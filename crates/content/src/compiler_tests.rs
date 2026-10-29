@@ -7,7 +7,7 @@ fn builtin_fixture_compiles() {
     // The fixture is the minimum proof that all four contracts can coexist and
     // that authority and presentation summaries are independent values.
     let compiled = compile(m0_fixture_pack()).unwrap();
-    assert_eq!(compiled.blocks.len(), 4);
+    assert_eq!(compiled.blocks.len(), 5);
     assert!(compiled.blocks.contains_key(&key("base:stone")));
     assert!(compiled.blocks.contains_key(&key("base:glass")));
     // The upper slab is a state of base:glass_slab, not its own block.

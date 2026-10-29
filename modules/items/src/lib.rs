@@ -152,7 +152,13 @@ impl Catalog {
 /// The small demonstration's item policy; applications may supply another catalog.
 pub fn fixture_catalog(registry: &BlockStateRegistry) -> Result<Catalog, RejectCode> {
     Catalog::new(
-        ["base:stone", "base:glass_slab", "base:plant"].map(|id| ItemDefinition {
+        [
+            "base:stone",
+            "base:glass_slab",
+            "base:plant",
+            "base:vertical_glass_slab",
+        ]
+        .map(|id| ItemDefinition {
             id: key(id),
             limit: 64,
             block: Some(key(id)),
@@ -162,6 +168,7 @@ pub fn fixture_catalog(registry: &BlockStateRegistry) -> Result<Catalog, RejectC
             ("base:glass_slab", "base:glass_slab", 1),
             ("base:glass", "base:glass_slab", 2),
             ("base:plant", "base:plant", 1),
+            ("base:vertical_glass_slab", "base:vertical_glass_slab", 1),
         ]
         .map(|(block, item, count)| {
             (

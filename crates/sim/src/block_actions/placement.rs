@@ -34,6 +34,17 @@ pub fn resolve(
     current: BlockStateId,
     hit: PlacementHit,
 ) -> Option<PlacementIntent> {
+    resolve_at(registry, held, current, hit, [0.5, hit.local_height, 0.5])
+}
+
+/// Resolve a placement using the full cell-local hit position.
+pub fn resolve_at(
+    registry: &BlockStateRegistry,
+    held: &ContentKey,
+    current: BlockStateId,
+    hit: PlacementHit,
+    local: [f32; 3],
+) -> Option<PlacementIntent> {
     if !matches!(
         hit.face,
         [-1, 0, 0] | [1, 0, 0] | [0, -1, 0] | [0, 1, 0] | [0, 0, -1] | [0, 0, 1]
@@ -41,6 +52,55 @@ pub fn resolve(
         || !(0.0..=1.0).contains(&hit.local_height)
     {
         return None;
+    }
+    if local
+        .iter()
+        .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+    {
+        return None;
+    }
+    let vertical = registry
+        .default_state(held)
+        .and_then(|s| registry.definition(s))
+        .is_some_and(|d| {
+            d.tags
+                .iter()
+                .any(|t| t.to_string() == "world:tag/vertical_slab")
+        });
+    if vertical {
+        let half = match hit.face {
+            [-1, 0, 0] => 1,
+            [1, 0, 0] => 0,
+            [0, 0, -1] => 3,
+            [0, 0, 1] => 2,
+            _ if (local[0] - 0.5).abs() >= (local[2] - 0.5).abs() => u32::from(local[0] > 0.5),
+            _ => 2 + u32::from(local[2] > 0.5),
+        };
+        if registry.definition(current).is_some_and(|d| &d.id == held)
+            && let Some(Shape::Box(bounds)) = registry.selection_shape_ref(current)
+        {
+            let axis = if bounds.max[0] - bounds.min[0] == 0.5 {
+                0
+            } else {
+                2
+            };
+            let side = u32::from(bounds.min[axis] == 0.5) + if axis == 0 { 0 } else { 2 };
+            let inner = if side % 2 == 0 { 1 } else { -1 };
+            if hit.face[axis] == inner {
+                return Some(PlacementIntent {
+                    target: hit.block,
+                    half: side ^ 1,
+                });
+            }
+        }
+        return Some(PlacementIntent {
+            target: BlockPos::new(
+                hit.block.x.checked_add(i64::from(hit.face[0]))?,
+                hit.block.y.checked_add(i64::from(hit.face[1]))?,
+                hit.block.z.checked_add(i64::from(hit.face[2]))?,
+            ),
+            half,
+        });
     }
     let half = match hit.face {
         [0, -1, 0] => 1,
@@ -100,6 +160,64 @@ mod tests {
     fn registry() -> BlockStateRegistry {
         let content = torse_content::compile(torse_content::m0_fixture_pack()).unwrap();
         BlockStateRegistry::build(&content).unwrap()
+    }
+
+    #[test]
+    fn vertical_glass_uses_all_four_sides_and_only_completes_the_inner_face() {
+        let registry = registry();
+        let held = key("base:vertical_glass_slab");
+        for (side, face) in [
+            (0, [1, 0, 0]),
+            (1, [-1, 0, 0]),
+            (2, [0, 0, 1]),
+            (3, [0, 0, -1]),
+        ] {
+            let state = registry.state_of(&held, &[side]).unwrap();
+            let hit = PlacementHit {
+                block: BlockPos::ZERO,
+                face,
+                local_height: 0.7,
+            };
+            let inner = resolve_at(&registry, &held, state, hit, [0.5, 0.7, 0.5]).unwrap();
+            assert_eq!(
+                inner,
+                PlacementIntent {
+                    target: BlockPos::ZERO,
+                    half: u32::from(side ^ 1)
+                }
+            );
+            let outer_face = face.map(|v| -v);
+            let outer = resolve_at(
+                &registry,
+                &held,
+                state,
+                PlacementHit {
+                    face: outer_face,
+                    ..hit
+                },
+                [0.5, 0.7, 0.5],
+            )
+            .unwrap();
+            assert_ne!(outer.target, BlockPos::ZERO);
+        }
+        for (local, half) in [
+            ([0.1, 1.0, 0.5], 0),
+            ([0.9, 1.0, 0.5], 1),
+            ([0.5, 1.0, 0.1], 2),
+            ([0.5, 1.0, 0.9], 3),
+        ] {
+            let hit = PlacementHit {
+                block: BlockPos::ZERO,
+                face: [0, 1, 0],
+                local_height: 1.0,
+            };
+            assert_eq!(
+                resolve_at(&registry, &held, BlockStateId::EMPTY, hit, local)
+                    .unwrap()
+                    .half,
+                half
+            );
+        }
     }
 
     #[test]

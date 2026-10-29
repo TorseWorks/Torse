@@ -28,7 +28,7 @@ pub fn m0_fixture_pack() -> ContentPack {
     let inventory_capability = key("base:capability/item_port");
     let inspect_action = key("base:action/inspect");
 
-    ContentPack {
+    let mut pack = ContentPack {
         state_schemas: vec![
             sourced(
                 "fixtures/m0/state_simple.json",
@@ -227,7 +227,24 @@ pub fn m0_fixture_pack() -> ContentPack {
                 ),
             ),
         ],
-    }
+    };
+    let schema = key("base:state/vertical_slab");
+    pack.state_schemas.push(sourced(
+        "fixtures/m0/state_vertical_slab.json",
+        crate::presets::vertical_slab_schema(schema.clone()),
+    ));
+    let mut vertical = pack
+        .blocks
+        .iter()
+        .find(|block| block.value.id == key("base:glass_slab"))
+        .expect("glass slab fixture")
+        .value
+        .clone();
+    vertical.id = key("base:vertical_glass_slab");
+    crate::presets::vertical_slab(&mut vertical, schema);
+    pack.blocks
+        .push(sourced("fixtures/m0/vertical_glass_slab.json", vertical));
+    pack
 }
 
 #[allow(clippy::too_many_arguments)]

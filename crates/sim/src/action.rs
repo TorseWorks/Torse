@@ -405,7 +405,7 @@ impl ActionView<'_> {
     /// Resolve the state a placement produces for one entry face.
     ///
     /// Blocks whose state schema carries a `base:field/half` field switch
-    /// between their lower (0) and upper (1) halves. Blocks without the
+    /// between their declared half values, including vertical sides. Blocks without the
     /// field resolve to their default state.
     pub fn state_with_half(&self, block: &ContentKey, half: usize) -> Option<BlockStateId> {
         let registry = self.world.registry();
@@ -420,7 +420,7 @@ impl ActionView<'_> {
             return Some(state);
         };
         let mut resolved = values.to_vec();
-        resolved[half_index] = u16::try_from(half).unwrap_or(0);
+        resolved[half_index] = u16::try_from(half).ok()?;
         registry.state_of(block, &resolved)
     }
 
@@ -476,6 +476,30 @@ impl ActionView<'_> {
         }
         let target = definition.interaction_profile.completes_to.as_ref()?;
         self.world.registry().default_state(target)
+    }
+
+    /// A vertical slab only completes with the opposite half on the same axis.
+    pub fn completion_state_for_side(
+        &self,
+        block: &ContentKey,
+        current: BlockStateId,
+        half: usize,
+    ) -> Option<BlockStateId> {
+        let registry = self.world.registry();
+        let definition = registry.definition(current)?;
+        if definition
+            .tags
+            .contains(&ContentKey::parse("world:tag/vertical_slab").expect("static tag"))
+        {
+            let index = registry
+                .fields_of(current)?
+                .iter()
+                .position(|f| f == &ContentKey::parse("base:field/half").expect("static field"))?;
+            if usize::from(registry.state_values(current)?[index] ^ 1) != half {
+                return None;
+            }
+        }
+        self.completion_state(block, current)
     }
 }
 

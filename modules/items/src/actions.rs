@@ -223,7 +223,7 @@ impl ActionHandler for Handler {
                 ComponentValue::Content(block.clone()),
             );
             let half = number(&request.parameters, "half")?;
-            if half > 1 {
+            if half > 3 {
                 return Err(RejectCode::InvalidData);
             }
             parameters.insert(key("world:field/half"), ComponentValue::U32(half as u32));

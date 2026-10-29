@@ -139,19 +139,19 @@ impl ActionHandler for BlockHandler {
             else {
                 return Err(RejectCode::InvalidData);
             };
+            let half = match request.parameters.get(&key("world:field/half")) {
+                Some(ComponentValue::U32(value)) => *value as usize,
+                _ => 0,
+            };
             if current.is_empty() {
                 // Half-type blocks take the half from the aim point: the
                 // client computes it from where the ray met the surface.
-                let half = match request.parameters.get(&key("world:field/half")) {
-                    Some(ComponentValue::U32(value)) => (*value % 2) as usize,
-                    _ => 0,
-                };
                 view.state_with_half(block, half)
                     .ok_or(RejectCode::MissingTarget)?
             } else {
                 // A cell that already holds the same block may complete into
                 // the block its content names, filling the remaining volume.
-                view.completion_state(block, current)
+                view.completion_state_for_side(block, current, half)
                     .ok_or(RejectCode::Conflict)?
             }
         } else {

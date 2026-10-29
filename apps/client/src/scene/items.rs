@@ -227,6 +227,38 @@ impl Scene {
 mod tests {
     use super::*;
     #[test]
+    fn vertical_glass_places_each_side_and_rejects_wrong_axis_completion() {
+        for side in 0..4 {
+            let mut scene = Scene::new(0).unwrap();
+            scene.enable_items(None).unwrap();
+            let owner = scene.item_owner().unwrap();
+            let pos = BlockPos::new(8, 14, 8);
+            scene
+                .apply_item_call(torse_items::edit_call(owner, true, 3, pos, side))
+                .unwrap();
+            let state = scene.authority.store().query(pos).ready().unwrap();
+            assert_eq!(
+                scene.authority.registry().state_values(state),
+                Some([side as u16].as_slice())
+            );
+            let before = scene.inventory_slots();
+            assert!(
+                scene
+                    .apply_item_call(torse_items::edit_call(owner, true, 3, pos, side ^ 2))
+                    .is_err()
+            );
+            assert_eq!(scene.inventory_slots(), before);
+            scene
+                .apply_item_call(torse_items::edit_call(owner, true, 3, pos, side ^ 1))
+                .unwrap();
+            let state = scene.authority.store().query(pos).ready().unwrap();
+            assert_eq!(
+                scene.authority.registry().definition(state).unwrap().id,
+                key("base:glass")
+            );
+        }
+    }
+    #[test]
     fn local_inventory_survives_body_switches_and_stock_edits_are_atomic() {
         let mut scene = Scene::new(0).unwrap();
         let pool = torse_types::MemoryPool::new(torse_types::MemoryBudget::new(128 * 1024 * 1024));

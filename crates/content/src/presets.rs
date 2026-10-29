@@ -1,5 +1,57 @@
 //! Optional content-building templates; the compiler never applies them implicitly.
-use crate::{AlphaMode, BlockDefinition, BoxBounds, Shape};
+use crate::{AlphaMode, BlockDefinition, BoxBounds, FiniteField, Shape, StateProfile, StateSchema};
+use torse_types::ContentKey;
+
+/// Four vertical half volumes: west, east, north and south.
+pub fn vertical_slab_schema(id: ContentKey) -> StateSchema {
+    StateSchema {
+        id,
+        schema_version: 1,
+        finite_fields: vec![FiniteField {
+            id: ContentKey::parse("base:field/half").expect("static field"),
+            default_value: 0,
+            values: vec![0, 1, 2, 3],
+        }],
+        component_schemas: Vec::new(),
+    }
+}
+
+/// Configure caller-owned material and identity as a completable vertical slab.
+pub fn vertical_slab(block: &mut BlockDefinition, schema: ContentKey) {
+    block.state_schema = schema;
+    let tag = ContentKey::parse("world:tag/vertical_slab").expect("static tag");
+    if !block.tags.contains(&tag) {
+        block.tags.push(tag);
+    }
+    block.state_overrides = (0..4)
+        .map(|side| {
+            let mut bounds = BoxBounds {
+                min: [0.0; 3],
+                max: [1.0; 3],
+            };
+            let axis = if side < 2 { 0 } else { 2 };
+            if side % 2 == 0 {
+                bounds.max[axis] = 0.5;
+            } else {
+                bounds.min[axis] = 0.5;
+            }
+            StateProfile {
+                values: vec![side],
+                render_shape: Some(Shape::Box(bounds)),
+                collision_shape: Some(Shape::Box(bounds)),
+                selection_shape: Some(Shape::Box(bounds)),
+                occlusion: Some(0),
+            }
+        })
+        .collect();
+    block.render_profile.shape = block.state_overrides[0]
+        .render_shape
+        .clone()
+        .expect("first state");
+    block.collision_profile.shape = Some(block.render_profile.shape.clone());
+    block.selection_profile.shape = Some(block.render_profile.shape.clone());
+    block.occlusion_profile.face_mask = 0;
+}
 
 /// Configure a non-solid plant with crossed cutout quads and a tight selection box.
 ///
@@ -27,6 +79,41 @@ pub fn crossed_plant(block: &mut BlockDefinition) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertical_template_keeps_the_material_and_exposes_four_distinct_half_volumes() {
+        let pack = crate::m0_fixture_pack();
+        let block = &pack
+            .blocks
+            .iter()
+            .find(|b| b.value.id.path() == "vertical_glass_slab")
+            .unwrap()
+            .value;
+        assert_eq!(
+            block.render_profile.material.to_string(),
+            "base:material/glass"
+        );
+        assert_eq!(
+            block
+                .interaction_profile
+                .completes_to
+                .as_ref()
+                .unwrap()
+                .to_string(),
+            "base:glass"
+        );
+        for (side, state) in block.state_overrides.iter().enumerate() {
+            let Some(Shape::Box(bounds)) = &state.render_shape else {
+                panic!("half box");
+            };
+            assert_eq!(state.collision_shape, state.render_shape);
+            assert_eq!(state.selection_shape, state.render_shape);
+            let axis = if side < 2 { 0 } else { 2 };
+            assert_eq!(bounds.max[axis] - bounds.min[axis], 0.5);
+            assert_eq!(bounds.max[1] - bounds.min[1], 1.0);
+        }
+        assert!(crate::compile(pack).is_ok());
+    }
     #[test]
     fn preset_preserves_identity_and_finite_state_while_replacing_geometry() {
         let mut pack = crate::m0_fixture_pack();

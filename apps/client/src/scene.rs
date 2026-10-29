@@ -634,7 +634,7 @@ impl Scene {
         held: &ContentKey,
     ) -> Option<block_actions::placement::PlacementIntent> {
         let current = self.authority.store().query(hit.block).ready()?;
-        block_actions::placement::resolve(
+        block_actions::placement::resolve_at(
             self.authority.registry(),
             held,
             current,
@@ -643,6 +643,12 @@ impl Scene {
                 face: hit.face,
                 local_height: hit.entry[1] - hit.block.y as f32,
             },
+            [
+                hit.entry[0] - hit.block.x as f32,
+                hit.entry[1] - hit.block.y as f32,
+                hit.entry[2] - hit.block.z as f32,
+            ]
+            .map(|v| v.clamp(0.0, 1.0)),
         )
     }
 
