@@ -493,6 +493,7 @@ impl CommitCoordinator {
         transaction: &Transaction,
     ) -> Result<PreparedChange, PrepareError> {
         if !transaction.movements.is_empty()
+            || !transaction.relocations.is_empty()
             || !transaction.clearance.is_empty()
             || !transaction.components.is_empty()
             || !transaction.spawns.is_empty()
@@ -639,6 +640,10 @@ impl CommitCoordinator {
             .is_none_or(|n| n > torse_world::MAX_COMPONENT_EDITS);
         let mut lifecycle_batch = None;
         for member in &group.members {
+            if !member.relocations.is_empty() && member.source != crate::action::relocation_source()
+            {
+                return Err(PrepareError::Rejected(RejectCode::PermissionDenied));
+            }
             if has_duplicate_targets(member) {
                 return Err(PrepareError::Rejected(RejectCode::InvalidData));
             }
@@ -723,6 +728,15 @@ impl CommitCoordinator {
             edits.extend(member_edits);
             entity_moves.extend(resolved.moves);
             movement_reads.extend(resolved.reads);
+            take_relocations(
+                store,
+                entities,
+                registry,
+                &member.relocations,
+                &mut entity_moves,
+                &mut movement_reads,
+                &mut movement_handles,
+            )?;
             movement_handles.extend(member.movements.iter().map(|request| {
                 (
                     request.handle,
@@ -791,6 +805,19 @@ impl CommitCoordinator {
             })
         {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
+        }
+        for member in &group.members {
+            movement_reads.extend(
+                crate::relocation::validate_final(
+                    store,
+                    entities,
+                    registry,
+                    &member.relocations,
+                    &edits,
+                    &component_edits,
+                )
+                .map_err(PrepareError::Rejected)?,
+            );
         }
         movement_reads.extend(
             crate::movement::validate_bodies(
@@ -875,6 +902,26 @@ impl CommitCoordinator {
                 )
             })
             .collect();
+        take_relocations(
+            store,
+            entities,
+            registry,
+            &transaction.relocations,
+            &mut prepared.entity_moves,
+            &mut prepared.movement_reads,
+            &mut prepared.movement_handles,
+        )?;
+        prepared.movement_reads.extend(
+            crate::relocation::validate_final(
+                store,
+                entities,
+                registry,
+                &transaction.relocations,
+                &prepared.edits,
+                &transaction.components,
+            )
+            .map_err(PrepareError::Rejected)?,
+        );
         prepared.clearance =
             crate::placement::prepare(registry, &transaction.mutations, &transaction.clearance)
                 .map_err(PrepareError::Rejected)?;
@@ -900,11 +947,17 @@ impl CommitCoordinator {
         store: &SectionStore,
         transaction: &Transaction,
     ) -> Result<PreparedChange, PrepareError> {
+        if !transaction.relocations.is_empty()
+            && transaction.source != crate::action::relocation_source()
+        {
+            return Err(PrepareError::Rejected(RejectCode::PermissionDenied));
+        }
         if (transaction.mutations.is_empty()
             && transaction.movements.is_empty()
             && transaction.components.is_empty()
             && transaction.spawns.is_empty()
-            && transaction.despawns.is_empty())
+            && transaction.despawns.is_empty()
+            && transaction.relocations.is_empty())
             || has_duplicate_targets(transaction)
         {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
@@ -1198,6 +1251,7 @@ impl CommitCoordinator {
             || !transaction.components.is_empty()
             || !transaction.spawns.is_empty()
             || !transaction.despawns.is_empty()
+            || !transaction.relocations.is_empty()
         {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
         }
@@ -1313,6 +1367,37 @@ fn rejected<T>(transaction: TransactionId, code: RejectCode) -> TransactionResul
         transaction,
         outcome: TransactionOutcome::Rejected(code),
     }
+}
+
+fn take_relocations(
+    store: &SectionStore,
+    entities: &EntityStore,
+    registry: &BlockStateRegistry,
+    relocations: &[crate::transaction::Relocation],
+    moves: &mut Vec<torse_world::EntityMove>,
+    reads: &mut Vec<(torse_types::BlockPos, TerrainQuery)>,
+    handles: &mut Vec<(EntityHandle, EntityId, Option<torse_world::EntityCollider>)>,
+) -> Result<(), PrepareError> {
+    let resolved = crate::relocation::resolve(store, entities, registry, relocations)
+        .map_err(PrepareError::Rejected)?;
+    if resolved
+        .moves
+        .iter()
+        .any(|relocation| moves.iter().any(|movement| movement.id == relocation.id))
+    {
+        return Err(PrepareError::Rejected(RejectCode::Conflict));
+    }
+    for movement in &resolved.moves {
+        let handle = entities
+            .handle_of(movement.id)
+            .expect("validated relocation identity");
+        let body = torse_world::EntityCollider::of(entities.get(handle).expect("validated handle"))
+            .expect("validated body");
+        handles.push((handle, movement.id, body));
+    }
+    moves.extend(resolved.moves);
+    reads.extend(resolved.reads);
+    Ok(())
 }
 
 fn has_duplicate_targets(transaction: &Transaction) -> bool {

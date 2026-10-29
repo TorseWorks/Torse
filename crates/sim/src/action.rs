@@ -258,6 +258,18 @@ pub fn despawn_permission() -> ContentKey {
     ContentKey::parse("world:permission/despawn").expect("static permission")
 }
 
+/// Explicit host permission for relocating one granted entity.
+///
+/// Inventory, visibility, and the caller's module name do not grant it.
+pub fn relocate_permission() -> ContentKey {
+    ContentKey::parse("world:permission/relocate").expect("static permission")
+}
+
+/// Source recorded on a relocation plan so another module can share the group.
+pub fn relocation_source() -> ContentKey {
+    ContentKey::parse("world:module/relocation").expect("static source")
+}
+
 /// A bounded query result or an unpublished mutation plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActionOutput {
@@ -320,6 +332,31 @@ impl ActionView<'_> {
             entity,
             expected,
             requested,
+            transaction,
+            ordering,
+        )
+    }
+
+    /// Plan an exact move that keeps the entity identity.
+    ///
+    /// The result is not published. Ordinary movement limits are unchanged.
+    /// Section grants do not cover the entity.
+    pub fn plan_relocation(
+        &self,
+        entity: EntityId,
+        expected: Position,
+        destination: Position,
+        policy: crate::DestinationPolicy,
+        transaction: TransactionId,
+        ordering: OrderingKey,
+    ) -> Result<Transaction, RejectCode> {
+        crate::relocation::plan(
+            self.world,
+            self.actor,
+            entity,
+            expected,
+            destination,
+            policy,
             transaction,
             ordering,
         )
@@ -692,6 +729,14 @@ impl ActionService {
             ActionOutput::Mutation(tx) if action.kind == ActionKind::Mutation => {
                 if (!tx.spawns.is_empty() && !actor.permits(&spawn_permission()))
                     || (!tx.despawns.is_empty() && !actor.permits(&despawn_permission()))
+                    || (!tx.relocations.is_empty() && !actor.permits(&relocate_permission()))
+                {
+                    return Err(RejectCode::PermissionDenied);
+                }
+                if tx
+                    .relocations
+                    .iter()
+                    .any(|relocation| !actor.allows(ActionTarget::Entity(relocation.id)))
                 {
                     return Err(RejectCode::PermissionDenied);
                 }

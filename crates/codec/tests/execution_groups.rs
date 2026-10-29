@@ -4,9 +4,10 @@ use torse_codec::{
     wire::{self, Wire},
 };
 use torse_sim::durable::{
-    FrozenTask, ReplyStatus, StableCell, StoredTransaction, StoredTransactionGroup,
+    FrozenTask, ReplyStatus, StableCell, StableRelocation, StoredTransaction,
+    StoredTransactionGroup,
 };
-use torse_types::{BlockPos, ContentKey, OutputBudget, TransactionId};
+use torse_types::{BlockPos, ContentKey, EntityId, OutputBudget, TransactionId};
 use torse_world::{CellContent, ComponentFields};
 
 const LIMITS: CodecLimits = CodecLimits {
@@ -34,6 +35,7 @@ fn member(source: &str, x: i64) -> StoredTransaction {
         }],
         clearance: Vec::new(),
         moves: Vec::new(),
+        relocations: Vec::new(),
         components: Vec::new(),
         spawns: Vec::new(),
         despawns: Vec::new(),
@@ -257,4 +259,22 @@ fn malformed_placement_conditions_reject_during_decode() {
         assert!(wire::encode(&invalid, &mut out, BUDGET, LIMITS).is_err());
         assert_eq!(out, [9]);
     }
+}
+
+#[test]
+fn relocation_groups_roundtrip_on_their_own_tag() {
+    let mut stored = member("world:module/relocation", 0);
+    stored.writes.clear();
+    stored.relocations.push(StableRelocation {
+        id: EntityId(4),
+        previous: [0; 3],
+        destination: [1; 3],
+        policy: 1,
+    });
+    let original = task(vec![stored]);
+    let mut bytes = Vec::new();
+    wire::encode(&original, &mut bytes, BUDGET, LIMITS).expect("encode");
+    assert_eq!(bytes[2], 4, "relocation groups use tag 4");
+    let decoded: FrozenTask = wire::decode(&bytes, BUDGET, LIMITS).expect("decode");
+    assert_eq!(decoded, original);
 }

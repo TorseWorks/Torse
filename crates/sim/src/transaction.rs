@@ -70,6 +70,31 @@ pub struct Despawn {
     pub previous: EntityState,
 }
 
+/// How the destination of a relocation is checked.
+///
+/// This is not a movement sweep. Ordinary movement limits stay in force for
+/// [`Movement`] requests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DestinationPolicy {
+    /// The body must be clear of loaded terrain.
+    Clear,
+    /// Every cell the body covers must be loaded. Overlap is allowed.
+    Resident,
+}
+
+/// One exact relocation. Preparation writes the destination directly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Relocation {
+    /// Persistent identity that must still be live.
+    pub id: EntityId,
+    /// Position observed by the planner, as IEEE-754 bits.
+    pub previous_bits: [u64; 3],
+    /// Finite destination inside the movement coordinate limit.
+    pub destination_bits: [u64; 3],
+    /// Destination residency rule.
+    pub policy: DestinationPolicy,
+}
+
 /// Stable ordering key of one transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct OrderingKey {
@@ -107,6 +132,8 @@ pub struct Transaction {
     pub spawns: Vec<Spawn>,
     /// Removals compare the complete observed state before publication.
     pub despawns: Vec<Despawn>,
+    /// Exact relocations. They do not pass through movement sweep limits.
+    pub relocations: Vec<Relocation>,
 }
 
 /// Upper bound on members in one atomic group.
@@ -180,6 +207,12 @@ impl TransactionGroup {
                 }
                 touched_entities.insert(movement.id);
             }
+            for relocation in &member.relocations {
+                if !moved_entities.insert(relocation.id) {
+                    return Err(RejectCode::Conflict);
+                }
+                touched_entities.insert(relocation.id);
+            }
             if !member.spawns.is_empty() || !member.despawns.is_empty() {
                 lifecycle_members += 1;
                 for despawn in &member.despawns {
@@ -221,6 +254,7 @@ impl Transaction {
             components: Vec::new(),
             spawns: Vec::new(),
             despawns: Vec::new(),
+            relocations: Vec::new(),
         }
     }
 
@@ -283,6 +317,23 @@ impl Transaction {
             previous_bits: previous.to_bits(),
             delta_bits: delta.map(f64::to_bits),
             half_bits: half.map(f64::to_bits),
+        });
+        self
+    }
+
+    /// Request an exact relocation. The destination is not a movement delta.
+    pub fn relocate_entity(
+        &mut self,
+        id: EntityId,
+        previous: Position,
+        destination: Position,
+        policy: DestinationPolicy,
+    ) -> &mut Self {
+        self.relocations.push(Relocation {
+            id,
+            previous_bits: previous.to_bits(),
+            destination_bits: destination.to_bits(),
+            policy,
         });
         self
     }

@@ -63,6 +63,17 @@ pub struct StableMove {
     pub delta: [u64; 3],
     pub half: [u64; 3],
 }
+
+/// Exact relocation stored with an unpublished durable task.
+///
+/// `policy` is 0 for a clear destination and 1 for a loaded destination.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StableRelocation {
+    pub id: EntityId,
+    pub previous: [u64; 3],
+    pub destination: [u64; 3],
+    pub policy: u8,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StableSpawn {
     pub position: [u64; 3],
@@ -81,6 +92,7 @@ pub struct StoredTransaction {
     /// Occupancy requirements, resolved by stable block identity after restart.
     pub clearance: Vec<StableCell>,
     pub moves: Vec<StableMove>,
+    pub relocations: Vec<StableRelocation>,
     pub components: Vec<ComponentEdit>,
     pub spawns: Vec<StableSpawn>,
     pub despawns: Vec<EntityState>,
@@ -179,7 +191,28 @@ impl StoredTransactionGroup {
                 }
                 touched.insert(edit.id);
             }
-            touched.extend(member.moves.iter().map(|m| m.id));
+            let mut moved = std::collections::BTreeSet::new();
+            for id in member
+                .moves
+                .iter()
+                .map(|movement| movement.id)
+                .chain(member.relocations.iter().map(|relocation| relocation.id))
+            {
+                if !moved.insert(id) {
+                    return Err(Fault::invalid_data("duplicate group move"));
+                }
+                touched.insert(id);
+            }
+            if member.relocations.len() > 1
+                || member
+                    .relocations
+                    .iter()
+                    .any(|relocation| relocation.policy > 1)
+                || (!member.relocations.is_empty()
+                    && member.source != crate::action::relocation_source())
+            {
+                return Err(Fault::invalid_data("invalid relocation"));
+            }
             if !member.spawns.is_empty() || !member.despawns.is_empty() {
                 lifecycle_members += 1;
             }
@@ -367,6 +400,19 @@ impl StoredTransaction {
                     half: m.half_bits,
                 })
                 .collect(),
+            relocations: tx
+                .relocations
+                .iter()
+                .map(|relocation| StableRelocation {
+                    id: relocation.id,
+                    previous: relocation.previous_bits,
+                    destination: relocation.destination_bits,
+                    policy: match relocation.policy {
+                        crate::DestinationPolicy::Clear => 0,
+                        crate::DestinationPolicy::Resident => 1,
+                    },
+                })
+                .collect(),
             components: tx.components.clone(),
             spawns: tx
                 .spawns
@@ -410,6 +456,19 @@ impl StoredTransaction {
                 Position::from_bits(m.previous),
                 m.delta.map(f64::from_bits),
                 m.half.map(f64::from_bits),
+            );
+        }
+        for relocation in &self.relocations {
+            let policy = match relocation.policy {
+                0 => crate::DestinationPolicy::Clear,
+                1 => crate::DestinationPolicy::Resident,
+                _ => return Err(RejectCode::InvalidData),
+            };
+            tx.relocate_entity(
+                relocation.id,
+                Position::from_bits(relocation.previous),
+                Position::from_bits(relocation.destination),
+                policy,
             );
         }
         tx.components = self.components.clone();
