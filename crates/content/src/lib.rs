@@ -6,6 +6,7 @@ mod builtin;
 mod compiler;
 mod cooked;
 mod descriptor;
+pub mod presets;
 
 #[cfg(test)]
 mod compiler_tests;

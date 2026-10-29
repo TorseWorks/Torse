@@ -2,7 +2,7 @@
 //!
 //! The fixture intentionally exercises independent shape properties: stone is a
 //! full cube, glass is a transparent lower slab, and a plant has visual and
-//! selection geometry but no collision. Component, capability, permission, and
+//! crossed visual and bounded selection geometry but no collision. Component, capability, permission, and
 //! action declarations are included to validate references across all four
 //! content contracts without requiring a running world.
 
@@ -191,24 +191,26 @@ pub fn m0_fixture_pack() -> ContentPack {
                 ];
                 slab
             }),
-            sourced(
-                "fixtures/m0/plant.json",
-                BlockDefinition {
+            sourced("fixtures/m0/plant.json", {
+                let mut plant = BlockDefinition {
                     collision_profile: CollisionProfile { shape: None },
                     tags: vec![key("base:tag/plant")],
                     ..block(
                         "base:plant",
                         plant_state,
-                        Shape::Panel,
+                        Shape::Cross,
                         None,
-                        Some(Shape::Panel),
+                        None,
                         0,
                         AlphaMode::Mask,
                         inspect_action.clone(),
                         None,
                     )
-                },
-            ),
+                };
+                crate::presets::crossed_plant(&mut plant);
+                plant.definition_version = 2;
+                plant
+            }),
             sourced(
                 "fixtures/m0/glass.json",
                 block(

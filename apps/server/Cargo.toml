@@ -26,6 +26,7 @@ torse-net = { path = "../../crates/net" }
 torse-content = { path = "../../crates/content" }
 torse-modules = { path = "../../crates/modules" }
 torse-inventory = { path = "../../modules/inventory" }
+torse-items = { path = "../../modules/items" }
 torse-mod-host = { path = "../../crates/mod_host", optional = true }
 
 [dev-dependencies]

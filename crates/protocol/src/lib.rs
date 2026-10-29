@@ -2,5 +2,6 @@
 #![forbid(unsafe_code)]
 mod messages;
 pub use messages::{
-    ClientMessage, HEARTBEAT_INTERVAL, MoveCommand, PROTOCOL_VERSION, PlayerUpdate, ServerMessage,
+    CONTROL_API_VERSION, ClientMessage, HEARTBEAT_INTERVAL, MoveCommand, PROTOCOL_VERSION,
+    PlayerUpdate, ServerMessage,
 };

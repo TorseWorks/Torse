@@ -382,19 +382,30 @@ fn trace_loaded(
 /// Whether an enabled body at `position` is clear of terrain.
 ///
 /// `Ok` lists the cells that were observed. Overlap is [`RejectCode::Conflict`].
-/// A missing or out-of-range cell is [`RejectCode::NotLoaded`].
-pub(crate) fn observe_body(
+/// Missing cells and closed exterior faces are [`RejectCode::NotLoaded`].
+/// Open exterior faces are known empty for body movement.
+pub fn observe_body(
     store: &SectionStore,
     registry: &BlockStateRegistry,
     position: Position,
     half: [f64; 3],
+) -> Result<Vec<(BlockPos, TerrainQuery)>, RejectCode> {
+    observe_body_with_edits(store, registry, position, half, &[])
+}
+
+pub(crate) fn observe_body_with_edits(
+    store: &SectionStore,
+    registry: &BlockStateRegistry,
+    position: Position,
+    half: [f64; 3],
+    edits: &[BlockEdit],
 ) -> Result<Vec<(BlockPos, TerrainQuery)>, RejectCode> {
     let center = bounded_center([position.x, position.y, position.z], half)
         .ok_or(RejectCode::InvalidData)?;
     let view = CollisionView {
         store,
         registry,
-        overlay: BTreeMap::new(),
+        overlay: edits.iter().map(|e| (e.pos, e.state)).collect(),
         reads: RefCell::new(BTreeMap::new()),
         unknown: RefCell::new(false),
     };

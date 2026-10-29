@@ -543,6 +543,12 @@ fields!(StableMove {
     delta,
     half
 });
+fields!(StableRelocation {
+    id,
+    previous,
+    destination,
+    policy
+});
 fields!(StableSpawn {
     position,
     components
@@ -579,6 +585,9 @@ impl Wire for StoredTransaction {
                 "placement conditions require frozen transaction tag 3",
             ));
         }
+        if !self.relocations.is_empty() {
+            return Err(invalid("relocations require frozen transaction tag 4"));
+        }
         write_legacy_transaction(self, e)
     }
     fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
@@ -593,6 +602,7 @@ impl Wire for StoredTransaction {
             writes: Wire::read(d)?,
             clearance: Vec::new(),
             moves: Wire::read(d)?,
+            relocations: Vec::new(),
             components: Wire::read(d)?,
             spawns: Wire::read(d)?,
             despawns: Wire::read(d)?,
@@ -606,7 +616,20 @@ impl Wire for FrozenTask {
             None => 0u8.write(e)?,
             Some(group) => {
                 group.validate()?;
-                if group.members.iter().any(|m| !m.clearance.is_empty()) {
+                if group
+                    .members
+                    .iter()
+                    .any(|member| !member.relocations.is_empty())
+                {
+                    4u8.write(e)?;
+                    group.id.write(e)?;
+                    write_items(e, group.members.len(), "frozen group")?;
+                    for member in &group.members {
+                        write_legacy_transaction(member, e)?;
+                        member.clearance.write(e)?;
+                        member.relocations.write(e)?;
+                    }
+                } else if group.members.iter().any(|m| !m.clearance.is_empty()) {
                     3u8.write(e)?;
                     group.id.write(e)?;
                     write_items(e, group.members.len(), "frozen group")?;
@@ -643,7 +666,7 @@ impl Wire for FrozenTask {
                     members: vec![member],
                 })
             }
-            2 | 3 => {
+            2..=4 => {
                 let id = TransactionId::read(d)?;
                 // Check the group bound before allocating its member vector.
                 let n = read_items(d, 1, "frozen group")?;
@@ -655,7 +678,7 @@ impl Wire for FrozenTask {
                 let mut remaining_checks = torse_sim::transaction::MAX_CLEARANCE_CHECKS;
                 for _ in 0..n {
                     let mut member = StoredTransaction::read(d)?;
-                    if tag == 3 {
+                    if tag == 3 || tag == 4 {
                         let checks = read_items(d, 1, "placement conditions")?;
                         remaining_checks = remaining_checks
                             .checked_sub(checks)
@@ -664,6 +687,17 @@ impl Wire for FrozenTask {
                         member.clearance = Vec::with_capacity(checks);
                         for _ in 0..checks {
                             member.clearance.push(StableCell::read(d)?);
+                        }
+                    }
+                    if tag == 4 {
+                        let count = read_items(d, 1, "relocations")?;
+                        if count > 1 {
+                            return Err(invalid("too many relocations"));
+                        }
+                        charge_vec::<StableRelocation>(d, count)?;
+                        member.relocations = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            member.relocations.push(StableRelocation::read(d)?);
                         }
                     }
                     members.push(member);

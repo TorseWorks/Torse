@@ -50,6 +50,6 @@ if let Some(result) = job.try_take() {
 
 该接口不暴露阻塞等待结果的方法。工作线程不执行磁盘、网络操作，也不等待同池子任务；生成与网格适配器按高度行或切片检查取消。执行器不强制终止任意原生代码。
 
-生成与网格接入有界执行器的取消、背压与结果失效验证见[记录](../../benchmarks/M6-bounded-executor.md)。ECS实验仍通过ecs-probe特性启用。
+生成与网格接入有界执行器的取消、背压与结果失效验证见[记录](../../benchmarks/archive/performance/M6-bounded-executor.md)。ECS实验仍通过ecs-probe特性启用。
 
-`Executor::with_memory`可与世界、复制和资源共用MemoryPool，任务槽和输入、输出峰值均参与同一总量校验。`Job::try_take_charged`将完成结果的原预留转入指定分类，分类暂满时保留结果供重试；`try_take`仍由调用方自行负责结果的常驻预算。两端主程序装配及范围见[共享内存记录](../../benchmarks/M6-shared-memory.md)。
+`Executor::with_memory`可与世界、复制和资源共用MemoryPool，任务槽和输入、输出峰值均参与同一总量校验。`Job::try_take_charged`将完成结果的原预留转入指定分类，分类暂满时保留结果供重试；`try_take`仍由调用方自行负责结果的常驻预算。两端主程序装配及范围见[共享内存记录](../../benchmarks/archive/performance/M6-shared-memory.md)。

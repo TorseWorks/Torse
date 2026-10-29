@@ -40,9 +40,9 @@ Move的水平意向以i8的二进制补码写入两个u8，服务端归一化方
 
 断线撤销父会话及内部移动会话，冻结任务在提交前重查绑定、运行代数与批准范围。重连创建新会话；订阅替换保留当前移动序号并建立新代数基线，旧代数增量不能进入新镜像。移动路径及碰撞读取涉及的所有分区必须处于批准范围。
 
-标签0至5及codec/wire版本1保持原布局，但Hello拒绝协议版本1、2和未知版本。协议升级不重写现有存档；存在玩家运动组件的新世界需要支持该组件的读取器。具体预算和验证见[权威移动](../../benchmarks/M5-authoritative-movement.md)。
+标签0至5及codec/wire版本1保持原布局，但Hello拒绝协议版本1、2和未知版本。协议升级不重写现有存档；存在玩家运动组件的新世界需要支持该组件的读取器。具体预算和验证见[权威移动](../../benchmarks/archive/network/M5-authoritative-movement.md)。
 
-机器UI复用Seed/Batch中的Authorized组件和Request中的Call。机器对象及两个端口分别授权，引用端口身份不扩大读取权限。UI描述版本1是客户端编译期模型版本，独立于应用协议版本；未知描述版本清空视图。按钮ActionID与版本见[执行载荷](../codec/EXECUTION.md)，模型和场景见[机器UI验证](../../benchmarks/M4-machine-ui.md)。
+机器UI复用Seed/Batch中的Authorized组件和Request中的Call。机器对象及两个端口分别授权，引用端口身份不扩大读取权限。UI描述版本1是客户端编译期模型版本，独立于应用协议版本；未知描述版本清空视图。按钮ActionID与版本见[执行载荷](../codec/EXECUTION.md)，模型和场景见[机器UI验证](../../benchmarks/archive/mods/M4-machine-ui.md)。
 
 ## 会话存活
 

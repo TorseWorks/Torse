@@ -77,7 +77,7 @@ spawned保持请求顺序，身份必须从previous_next_id连续分配。next_i
 
 持久宿主在编码前执行组件持久投影：Never组件从快照、组件增量及生成和销毁观察中省略，Always保留，OwnerDefined采用启动装配时由所有者选定的策略，未选时保留。Codec自身仍可编码完整交换载荷。Recovery对旧完整记录采用相同投影，空投影也保留提交位置。
 
-方块附属实例复用EntityState与普通组件字段，不增加布局字段。保留模式`core:schema/block_instance`包含`core:field/block`内容引用及`core:field/x`、`core:field/y`、`core:field/z`三个I64坐标，绑定始终持久保存。显式生成在前，按最终格坐标排序的自动生成在后，共用一个水位区间。验证见[内核一致性](../../benchmarks/M2-core-consistency.md)。
+方块附属实例复用EntityState与普通组件字段，不增加布局字段。保留模式`core:schema/block_instance`包含`core:field/block`内容引用及`core:field/x`、`core:field/y`、`core:field/z`三个I64坐标，绑定始终持久保存。显式生成在前，按最终格坐标排序的自动生成在后，共用一个水位区间。验证见[内核一致性](../../benchmarks/archive/simulation/M2-core-consistency.md)。
 
 生成与销毁合计不得超过256个目标，完整生命周期载荷的保守预算上限为8MiB，包含销毁观察中的组件。一个身份只能出现一次，生命周期目标不能同时参与本条记录的移动或组件编辑。读写两侧检查结构、重复、分配算式及目标交叠；实际水位、销毁观察、组件模式和生成位置由世界层检查。
 

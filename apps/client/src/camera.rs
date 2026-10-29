@@ -3,6 +3,28 @@
 //! Matrices are column-major `[f32; 16]`, the layout WGSL expects. The
 //! projection targets WebGPU's `0..1` depth range.
 
+/// Deterministic paths for finite performance measurements.
+#[derive(Clone, Copy, Debug)]
+pub enum BenchmarkMotion {
+    Stationary,
+    Local,
+    Travel,
+}
+impl BenchmarkMotion {
+    pub fn eye(self, frame: u32) -> [f32; 3] {
+        let frame = frame as f32;
+        match self {
+            Self::Stationary => [15.5, 46.0, 8.5],
+            Self::Local => [
+                15.5 + (frame * 0.01).sin() * 2.0,
+                46.0,
+                8.5 + (frame * 0.01).cos() * 2.0,
+            ],
+            Self::Travel => [15.5, 46.0, 8.5 - frame * 0.5],
+        }
+    }
+}
+
 /// Perspective camera looking at a target.
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {

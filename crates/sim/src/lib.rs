@@ -28,6 +28,7 @@ pub mod phase;
 mod placement;
 pub mod player;
 mod presentation;
+mod relocation;
 pub mod replica;
 pub mod simulation;
 pub mod streaming;
@@ -50,6 +51,6 @@ pub use simulation::{
 };
 pub use system::{System, SystemContext};
 pub use transaction::{
-    BlockPrecondition, Despawn, MAX_GROUP_MEMBERS, Movement, Mutation, OrderingKey, Spawn,
-    Transaction, TransactionGroup,
+    BlockPrecondition, Despawn, DestinationPolicy, MAX_GROUP_MEMBERS, Movement, Mutation,
+    OrderingKey, Relocation, Spawn, Transaction, TransactionGroup,
 };

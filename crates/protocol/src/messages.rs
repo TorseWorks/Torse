@@ -1,6 +1,8 @@
 use torse_codec::{Decoder, EncodeResult, Encoder, wire::Wire};
 use torse_types::*;
 pub const PROTOCOL_VERSION: u16 = 3;
+/// Negotiated separately from [`PROTOCOL_VERSION`] and from world payloads.
+pub const CONTROL_API_VERSION: u16 = 1;
 /// Movement sequencing is independent of ordinary action requests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MoveCommand {
@@ -88,6 +90,15 @@ pub enum ClientMessage<I> {
     Close,
     Ping,
     Move(MoveCommand),
+    /// Ask to enable the control extension. Ignored by hosts that have no dispatcher.
+    ControlOffer {
+        api: u16,
+    },
+    /// One bounded sample. The host viewer is not read from this payload.
+    Control {
+        seq: u64,
+        payload: Vec<u8>,
+    },
 }
 #[derive(Debug)]
 pub enum ServerMessage<O, S, C> {
@@ -107,6 +118,15 @@ pub enum ServerMessage<O, S, C> {
     Batch(ReplicaBatch<C>),
     Rejected(RejectCode),
     Player(PlayerUpdate),
+    /// The offered control API was accepted for this connection.
+    ControlReady {
+        api: u16,
+    },
+    /// Transport admission for one control sample. This is not a world receipt.
+    ControlAck {
+        seq: u64,
+        accepted: bool,
+    },
 }
 fn invalid() -> Fault {
     Fault::invalid_data("unknown protocol message/tag")
@@ -141,6 +161,15 @@ impl<I: Wire> Wire for ClientMessage<I> {
                 6u8.write(e)?;
                 input.write(e)
             }
+            Self::ControlOffer { api } => {
+                7u8.write(e)?;
+                api.write(e)
+            }
+            Self::Control { seq, payload } => {
+                8u8.write(e)?;
+                seq.write(e)?;
+                payload.write(e)
+            }
         }
     }
     fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
@@ -162,6 +191,13 @@ impl<I: Wire> Wire for ClientMessage<I> {
             4 => Ok(Self::Close),
             5 => Ok(Self::Ping),
             6 => Ok(Self::Move(Wire::read(d)?)),
+            7 => Ok(Self::ControlOffer {
+                api: Wire::read(d)?,
+            }),
+            8 => Ok(Self::Control {
+                seq: Wire::read(d)?,
+                payload: Wire::read(d)?,
+            }),
             _ => Err(invalid()),
         }
     }
@@ -225,6 +261,15 @@ impl<O: Wire, S: Wire, C: Wire> Wire for ServerMessage<O, S, C> {
                 6u8.write(e)?;
                 update.write(e)
             }
+            Self::ControlReady { api } => {
+                7u8.write(e)?;
+                api.write(e)
+            }
+            Self::ControlAck { seq, accepted } => {
+                8u8.write(e)?;
+                seq.write(e)?;
+                accepted.write(e)
+            }
         }
     }
     fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
@@ -245,6 +290,13 @@ impl<O: Wire, S: Wire, C: Wire> Wire for ServerMessage<O, S, C> {
             4 => Ok(Self::Batch(Wire::read(d)?)),
             5 => Ok(Self::Rejected(Wire::read(d)?)),
             6 => Ok(Self::Player(Wire::read(d)?)),
+            7 => Ok(Self::ControlReady {
+                api: Wire::read(d)?,
+            }),
+            8 => Ok(Self::ControlAck {
+                seq: Wire::read(d)?,
+                accepted: Wire::read(d)?,
+            }),
             _ => Err(invalid()),
         }
     }

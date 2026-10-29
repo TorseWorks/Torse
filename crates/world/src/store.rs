@@ -50,14 +50,23 @@ impl WorldBounds {
 
 /// Which storage faces are known empty instead of a solid boundary.
 ///
-/// The default blocks movement at both faces. Opening a face does not make an
-/// unloaded section inside the store empty.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// The default preserves movement above the build ceiling and blocks the lower
+/// face. Opening a face does not make an unloaded section inside the store empty.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExteriorPolicy {
     /// Space below [`WorldBounds::min_y`] is empty.
     pub below: bool,
     /// Space at and above [`WorldBounds::max_y`] is empty.
     pub above: bool,
+}
+
+impl Default for ExteriorPolicy {
+    fn default() -> Self {
+        Self {
+            below: false,
+            above: true,
+        }
+    }
 }
 
 /// Mix a non-default exterior policy into the authority compatibility identity.
@@ -205,7 +214,10 @@ pub struct SectionStore {
     exterior: ExteriorPolicy,
     sections: BTreeMap<SectionPos, Entry>,
     retired: BTreeMap<SectionPos, Revision>,
+    retired_floor: Option<Revision>,
 }
+
+const RETIRED_REVISION_LIMIT: usize = 1024;
 
 impl SectionStore {
     /// Create an empty store.
@@ -217,6 +229,7 @@ impl SectionStore {
             exterior: ExteriorPolicy::default(),
             sections: BTreeMap::new(),
             retired: BTreeMap::new(),
+            retired_floor: None,
         })
     }
 
@@ -270,9 +283,30 @@ impl SectionStore {
         }
     }
 
-    /// Install generated or read data for a requested section.
+    /// Conservative revision watermark for a nonresident section.
+    /// Compaction may return a watermark from another retired coordinate.
     pub fn retired_revision(&self, pos: SectionPos) -> Option<Revision> {
-        self.retired.get(&pos).copied()
+        match (self.retired.get(&pos).copied(), self.retired_floor) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn retire(&mut self, pos: SectionPos, revision: Revision) {
+        self.retired.insert(pos, revision);
+        if self.retired.len() >= RETIRED_REVISION_LIMIT {
+            // A store-wide watermark conservatively invalidates cold-load
+            // observations without retaining every coordinate ever visited.
+            // New installations resume above it, so compaction cannot reuse
+            // a revision previously observed at a forgotten coordinate.
+            self.retired_floor = self
+                .retired
+                .values()
+                .copied()
+                .chain(self.retired_floor)
+                .max();
+            self.retired.clear();
+        }
     }
 
     pub fn validate_install_revision(
@@ -280,7 +314,7 @@ impl SectionStore {
         pos: SectionPos,
         section: &Section,
     ) -> Result<(), StoreError> {
-        if let Some(old) = self.retired.get(&pos) {
+        if let Some(old) = self.retired_revision(pos) {
             section
                 .revision()
                 .0
@@ -298,8 +332,8 @@ impl SectionStore {
                 actual: section.side(),
             });
         }
-        if let Some(revision) = self.retired.get(&pos) {
-            section.resume_revision(*revision)?;
+        if let Some(revision) = self.retired_revision(pos) {
+            section.resume_revision(revision)?;
         }
         let entry = self
             .sections
@@ -592,7 +626,7 @@ impl SectionStore {
         }
         match entry.phase {
             SectionPhase::Ready => {
-                self.retired.insert(pos, entry.section.revision());
+                self.retire(pos, entry.section.revision());
                 self.sections.remove(&pos);
                 Ok(())
             }
@@ -610,7 +644,7 @@ impl SectionStore {
     /// `release_ticket` and `unload`, which enforce the lifecycle rules.
     pub fn discard(&mut self, pos: SectionPos) -> Option<Section> {
         self.sections.remove(&pos).map(|entry| {
-            self.retired.insert(pos, entry.section.revision());
+            self.retire(pos, entry.section.revision());
             entry.section
         })
     }
@@ -897,7 +931,7 @@ mod tests {
         );
         assert_eq!(
             store.query(BlockPos::new(0, 300, 0)),
-            TerrainQuery::OutOfBounds
+            TerrainQuery::Exterior
         );
         assert_eq!(store.phase(SectionPos::ZERO), None);
     }
@@ -1199,5 +1233,37 @@ mod tests {
             ),
             base
         );
+    }
+
+    #[test]
+    fn long_travel_bounds_retired_metadata_without_reusing_old_revisions() {
+        let mut store = store();
+        let origin = SectionPos::ZERO;
+        store.request(origin).unwrap();
+        store.install(origin, Section::empty(16).unwrap()).unwrap();
+        store.finish_load(origin).unwrap();
+        for n in 0..12 {
+            store
+                .edit(BlockPos::new(0, 0, 0), BlockStateId(1 + n % 2))
+                .unwrap();
+        }
+        let old = store.revision(origin).unwrap();
+        store.unload(origin).unwrap();
+        for x in 1..=8192 {
+            let pos = SectionPos::new(x, 0, 0);
+            store.request(pos).unwrap();
+            store.install(pos, Section::empty(16).unwrap()).unwrap();
+            store.finish_load(pos).unwrap();
+            store.unload(pos).unwrap();
+            assert!(
+                store.accounted_bytes() < 8 * 1024 * 1024,
+                "retired world memory grew with travel at {x}"
+            );
+        }
+        assert!(store.retired_revision(origin).unwrap() >= old);
+        store.request(origin).unwrap();
+        store.install(origin, Section::empty(16).unwrap()).unwrap();
+        store.finish_load(origin).unwrap();
+        assert!(store.revision(origin).unwrap() > old);
     }
 }

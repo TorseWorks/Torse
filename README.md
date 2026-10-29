@@ -18,15 +18,15 @@ Torse目前处于早期开发阶段，已有可运行的图形客户端、独立
 
 | 领域 | 已实现的范围 | 验证记录 |
 |---|---|---|
-| 世界与地形 | 方块状态、分区存储与流式装载、确定性地形生成、碰撞检测和网格生成 | [世界场景](benchmarks/M1-scenario.md) |
-| 模拟与事务 | 固定步长Tick、阶段调度、实体与组件、动作授权、库存转移和跨模块原子提交 | [Tick执行](benchmarks/M2-tick.md)、[跨模块事务](benchmarks/M4-cross-module.md) |
-| 图形客户端 | 窗口与离屏渲染、图集贴图与逐面材质、飞行与行走、方块选择与编辑、HUD、菜单和截图 | [窗口交互](benchmarks/M1-window.md)、[地形贴图](benchmarks/M1-textures.md) |
-| 持久化 | 日志、检查点、实体生命周期恢复、持久任务与定时事件、请求结果与去重 | [世界恢复](benchmarks/M3-local-world.md)、[执行与网络](benchmarks/B6-B7-execution-network.md) |
-| 联机 | 双向TLS与用户授权、TCP连接、授权复制、多人编辑、越界拒绝、撤权与重连 | [用户认证](benchmarks/M5-user-authentication.md)、[授权验收](benchmarks/A8-acceptance.md) |
-| Mod扩展 | Wasm包、类型化交互、嵌套状态、批量库存与实体生命周期，共同准备和提交 | [Mod动作](benchmarks/M4-mod-actions.md)、[Mod持久执行](benchmarks/M4-mod-durable.md) |
-| 内存预算 | 主程序共享世界、资源、复制、编解码、任务和缓存预留，支持背压、重试及生命周期释放 | [共享内存](benchmarks/M6-shared-memory.md) |
+| 世界与地形 | 方块状态、分区存储与流式装载、确定性地形生成、碰撞检测和网格生成 | [世界场景](benchmarks/archive/world/M1-scenario.md) |
+| 模拟与事务 | 固定步长Tick、阶段调度、实体与组件、动作授权、库存转移和跨模块原子提交 | [Tick执行](benchmarks/archive/simulation/M2-tick.md)、[跨模块事务](benchmarks/archive/mods/M4-cross-module.md) |
+| 图形客户端 | 窗口与离屏渲染、图集贴图与逐面材质、飞行与行走、方块选择与编辑、HUD、菜单和截图 | [窗口交互](benchmarks/archive/client/M1-window.md)、[地形贴图](benchmarks/archive/world/M1-textures.md) |
+| 持久化 | 日志、检查点、实体生命周期恢复、持久任务与定时事件、请求结果与去重 | [世界恢复](benchmarks/archive/persistence/M3-local-world.md)、[执行与网络](benchmarks/archive/network/B6-B7-execution-network.md) |
+| 联机 | 双向TLS与用户授权、TCP连接、授权复制、多人编辑、越界拒绝、撤权与重连 | [用户认证](benchmarks/archive/network/M5-user-authentication.md)、[授权验收](benchmarks/archive/network/A8-acceptance.md) |
+| Mod扩展 | Wasm包、类型化交互、嵌套状态、批量库存与实体生命周期，共同准备和提交 | [Mod动作](benchmarks/archive/mods/M4-mod-actions.md)、[Mod持久执行](benchmarks/archive/mods/M4-mod-durable.md) |
+| 内存预算 | 主程序共享世界、资源、复制、编解码、任务和缓存预留，支持背压、重试及生命周期释放 | [共享内存](benchmarks/archive/performance/M6-shared-memory.md) |
 
-联网移动已接入服务端固定Tick结算、持久运动状态与客户端预测校正，宿主可替换批准范围并重建订阅基线。自动跟随玩家的兴趣策略，以及图形界面对真实Mod机器的操作仍待装配。当前机器面板使用示例数据；放置与破坏尚未连接库存消耗和掉落。服务端使用有限世界，现有功能验证不代表大规模世界或高并发性能。
+联网移动已接入服务端固定Tick结算、持久运动状态与客户端预测校正。服务端可在批准范围内自动跟随玩家调整兴趣窗口，也可由宿主显式替换范围并重建订阅基线。物品模块已连接放置消耗、破坏回收与库存原子提交，回收产物直接进入背包，尚无地面掉落实体。当前图形机器面板使用示例数据，真实Mod机器面板仍待装配。默认服务端演示使用有限世界，不代表已经验证大规模世界或高并发性能。
 
 ## 快速开始
 
@@ -47,7 +47,8 @@ cargo run -p torse-client -- --window
 | 飞行升降 | 空格 / 左Shift |
 | 切换飞行与行走 | F5，行走时空格跳跃 |
 | 破坏 / 放置方块 | 短按鼠标左键 / 右键 |
-| 选择方块 | 数字键1到3 |
+| 选择快捷槽 / 打开物品栏 | 数字键1到9 / Tab |
+| 调试信息 | F8，可在按键设置中修改 |
 | 调节速度 | 鼠标滚轮 |
 | 菜单 / 机器面板预览 | Esc / E |
 | 截图 | F12 |
@@ -74,7 +75,7 @@ cargo run -p torse-server -- .work/demo-world --listen 127.0.0.1:7777 --fill --e
 cargo run -p torse-client -- --window --connect 127.0.0.1:7777
 ```
 
-可以再启动一个客户端，观察同一世界中的编辑结果。`--fill`只用于首次创建世界，重新打开同一目录时需去掉该参数。`--editors`会向所有连接授予演示范围内的编辑权限；省略时，客户端以访客权限连接，编辑请求会被拒绝。该策略仅用于回环地址的本地演示，远程连接改用双向TLS及用户配置，见[用户认证](benchmarks/M5-user-authentication.md)。
+可以再启动一个客户端，观察同一世界中的编辑结果。`--fill`只用于首次创建世界，重新打开同一目录时需去掉该参数。`--editors`会向所有连接授予演示范围内的编辑权限；省略时，客户端以访客权限连接，编辑请求会被拒绝。该策略仅用于回环地址的本地演示，远程连接改用双向TLS及用户配置，见[用户认证](benchmarks/archive/network/M5-user-authentication.md)。
 
 无需图形环境时，可在服务端运行期间使用无GPU客户端示例：
 
@@ -93,7 +94,7 @@ cargo run -p torse-server --example headless_client -- 127.0.0.1:7777
 | [apps](apps/README.md) | 图形客户端、独立服务端与开发工具 |
 | [crates](crates/README.md) | 世界、模拟、渲染、编码、存储、协议与网络等框架库 |
 | [crates/mod_sdk](crates/mod_sdk/src/lib.rs) | 面向Mod开发者的SDK |
-| [modules](modules/README.md) | 库存标准模块，以及预留的合成与能量模块 |
+| [modules](modules/README.md) | 库存、物品与可换肤UI模块，以及预留的合成与能量入口 |
 | [games/base](games/base/README.md) | 基础游戏的内容、规则与素材 |
 | [examples/mods](examples/mods/README.md) | 通过公开SDK实现的Mod示例 |
 | [tests](tests/README.md) | 跨模块场景、故障注入与测试夹具 |

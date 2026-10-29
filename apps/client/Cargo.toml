@@ -9,7 +9,6 @@ license.workspace = true
 gpu-tests = []
 
 [dependencies]
-ab_glyph = "=0.2.32"
 pollster = "0.4.0"
 png = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +16,8 @@ toml = "0.9"
 torse-assets = { path = "../../crates/assets" }
 torse-content = { path = "../../crates/content" }
 torse-inventory = { path = "../../modules/inventory" }
+torse-items = { path = "../../modules/items" }
+torse-ui = { path = "../../modules/ui" }
 torse-codec = { path = "../../crates/codec" }
 torse-net = { path = "../../crates/net" }
 torse-protocol = { path = "../../crates/protocol" }
@@ -27,4 +28,4 @@ torse-types = { path = "../../crates/types" }
 torse-world = { path = "../../crates/world" }
 torse-world-services = { path = "../../crates/world_services" }
 wgpu = { version = "=30.0.1", default-features = false, features = ["dx12", "metal", "vulkan", "wgsl", "std"] }
-winit = "=0.30.12"
+winit = { version = "=0.30.12", features = ["serde"] }

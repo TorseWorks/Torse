@@ -364,36 +364,14 @@ fn wedged(world: &WorldAuthority, handle: EntityHandle, id: EntityId) -> Result<
     if entity.id != id {
         return Err(RejectCode::MissingTarget);
     }
-    use torse_world_services::{Aabb, CollisionCell, CollisionSource, collides};
-    struct View<'a> {
-        world: &'a WorldAuthority,
-    }
-    impl CollisionSource for View<'_> {
-        fn shape_reach(&self) -> ([u8; 3], [u8; 3]) {
-            self.world.registry().collision_reach()
-        }
-        fn collision(&self, pos: torse_types::BlockPos) -> CollisionCell {
-            match self.world.store().query(pos) {
-                torse_world::TerrainQuery::Ready(state) => {
-                    match self.world.registry().collision_shape_ref(state) {
-                        None => CollisionCell::Empty,
-                        Some(shape) => CollisionCell::Solid(crate::movement::boxes(shape)),
-                    }
-                }
-                torse_world::TerrainQuery::NotLoaded => CollisionCell::NotLoaded,
-                torse_world::TerrainQuery::OutOfBounds => CollisionCell::OutOfBounds,
-                torse_world::TerrainQuery::Exterior => CollisionCell::Empty,
-            }
-        }
-    }
     let Some(half) = crate::body::of(entity, &[], WALKER_HALF)? else {
         return Ok(false);
     };
-    let collider = Aabb::from_center(
-        [entity.position.x, entity.position.y, entity.position.z],
-        half,
-    );
-    Ok(collides(&View { world }, &collider))
+    match crate::movement::observe_body(world.store(), world.registry(), entity.position, half) {
+        Ok(_) => Ok(false),
+        Err(RejectCode::Conflict) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 /// One tick of aggregated movement intent.

@@ -1,0 +1,19 @@
+[package]
+name = "torse-ui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[features]
+default = ["gpu"]
+gpu = ["dep:wgpu"]
+
+[dependencies]
+ab_glyph = "=0.2.32"
+png = "0.17"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+torse-assets = { path = "../../crates/assets" }
+torse-types = { path = "../../crates/types" }
+wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["dx12", "metal", "vulkan", "wgsl", "std"] }

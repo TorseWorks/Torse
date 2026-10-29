@@ -74,6 +74,119 @@ fn spawn(authority: &mut WorldAuthority, x: f64) -> EntityHandle {
         .expect("spawn")
 }
 
+#[test]
+fn movement_and_prediction_above_build_ceiling_land_on_the_highest_layer() {
+    let mut world = authority();
+    let upper = SectionPos::new(0, 1, 0);
+    world.store_mut().request(upper).unwrap();
+    world
+        .store_mut()
+        .install(upper, Section::empty(16).unwrap())
+        .unwrap();
+    world.store_mut().finish_load(upper).unwrap();
+    let stone = world.registry().default_state(&key("base:stone")).unwrap();
+    world
+        .store_mut()
+        .edit(BlockPos::new(2, 31, 2), stone)
+        .unwrap();
+    let start = Position::new(2.5, 35.0, 2.5);
+    assert!(
+        torse_sim::movement::observe_body(
+            world.store(),
+            world.registry(),
+            start,
+            torse_sim::player::WALKER_HALF
+        )
+        .unwrap()
+        .iter()
+        .all(|(_, query)| *query == TerrainQuery::Exterior)
+    );
+    let handle = world.entities_mut().spawn(start).unwrap();
+    let predicted = torse_sim::player::predict_step(
+        &world,
+        start,
+        torse_sim::player::WALKER_HALF,
+        torse_world::PlayerMotion {
+            vertical_micros: 0,
+            grounded: false,
+        },
+        torse_sim::player::MoveInput {
+            seq: 1,
+            wish: [0; 3],
+            jump: false,
+        },
+    )
+    .unwrap()
+    .0;
+    let mut walker = torse_sim::player::WalkerState::new(handle);
+    let first = torse_sim::player::walker_step(
+        &mut world,
+        &mut walker,
+        [0.0; 3],
+        false,
+        0.05,
+        &key("test:walker"),
+        TransactionId(1),
+    )
+    .unwrap()
+    .0;
+    assert!((first.y - predicted.y).abs() < 1e-7);
+    assert!(first.y < start.y);
+    for id in 2..80 {
+        torse_sim::player::walker_step(
+            &mut world,
+            &mut walker,
+            [0.0; 3],
+            false,
+            0.05,
+            &key("test:walker"),
+            TransactionId(id),
+        )
+        .unwrap();
+    }
+    let landed = world.entities().get(handle).unwrap().position;
+    assert!((landed.y - 32.9).abs() < 1e-6);
+    assert!(walker.grounded);
+    assert_eq!(
+        world.store().query(BlockPos::new(2, 32, 2)),
+        TerrainQuery::Exterior
+    );
+    assert!(
+        world
+            .store_mut()
+            .edit(BlockPos::new(2, 32, 2), stone)
+            .is_err()
+    );
+}
+
+#[test]
+fn ceiling_air_does_not_make_unknown_terrain_or_the_lower_boundary_passable() {
+    let mut world = authority();
+    let above_unknown = world
+        .entities_mut()
+        .spawn(Position::new(2.5, 32.5, 2.5))
+        .unwrap();
+    let tx = movement(&world, above_unknown, [0.0, -1.0, 0.0]);
+    assert!(matches!(
+        world.commit(&tx).unwrap().outcome,
+        TransactionOutcome::Rejected(_)
+    ));
+    assert_eq!(
+        world.entities().get(above_unknown).unwrap().position.y,
+        32.5
+    );
+    let below = world
+        .entities_mut()
+        .spawn(Position::new(2.5, -1.0, 2.5))
+        .unwrap();
+    let tx = movement(&world, below, [0.0, 1.0, 0.0]);
+    assert!(matches!(
+        world.commit(&tx).unwrap().outcome,
+        TransactionOutcome::Rejected(_)
+    ));
+    assert_eq!(world.entities().get(below).unwrap().position.y, -1.0);
+}
+
 fn committed(result: TransactionResult<torse_sim::Committed>) -> torse_sim::Committed {
     match result.outcome {
         TransactionOutcome::Committed { value, .. } => value,
@@ -645,6 +758,75 @@ fn malformed_replay_moves_are_validated_before_any_terrain_write() {
         );
         assert_eq!(entities.get(handle).expect("entity").position.x, 2.0);
         assert_eq!(entities.indexed_count(), 1);
+    }
+}
+
+#[test]
+fn explicit_exterior_faces_control_crossings_and_recover_with_the_same_rules() {
+    for below in [false, true] {
+        for above in [false, true] {
+            let mut world = authority();
+            world
+                .set_exterior_policy(ExteriorPolicy { below, above })
+                .unwrap();
+            let upper = SectionPos::new(0, 1, 0);
+            world.store_mut().request(upper).unwrap();
+            world
+                .store_mut()
+                .install(upper, Section::empty(16).unwrap())
+                .unwrap();
+            world.store_mut().finish_load(upper).unwrap();
+            for (start, delta, open) in [
+                (Position::new(2.5, 30.0, 2.5), 4.0, above),
+                (Position::new(4.5, 2.0, 2.5), -4.0, below),
+            ] {
+                let handle = world.entities_mut().spawn(start).unwrap();
+                committed(
+                    world
+                        .commit(&movement(&world, handle, [0.0, delta, 0.0]))
+                        .unwrap(),
+                );
+                let y = world.entities().get(handle).unwrap().position.y;
+                assert_eq!(
+                    y < 0.0 || y > 32.0,
+                    open,
+                    "policy={below:?}/{above:?}, y={y}"
+                );
+            }
+            let exterior = Position::new(2.5, 34.0, 2.5);
+            assert_eq!(
+                torse_sim::movement::observe_body(
+                    world.store(),
+                    world.registry(),
+                    exterior,
+                    torse_sim::player::WALKER_HALF,
+                )
+                .is_ok(),
+                above
+            );
+            let snapshot = world.capture_snapshot(snapshot_meta(&world)).unwrap();
+            let mut recovery =
+                torse_sim::Recovery::new(world.world(), world.registry(), world.schemas());
+            recovery.restore_snapshot(&snapshot).unwrap();
+            let restored = recovery.finish().unwrap();
+            assert_eq!(restored.store().exterior(), ExteriorPolicy { below, above });
+            assert_eq!(
+                restored.store().query(BlockPos::new(2, 32, 2)),
+                if above {
+                    TerrainQuery::Exterior
+                } else {
+                    TerrainQuery::OutOfBounds
+                }
+            );
+            assert_eq!(
+                restored.store().query(BlockPos::new(2, -1, 2)),
+                if below {
+                    TerrainQuery::Exterior
+                } else {
+                    TerrainQuery::OutOfBounds
+                }
+            );
+        }
     }
 }
 

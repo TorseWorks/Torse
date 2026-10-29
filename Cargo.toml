@@ -26,6 +26,8 @@ members = [
     "modules/inventory",
     "modules/crafting",
     "modules/energy",
+    "modules/ui",
+    "modules/items",
 ]
 resolver = "3"
 
@@ -36,6 +38,18 @@ publish = false
 license = "GPL-3.0-only"
 
 # Keep large native TLS/Wasm links within Windows PDB type-record limits.
-# Tests inherit this profile; assertions and overflow checks stay enabled.
+# Interactive development keeps diagnostics while optimizing hot loops.
 [profile.dev]
 debug = "limited"
+opt-level = 1
+debug-assertions = true
+overflow-checks = true
+
+# Keep test builds fast and exercise fully unoptimized code as well.
+[profile.test]
+opt-level = 0
+
+# Use when source-level stepping needs the original instruction order.
+[profile.debug-unoptimized]
+inherits = "dev"
+opt-level = 0

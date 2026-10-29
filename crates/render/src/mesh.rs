@@ -445,7 +445,7 @@ pub fn build_mesh_bounded(
     )
 }
 
-/// Merge coplanar opaque cube runs with identical materials and tints.
+/// Merge coplanar opaque cube faces into rectangles with identical materials and tints.
 /// Missing borders, shaped blocks and overlays retain ordinary face semantics.
 /// Reserve occupancy_scratch_bytes in addition to bounded output.
 /// UVs repeat per cell; consumers must support tiled local face coordinates.
@@ -623,18 +623,22 @@ fn build_mesh_inner(
     Ok(mesh)
 }
 
-/// Temporary row-table and nonempty-row flag payload, excluding stack metadata.
+/// Temporary meshing-work payload, excluding stack metadata.
 ///
 /// Budgeted callers reserve these bytes in their shared mesh class before
 /// copying mesh input or starting work, and keep the lease until work ends.
-/// Invalid sides outside `1..=64` require no scratch allocation.
+/// The optimized path also retains one plane of face appearances and its used
+/// bits while it coalesces rectangles. Sides outside `1..=64` use the
+/// reference path without these allocations.
 pub fn occupancy_scratch_bytes(side: u32) -> u64 {
     if side == 0 || side > 64 {
         return 0;
     }
     let word = if side <= 32 { 4 } else { 8 };
     let rows = u64::from(side) * u64::from(side);
-    rows * word + rows.div_ceil(64) * 8
+    let occupancy = rows * word + rows.div_ceil(64) * 8;
+    let rectangle_work = rows * (size_of::<Option<FaceAppearance>>() + size_of::<bool>()) as u64;
+    occupancy.saturating_add(rectangle_work)
 }
 
 struct OccupancyCharge<'a> {
@@ -1857,9 +1861,56 @@ mod tests {
         let mesh = build_mesh_accounted(4, SectionPos::ZERO, sample, &mut ledger).unwrap();
         assert_eq!(ledger.total_usage(), 0);
         assert_eq!(mesh.face_count(), 6);
-        assert_eq!(occupancy_scratch_bytes(32), 32 * 32 * 4 + 128);
-        assert_eq!(occupancy_scratch_bytes(64), 64 * 64 * 8 + 512);
+        let rectangle_cell = (size_of::<Option<FaceAppearance>>() + size_of::<bool>()) as u64;
+        assert_eq!(
+            occupancy_scratch_bytes(32),
+            32 * 32 * 4 + 128 + 32 * 32 * rectangle_cell
+        );
+        assert_eq!(
+            occupancy_scratch_bytes(64),
+            64 * 64 * 8 + 512 + 64 * 64 * rectangle_cell
+        );
         assert_eq!(occupancy_scratch_bytes(65), 0);
+    }
+
+    #[test]
+    fn rectangle_work_is_reserved_before_zero_output_meshing() {
+        let sampled = Cell::new(0);
+        let empty = |_| {
+            sampled.set(sampled.get() + 1);
+            MeshSample::Ready(RenderBlock::EMPTY)
+        };
+        let mut denied = MemoryLedger::new(MemoryBudget::new(
+            occupancy_scratch_bytes(64).saturating_sub(1),
+        ));
+        assert_eq!(
+            build_mesh_inner(
+                64,
+                SectionPos::ZERO,
+                empty,
+                || false,
+                Some(0),
+                Some(&mut denied),
+                MeshMode::Runs,
+            ),
+            Err(MeshBuildError::Memory)
+        );
+        assert_eq!(sampled.get(), 0, "denied work must not sample or allocate");
+        assert_eq!(denied.total_usage(), 0);
+
+        let mut exact = MemoryLedger::new(MemoryBudget::new(occupancy_scratch_bytes(64)));
+        let mesh = build_mesh_inner(
+            64,
+            SectionPos::ZERO,
+            |_| MeshSample::Ready(RenderBlock::EMPTY),
+            || false,
+            Some(0),
+            Some(&mut exact),
+            MeshMode::Runs,
+        )
+        .unwrap();
+        assert!(mesh.is_empty());
+        assert_eq!(exact.total_usage(), 0, "scratch is released after meshing");
     }
 
     #[test]

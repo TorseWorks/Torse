@@ -132,9 +132,13 @@ impl ExecutionHost {
             candidate.insert(change.page.sections[0].pos, change.reference.clone());
             wire::measure_inner(&candidate, self.limits.runtime, self.limits.codec)?;
         }
-        let world = self
-            .world()
-            .prepare_section(&change.page, change.load, self.limits.runtime)?;
+        let world = if change.fresh {
+            self.world()
+                .prepare_generated_section(&change.page, self.limits.runtime)?
+        } else {
+            self.world()
+                .prepare_section(&change.page, change.load, self.limits.runtime)?
+        };
         let meta = world.meta();
         let changes = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
             .map_err(|e| Fault::invalid_data(e.to_string()))?;
@@ -180,7 +184,7 @@ fn check_reference(
     }
     let pos = change.page.sections[0].pos;
     let valid = if change.fresh {
-        change.load && !parked.contains_key(&pos) && change.page.entities.is_empty()
+        change.load && !parked.contains_key(&pos)
     } else if change.load {
         parked.get(&pos) == Some(&change.reference)
     } else {
@@ -270,7 +274,7 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         self.authority.section_pending = Some(self.authority.prepare_residency(change)?);
         self.drive_one(sink)
     }
-    /// Install trusted generated terrain. Fresh pages cannot introduce entity identities.
+    /// Install trusted generated terrain and freshly allocated attached state atomically.
     pub fn install_section(
         &mut self,
         pages: &SectionPages,
@@ -349,12 +353,20 @@ impl ExecutionRecovery<'_> {
         if pages.digest(&change.page)? != change.reference.digest {
             return Err(Fault::invalid_data("journal page digest mismatch"));
         }
-        self.recovery.replay_section(
-            &record.changes.world,
-            &change.page,
-            change.load,
-            self.limits.runtime,
-        )?;
+        if change.fresh {
+            self.recovery.replay_generated_section(
+                &record.changes.world,
+                &change.page,
+                self.limits.runtime,
+            )?;
+        } else {
+            self.recovery.replay_section(
+                &record.changes.world,
+                &change.page,
+                change.load,
+                self.limits.runtime,
+            )?;
+        }
         let pos = change.page.sections[0].pos;
         if change.load {
             self.parked.remove(&pos);

@@ -597,6 +597,94 @@ fn fresh_terrain_is_durable_and_rejects_existing_sections_or_imported_entity_ids
 }
 
 #[test]
+fn generated_entities_allocate_atomically_and_survive_journal_and_page_recovery() {
+    let dir = Directory::new();
+    let pages = pages(&dir);
+    let mut server = create(&dir);
+    let pos = SectionPos::new(2, 0, 0);
+    let mut page = generated(server.authority().unwrap().world(), pos);
+    let next = page.next_entity_id;
+    page.entities.push(SnapshotEntity {
+        id: EntityId(next),
+        position_bits: Position::new(33.5, 1.5, 1.5).to_bits(),
+        components: Vec::new(),
+    });
+    page.next_entity_id = next + 1;
+    let mut invalid = page.clone();
+    invalid.entities[0].id = EntityId(next - 1);
+    assert!(
+        server
+            .install_section(&pages, invalid, &mut NoReplicas)
+            .is_err()
+    );
+    assert_eq!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .next_entity_id(),
+        next
+    );
+    let mut gap = page.clone();
+    gap.entities[0].id = EntityId(next + 1);
+    gap.next_entity_id = next + 2;
+    assert!(
+        server
+            .install_section(&pages, gap, &mut NoReplicas)
+            .is_err()
+    );
+    durable(
+        server
+            .install_section(&pages, page, &mut NoReplicas)
+            .unwrap(),
+    );
+    drop(server);
+    let mut server = open(&dir, pages.clone()).unwrap();
+    assert!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .handle_of(EntityId(next))
+            .is_some()
+    );
+    assert_eq!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .next_entity_id(),
+        next + 1
+    );
+    durable(server.unload_section(&pages, pos, &mut NoReplicas).unwrap());
+    server.checkpoint().unwrap();
+    drop(server);
+    let mut server = open(&dir, pages.clone()).unwrap();
+    durable(server.reload_section(&pages, pos, &mut NoReplicas).unwrap());
+    assert!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .handle_of(EntityId(next))
+            .is_some()
+    );
+    assert_eq!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .next_entity_id(),
+        next + 1
+    );
+}
+
+#[test]
 fn corrupt_or_missing_parked_pages_refuse_recovery_without_rewriting_world_data() {
     let dir = Directory::new();
     let pages = pages(&dir);

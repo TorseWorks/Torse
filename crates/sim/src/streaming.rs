@@ -71,6 +71,7 @@ pub(crate) fn prepare(
     world: &WorldAuthority,
     page: &Snapshot,
     load: bool,
+    generated: bool,
     budget: OutputBudget,
 ) -> Result<PreparedSection, Fault> {
     if page.sections.len() != 1
@@ -79,11 +80,30 @@ pub(crate) fn prepare(
         || page.meta.cursor.world != world.world()
         || page.meta.compatibility != world.coordinator().compatibility()
         || page.meta.cursor.seq > world.seq()
-        || page.next_entity_id > world.entities().next_entity_id()
+        || (!generated && page.next_entity_id > world.entities().next_entity_id())
     {
         return Err(Fault::invalid_data(
             "section page does not match this world",
         ));
+    }
+    if generated {
+        let first = world.entities().next_entity_id();
+        let end = first
+            .checked_add(page.entities.len() as u128)
+            .ok_or_else(|| Fault::resource_limit("generated entity allocator exhausted"))?;
+        if !load
+            || page.meta.cursor.seq != world.seq()
+            || page.next_entity_id != end
+            || page
+                .entities
+                .iter()
+                .enumerate()
+                .any(|(index, entity)| entity.id.0 != first + index as u128)
+        {
+            return Err(Fault::invalid_data(
+                "generated identities must extend the current allocator",
+            ));
+        }
     }
     // Budget and canonical structure are checked before cloning the page.
     let checked = torse_world::SnapshotArchive::import_legacy(

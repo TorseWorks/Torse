@@ -305,6 +305,7 @@ impl<T: Transport> Connection<T> {
                 self.prediction.receive(update);
                 Ok(Some(NetEvent::Player(update)))
             }
+            ServerMessage::ControlReady { .. } | ServerMessage::ControlAck { .. } => Ok(None),
         }
     }
 }

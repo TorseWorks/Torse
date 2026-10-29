@@ -24,6 +24,8 @@ const CLICK_SLOP: f64 = 4.0;
 /// Aggregated input state between frames.
 #[derive(Debug, Default)]
 pub struct InputState {
+    pub bindings: crate::settings::Bindings,
+    pub invert_y: bool,
     held: BTreeSet<KeyCode>,
     look_delta: PhysicalPosition<f64>,
     dragging: bool,
@@ -50,8 +52,8 @@ impl InputState {
         };
         match state {
             ElementState::Pressed => {
-                self.held.insert(code);
-                if code == KeyCode::F12 {
+                let fresh = self.held.insert(code);
+                if fresh && code == self.bindings.screenshot {
                     self.screenshot = true;
                 }
             }
@@ -117,12 +119,13 @@ impl InputState {
             (self.held.contains(&positive) as i32 - self.held.contains(&negative) as i32) as f32
         };
         let yaw_delta = -(self.look_delta.x as f32) * LOOK_PER_PIXEL;
-        let pitch_delta = -(self.look_delta.y as f32) * LOOK_PER_PIXEL;
+        let pitch_delta =
+            -(self.look_delta.y as f32) * LOOK_PER_PIXEL * if self.invert_y { -1.0 } else { 1.0 };
         self.look_delta = PhysicalPosition::new(0.0, 0.0);
         let input = MoveInput {
-            forward: axis(KeyCode::KeyW, KeyCode::KeyS),
-            strafe: axis(KeyCode::KeyD, KeyCode::KeyA),
-            vertical: axis(KeyCode::Space, KeyCode::ShiftLeft),
+            forward: axis(self.bindings.forward, self.bindings.back),
+            strafe: axis(self.bindings.right, self.bindings.left),
+            vertical: axis(self.bindings.jump, self.bindings.descend),
             yaw_delta,
             pitch_delta,
         };
@@ -133,7 +136,7 @@ impl InputState {
 
     /// Whether the jump key is currently held.
     pub fn jump_held(&self) -> bool {
-        self.held.contains(&KeyCode::Space)
+        self.held.contains(&self.bindings.jump)
     }
 
     /// Feed one captured-mouse motion step.
@@ -177,6 +180,34 @@ impl InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rebound_movement_and_screenshot_keys_and_inverted_look_take_effect() {
+        let mut state = InputState::new();
+        state
+            .bindings
+            .rebind(crate::settings::Binding::Forward, KeyCode::KeyZ)
+            .unwrap();
+        state
+            .bindings
+            .rebind(crate::settings::Binding::Screenshot, KeyCode::F10)
+            .unwrap();
+        state.invert_y = true;
+        state.key(PhysicalKey::Code(KeyCode::KeyW), ElementState::Pressed);
+        assert_eq!(state.take_input(12.0).0.forward, 0.0);
+        state.key(PhysicalKey::Code(KeyCode::KeyZ), ElementState::Pressed);
+        state.mouse_look(0.0, 2.0);
+        let input = state.take_input(12.0).0;
+        assert_eq!(input.forward, 1.0);
+        assert!(input.pitch_delta > 0.0);
+        state.key(PhysicalKey::Code(KeyCode::F12), ElementState::Pressed);
+        assert!(!state.take_screenshot());
+        state.key(PhysicalKey::Code(KeyCode::F10), ElementState::Pressed);
+        assert!(state.take_screenshot());
+        state.key(PhysicalKey::Code(KeyCode::F10), ElementState::Pressed);
+        assert!(!state.take_screenshot());
+        state.reset();
+        assert_eq!(state.take_input(12.0).0.forward, 0.0);
+    }
     #[test]
     fn focus_reset_cancels_held_movement_and_late_mouse_release() {
         let mut state = InputState::new();

@@ -1,0 +1,15 @@
+[package]
+name = "torse-items"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2 = "=0.10.9"
+torse-actions = { path = "../../crates/actions" }
+torse-content = { path = "../../crates/content" }
+torse-inventory = { path = "../inventory" }
+torse-sim = { path = "../../crates/sim" }
+torse-types = { path = "../../crates/types" }
+torse-world = { path = "../../crates/world" }
