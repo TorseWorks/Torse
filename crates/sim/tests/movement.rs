@@ -788,7 +788,7 @@ fn explicit_exterior_faces_control_crossings_and_recover_with_the_same_rules() {
                 );
                 let y = world.entities().get(handle).unwrap().position.y;
                 assert_eq!(
-                    y < 0.0 || y > 32.0,
+                    !(0.0..=32.0).contains(&y),
                     open,
                     "policy={below:?}/{above:?}, y={y}"
                 );
