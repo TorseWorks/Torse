@@ -18,6 +18,92 @@ pub const PICKUP_REACH: f64 = 3.0;
 pub const MAX_STEP_BODIES: usize = 64;
 const STEP: f64 = 0.05;
 
+fn leave_filled_cell(
+    world: &WorldAuthority,
+    entity: &Entity,
+    id: TransactionId,
+    ordering: OrderingKey,
+) -> Option<Transaction> {
+    // Only initial inert bodies need this: terrain may have been filled again
+    // between the harvest and the first collider activation.
+    if torse_sim::movement::observe_body(
+        world.store(),
+        world.registry(),
+        entity.position,
+        [HALF; 3],
+    ) != Err(RejectCode::Conflict)
+    {
+        return None;
+    }
+    let mut previous = Vec::new();
+    for x in [
+        (entity.position.x - HALF).floor() as i64,
+        (entity.position.x + HALF).floor() as i64,
+    ] {
+        for y in [
+            (entity.position.y - HALF).floor() as i64,
+            (entity.position.y + HALF).floor() as i64,
+        ] {
+            for z in [
+                (entity.position.z - HALF).floor() as i64,
+                (entity.position.z + HALF).floor() as i64,
+            ] {
+                let pos = torse_types::BlockPos::new(x, y, z);
+                let state = world.store().query(pos).ready()?;
+                if !previous.iter().any(|(p, _)| *p == pos) {
+                    previous.push((pos, state));
+                }
+            }
+        }
+    }
+    let actor = ActorContext::new(owner())
+        .target(ActionTarget::Entity(entity.id))
+        .permission(torse_sim::action::relocate_permission());
+    for [dx, dy, dz] in [
+        [0., 1., 0.],
+        [-1., 0., 0.],
+        [1., 0., 0.],
+        [0., 0., -1.],
+        [0., 0., 1.],
+        [0., -1., 0.],
+    ] {
+        let destination = Position::new(
+            entity.position.x + dx,
+            entity.position.y + dy,
+            entity.position.z + dz,
+        );
+        let Ok(reads) = torse_sim::movement::observe_body(
+            world.store(),
+            world.registry(),
+            destination,
+            [HALF; 3],
+        ) else {
+            continue;
+        };
+        if reads.iter().any(|(_, query)| query.ready().is_none()) {
+            continue;
+        }
+        let Ok(mut tx) = actor.view(world).plan_relocation(
+            entity.id,
+            entity.position,
+            destination,
+            torse_sim::DestinationPolicy::Clear,
+            id,
+            ordering,
+        ) else {
+            continue;
+        };
+        for (pos, state) in &previous {
+            tx.read_block(*pos, *state);
+        }
+        for (pos, query) in reads {
+            tx.read_block(pos, query.ready()?);
+        }
+        return Some(tx);
+    }
+    None
+}
+
 pub fn schema() -> ContentKey {
     key("items:schema/drop")
 }
@@ -369,6 +455,10 @@ pub fn plans(world: &WorldAuthority, catalog: &Catalog, tick: Tick) -> Vec<Trans
                 id,
                 ordering,
             ) && let Ok(group) = TransactionGroup::new(id, ordering, vec![tx])
+            {
+                groups.push(group);
+            } else if let Some(tx) = leave_filled_cell(world, entity, id, ordering)
+                && let Ok(group) = TransactionGroup::new(id, ordering, vec![tx])
             {
                 groups.push(group);
             }

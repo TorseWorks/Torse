@@ -502,12 +502,13 @@ mod tests {
     #[test]
     fn default_states_cover_every_block() {
         let registry = fixture_registry();
-        assert_eq!(registry.block_count(), 4);
+        assert_eq!(registry.block_count(), 5);
         for block in [
             key("base:stone"),
             key("base:glass_slab"),
             key("base:plant"),
             key("base:glass"),
+            key("base:vertical_glass_slab"),
         ] {
             let state = registry
                 .default_state(&block)

@@ -160,6 +160,94 @@ fn physical_harvest_falls_and_persists_without_automatic_pickup() {
 }
 
 #[test]
+fn initial_drop_escapes_refilled_terrain_but_waits_when_enclosed_or_unloaded() {
+    for case in 0..3 {
+        let (mut world, _, catalog, _) = setup_policy(true);
+        let y = if case == 2 { 15 } else { 8 };
+        let at = Position::new(8.5, f64::from(y) + 0.5, 8.5);
+        let h = world.entities_mut().spawn(at).unwrap();
+        let schemas = world.schemas().clone();
+        world
+            .entities_mut()
+            .components_mut(h)
+            .unwrap()
+            .insert(
+                &schemas,
+                &torse_items::drops::schema(),
+                torse_items::drops::DropState {
+                    stack: ItemStack {
+                        item: key("base:stone"),
+                        count: 7,
+                    },
+                    velocity: [0; 3],
+                }
+                .fields(),
+            )
+            .unwrap();
+        world
+            .entities_mut()
+            .components_mut(h)
+            .unwrap()
+            .insert(
+                &schemas,
+                &collider_schema(),
+                EntityCollider::Disabled.fields(),
+            )
+            .unwrap();
+        let stone = world.registry().default_state(&key("base:stone")).unwrap();
+        world
+            .store_mut()
+            .edit(BlockPos::new(8, y.into(), 8), stone)
+            .unwrap();
+        if case != 0 {
+            for [dx, dy, dz] in [
+                [0, 1, 0],
+                [-1, 0, 0],
+                [1, 0, 0],
+                [0, 0, -1],
+                [0, 0, 1],
+                [0, -1, 0],
+            ] {
+                if case == 2 && dy == 1 {
+                    continue;
+                }
+                world
+                    .store_mut()
+                    .edit(BlockPos::new(8 + dx, i64::from(y) + dy, 8 + dz), stone)
+                    .unwrap();
+            }
+        }
+        for tick in 1..30 {
+            for group in torse_items::drops::plans(&world, &catalog, Tick(tick)) {
+                let prepared = world.prepare_group(&group).unwrap();
+                world.publish(prepared).unwrap();
+            }
+        }
+        let body = world.entities().get(h).unwrap();
+        assert_eq!(
+            torse_items::drops::DropState::read(body, &catalog)
+                .unwrap()
+                .stack
+                .count,
+            7
+        );
+        if case == 0 {
+            assert!((body.position.y - 9.125).abs() < 1e-6);
+            assert_eq!(
+                EntityCollider::of(body).unwrap(),
+                Some(EntityCollider::Box { half: [125_000; 3] })
+            );
+        } else {
+            assert_eq!(body.position.to_bits(), at.to_bits());
+            assert_eq!(
+                EntityCollider::of(body).unwrap(),
+                Some(EntityCollider::Disabled)
+            );
+        }
+    }
+}
+
+#[test]
 fn pickup_is_atomic_partial_and_rejects_forged_child_actions() {
     let (mut world, service, catalog, id) = setup_policy(true);
     let handle = world.entities().handle_of(id).unwrap();
