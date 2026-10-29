@@ -421,6 +421,9 @@ fn run(
         Some(directory) => Scene::new_game(radius, std::path::Path::new(directory))?,
         None => Scene::new(radius)?,
     };
+    if ui_preview.is_some() {
+        scene.enable_items(None)?;
+    }
     scene
         .attach_memory_prepared(pool.clone(), world_memory)
         .map_err(|error| error.to_string())?;
@@ -483,7 +486,7 @@ fn run(
         return Err("transparent sorting exceeds memory budget".into());
     }
     if let Some(mode) = ui_preview {
-        renderer.render_ui(mode)?;
+        renderer.render_ui(mode, &scene)?;
     }
     renderer.save_png(path)?;
 

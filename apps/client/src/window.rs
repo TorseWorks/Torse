@@ -471,6 +471,7 @@ impl WindowApp {
                             [gpu.config.width, gpu.config.height],
                             &self.ui,
                             crate::ui::Hud {
+                                scene: self.scene.as_ref(),
                                 material: self.material,
                                 network: self.net.is_some(),
                                 ready: false,
@@ -956,6 +957,7 @@ impl WindowApp {
             [gpu.config.width, gpu.config.height],
             &self.ui,
             crate::ui::Hud {
+                scene: self.scene.as_ref(),
                 material: self.material,
                 network: self.net.is_some(),
                 ready: self.scene.is_some(),

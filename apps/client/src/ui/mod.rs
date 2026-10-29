@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use style::{MUTED, SEPARATOR, TEXT, TITLE_TEXT};
 use torse_ui::{Part, Theme};
 mod inventory;
+mod models;
 mod settings;
 mod themes;
 
@@ -253,31 +254,6 @@ impl Layout {
     }
 }
 
-/// Content icons only; every piece of window chrome is drawn by `style`.
-struct Skin {
-    icons: Vec<Sprite>,
-}
-impl Skin {
-    fn load() -> Result<Self, String> {
-        let catalog = crate::texture::resident_base_assets()?;
-        let sources = [
-            crate::texture::BASE_ICON_STONE,
-            crate::texture::BASE_ICON_GLASS,
-            crate::texture::BASE_ICON_PLANT,
-        ];
-        Ok(Self {
-            icons: sources
-                .into_iter()
-                .map(|guid| {
-                    let handle = catalog.handle(guid).ok_or("base icon is not resident")?;
-                    let bytes = catalog.get(handle).ok_or("base icon handle is stale")?;
-                    Sprite::decode(bytes, (16, 16), guid)
-                })
-                .collect::<Result<_, _>>()?,
-        })
-    }
-}
-
 #[derive(PartialEq, Eq)]
 struct View {
     size: [u32; 2],
@@ -305,7 +281,7 @@ struct View {
 
 pub struct Layer {
     overlay: Overlay,
-    skin: Skin,
+    models: models::Models,
     text: Text,
     labels: BTreeMap<&'static str, &'static str>,
     last: Option<View>,
@@ -316,6 +292,7 @@ pub struct Layer {
     memory: Option<torse_types::MemoryPool>,
 }
 pub struct Hud<'a> {
+    pub scene: Option<&'a crate::scene::Scene>,
     pub material: usize,
     pub network: bool,
     pub ready: bool,
@@ -334,9 +311,7 @@ impl Layer {
         self.last = None;
         self.theme.attach_memory(pool.clone())?;
         self.text.attach_memory(pool.clone())?;
-        for icon in &mut self.skin.icons {
-            icon.attach_memory(pool.clone())?;
-        }
+        self.models.attach_memory(pool.clone())?;
         self.memory = Some(pool);
         Ok(())
     }
@@ -370,7 +345,7 @@ impl Layer {
             })?;
         Ok(Self {
             overlay: Overlay::new(device, format),
-            skin: Skin::load()?,
+            models: models::Models::default(),
             text,
             labels: resource
                 .lines()
@@ -392,6 +367,17 @@ impl Layer {
         state: &State,
         hud: Hud<'_>,
     ) {
+        if let Some(scene) = hud.scene {
+            let keys = hud
+                .inventory
+                .iter()
+                .chain(hud.bar.iter())
+                .filter_map(|s| s.as_ref().map(|s| s.item.clone()))
+                .chain(["base:stone", "base:glass_slab", "base:plant"].map(torse_items::key));
+            if self.models.prepare(scene, keys, self.memory.as_ref()) {
+                self.last = None;
+            }
+        }
         let layout = Layout::new(size);
         let names = if hud.bar.is_empty() {
             hud.names.into_iter().take(3).collect()
@@ -642,7 +628,10 @@ impl Layer {
                     v.bar.get(i).and_then(Option::as_ref),
                 );
             } else if packaged {
-                c.sprite(&self.skin.icons[i], Rect::new(x + 4, slot_y + 4, 16, 16), 0);
+                let item = torse_items::key(["base:stone", "base:glass_slab", "base:plant"][i]);
+                if let Some(sprite) = self.models.get(&item) {
+                    c.sprite(sprite, Rect::new(x + 1, slot_y + 1, 22, 22), 0);
+                }
             }
             self.text.draw(
                 c,
@@ -774,11 +763,10 @@ impl Layer {
             self.theme
                 .slot(c, Rect::new(gx + 36, p.y + 58, 24, 24), false);
             if let Some(index) = icon {
-                c.sprite(
-                    &self.skin.icons[index],
-                    Rect::new(gx + 40, p.y + 62, 16, 16),
-                    0,
-                );
+                let item = torse_items::key(["base:stone", "base:glass_slab", "base:plant"][index]);
+                if let Some(sprite) = self.models.get(&item) {
+                    c.sprite(sprite, Rect::new(gx + 37, p.y + 59, 22, 22), 0);
+                }
                 self.text
                     .draw(c, "1", Rect::new(gx + 37, p.y + 60, 8, 9), 8, MUTED);
             }
@@ -826,6 +814,8 @@ mod tests {
         layer.attach_memory(pool.clone()).unwrap();
         let mut state = State::default();
         let hud = || Hud {
+            scene: None,
+            bar: Vec::new(),
             material: 0,
             network: false,
             ready: true,
@@ -857,14 +847,6 @@ mod tests {
         drop(held);
         drop(layer);
         assert_eq!(pool.usage().total, 0);
-    }
-    #[test]
-    fn content_icons_decode_at_the_declared_dimensions() {
-        let skin = Skin::load().unwrap();
-        assert_eq!(skin.icons.len(), 3);
-        for icon in &skin.icons {
-            assert_eq!((icon.width, icon.height), (16, 16));
-        }
     }
     #[test]
     fn modal_buttons_require_press_and_release_on_the_same_target() {

@@ -33,16 +33,15 @@ impl Layer {
         let Some(stack) = stack else {
             return;
         };
-        let icon = match stack.item.to_string().as_str() {
-            "base:stone" => Some(0),
-            "base:glass_slab" => Some(1),
-            "base:plant" => Some(2),
-            _ => None,
-        };
-        if let Some(icon) = icon {
+        if let Some(sprite) = self.models.get(&stack.item) {
             c.sprite(
-                &self.skin.icons[icon],
-                Rect::new(rect.x + 4, rect.y + 4, 16, 16),
+                sprite,
+                Rect::new(
+                    rect.x + 1,
+                    rect.y + 1,
+                    rect.w.saturating_sub(2),
+                    rect.h.saturating_sub(2),
+                ),
                 0,
             );
         } else {

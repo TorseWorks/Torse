@@ -1388,7 +1388,11 @@ impl Renderer {
     }
 
     /// Draw the same UI used by the window into an offscreen capture.
-    pub fn render_ui(&self, mode: crate::ui::Mode) -> Result<(), String> {
+    pub fn render_ui(
+        &self,
+        mode: crate::ui::Mode,
+        scene: &crate::scene::Scene,
+    ) -> Result<(), String> {
         let (device, queue) = self.context.parts();
         let mut layer = crate::ui::Layer::new(device, TextureFormat::Rgba8UnormSrgb)?;
         let mut state = crate::ui::State::default();
@@ -1399,9 +1403,10 @@ impl Renderer {
             [self.width, self.height],
             &state,
             crate::ui::Hud {
+                scene: Some(scene),
                 debug_lines: &[],
-                inventory: vec![],
-                bar: vec![],
+                inventory: scene.inventory_slots(),
+                bar: scene.inventory_slots().into_iter().take(9).collect(),
                 material: 0,
                 network: false,
                 ready: true,

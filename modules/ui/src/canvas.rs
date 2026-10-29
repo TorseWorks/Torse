@@ -55,12 +55,21 @@ impl Sprite {
         Self::from_pixels(info.width, info.height, pixels, guid)
     }
 
-    fn from_pixels(
+    /// Construct a bounded RGBA sprite, including procedurally derived previews.
+    pub fn from_pixels(
         width: u32,
         height: u32,
         pixels: Vec<u8>,
         guid: AssetGuid,
     ) -> Result<Self, String> {
+        if width == 0
+            || height == 0
+            || width > 1024
+            || height > 1024
+            || pixels.len() != width as usize * height as usize * 4
+        {
+            return Err("UI sprite has invalid dimensions or RGBA length".into());
+        }
         let mut assets = AssetCatalog::new(MemoryBudget::new(8 * 1024 * 1024));
         let handle = assets
             .load(guid, &pixels, &[], &[])

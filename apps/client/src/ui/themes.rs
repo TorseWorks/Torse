@@ -139,6 +139,8 @@ mod tests {
             [640, 360],
             &state,
             Hud {
+                scene: None,
+                bar: Vec::new(),
                 material: 0,
                 network: false,
                 ready: true,
