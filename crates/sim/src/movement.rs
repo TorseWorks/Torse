@@ -382,8 +382,8 @@ fn trace_loaded(
 /// Whether an enabled body at `position` is clear of terrain.
 ///
 /// `Ok` lists the cells that were observed. Overlap is [`RejectCode::Conflict`].
-/// Missing cells and the lower world boundary are [`RejectCode::NotLoaded`].
-/// Space above the build ceiling is known empty for body movement.
+/// Missing cells and closed exterior faces are [`RejectCode::NotLoaded`].
+/// Open exterior faces are known empty for body movement.
 pub fn observe_body(
     store: &SectionStore,
     registry: &BlockStateRegistry,
@@ -496,12 +496,6 @@ impl CollisionSource for CollisionView<'_> {
         self.registry.collision_reach()
     }
     fn collision(&self, pos: BlockPos) -> CollisionCell {
-        // World bounds constrain stored blocks. The immutable build ceiling
-        // does not cap entity motion: bodies may stand on its highest layer
-        // or fall back into loaded terrain. No mutable cell exists up here.
-        if pos.y >= self.store.bounds().max_y {
-            return CollisionCell::Empty;
-        }
         let observed = self.store.query(pos);
         self.reads.borrow_mut().insert(pos, observed);
         match observed {
@@ -526,6 +520,7 @@ impl CollisionSource for CollisionView<'_> {
             }
             TerrainQuery::NotLoaded => CollisionCell::NotLoaded,
             TerrainQuery::OutOfBounds => CollisionCell::OutOfBounds,
+            TerrainQuery::Exterior => CollisionCell::Empty,
         }
     }
 }

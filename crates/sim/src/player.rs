@@ -102,7 +102,10 @@ pub fn plan_step(
             TerrainQuery::Ready(state) => {
                 tx.read_block(pos, state);
             }
-            _ => return Err(RejectCode::NotLoaded),
+            TerrainQuery::Exterior => {}
+            TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => {
+                return Err(RejectCode::NotLoaded);
+            }
         }
     }
     tx.components.push(ComponentEdit {

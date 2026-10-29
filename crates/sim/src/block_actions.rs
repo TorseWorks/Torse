@@ -129,7 +129,9 @@ impl ActionHandler for BlockHandler {
         let current = match view.terrain(pos)? {
             TerrainQuery::Ready(state) => state,
             TerrainQuery::NotLoaded => return Err(RejectCode::NotLoaded),
-            TerrainQuery::OutOfBounds => return Err(RejectCode::MissingTarget),
+            TerrainQuery::OutOfBounds | TerrainQuery::Exterior => {
+                return Err(RejectCode::MissingTarget);
+            }
         };
         let state = if self.place {
             let Some(ComponentValue::Content(block)) =

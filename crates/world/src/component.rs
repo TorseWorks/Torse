@@ -57,6 +57,7 @@ pub struct ComponentSchemas {
     pub(crate) block_defaults: BTreeMap<ContentKey, BTreeMap<ContentKey, ComponentFields>>,
     pub(crate) blocks: BTreeMap<ContentKey, BTreeSet<ContentKey>>,
     pub(crate) compatibility: Option<torse_types::Compatibility>,
+    pub(crate) exterior: crate::ExteriorPolicy,
 }
 
 impl ComponentSchemas {
@@ -89,6 +90,7 @@ impl ComponentSchemas {
                 })
                 .collect(),
             compatibility: None,
+            exterior: crate::ExteriorPolicy::default(),
         }
     }
 

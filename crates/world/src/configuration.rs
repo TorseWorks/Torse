@@ -170,6 +170,35 @@ impl ComponentSchemas {
             _ => Err(ComponentError::ConfigurationMismatch),
         }
     }
+
+    /// Storage faces the host has opened as known empty space.
+    pub const fn exterior_policy(&self) -> crate::ExteriorPolicy {
+        self.exterior
+    }
+
+    /// Fold a non-default exterior policy into the frozen rules digest.
+    ///
+    /// Schemas must already be bound. The default policy leaves the digest
+    /// unchanged. A second non-default policy is rejected so recovery cannot
+    /// hash the same choice twice.
+    pub fn bind_exterior_policy(
+        &mut self,
+        policy: crate::ExteriorPolicy,
+    ) -> Result<torse_types::Compatibility, ComponentError> {
+        if self.exterior != crate::ExteriorPolicy::default() {
+            return Err(ComponentError::ConfigurationFrozen);
+        }
+        let current = self
+            .compatibility
+            .ok_or(ComponentError::ConfigurationMismatch)?;
+        if policy == crate::ExteriorPolicy::default() {
+            return Ok(current);
+        }
+        let next = crate::bind_exterior(current, policy);
+        self.compatibility = Some(next);
+        self.exterior = policy;
+        Ok(next)
+    }
 }
 fn count(hash: &mut Sha256, count: usize) {
     hash.update((count as u64).to_le_bytes());

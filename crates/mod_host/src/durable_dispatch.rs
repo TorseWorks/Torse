@@ -169,6 +169,7 @@ fn snapshot_cell(world: &WorldAuthority, symbols: &SymbolTable, pos: BlockPos) -
                 state_values: values,
             })
         }
+        TerrainQuery::Exterior => Cell::Empty,
         TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => Cell::NotLoaded,
     }
 }

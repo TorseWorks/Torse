@@ -59,7 +59,7 @@ pub(crate) fn plan(
             TerrainQuery::Ready(state) => {
                 tx.read_block(pos, state);
             }
-            TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => {
+            TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds | TerrainQuery::Exterior => {
                 return Err(RejectCode::NotLoaded);
             }
         }
@@ -203,7 +203,9 @@ fn observe_with_edits(
             for cell in covered(destination, half)? {
                 match store.query(cell) {
                     TerrainQuery::Ready(state) => reads.push((cell, TerrainQuery::Ready(state))),
-                    TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => {
+                    TerrainQuery::NotLoaded
+                    | TerrainQuery::OutOfBounds
+                    | TerrainQuery::Exterior => {
                         return Err(RejectCode::NotLoaded);
                     }
                 }
@@ -232,7 +234,9 @@ fn one_cell(
                 Err(RejectCode::Conflict)
             }
         }
-        TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => Err(RejectCode::NotLoaded),
+        TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds | TerrainQuery::Exterior => {
+            Err(RejectCode::NotLoaded)
+        }
     }
 }
 

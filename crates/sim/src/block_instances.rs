@@ -42,7 +42,9 @@ pub(crate) fn prepare(
         let old = match store.query(edit.pos) {
             TerrainQuery::Ready(state) => state,
             TerrainQuery::NotLoaded => return Err(RejectCode::NotLoaded),
-            TerrainQuery::OutOfBounds => return Err(RejectCode::MissingTarget),
+            TerrainQuery::OutOfBounds | TerrainQuery::Exterior => {
+                return Err(RejectCode::MissingTarget);
+            }
         };
         let old_definition = registry.definition(old);
         let new_definition = if edit.state.is_empty() {

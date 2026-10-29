@@ -2,9 +2,10 @@
 //!
 //! The store owns every section that is present in memory and the state machine
 //! that produced it. Queries never guess: a caller either receives an
-//! authoritative state, or is told that the data is not loaded, or that the
-//! coordinate is outside the supported world. Returning air for an unloaded
-//! region is the error this API exists to prevent.
+//! authoritative state, is told that the data is not loaded, or is told that
+//! the coordinate is outside the supported world. An opened storage face is
+//! known empty space. Returning air for an unloaded region is the error this
+//! API exists to prevent.
 //!
 //! Lifecycle transitions are deliberately explicit rather than automatic. A
 //! caller that requests a section must also install data, finish loading, and
@@ -13,7 +14,8 @@
 
 use std::collections::BTreeMap;
 
-use torse_types::{BlockPos, Revision, SectionPos};
+use sha2::{Digest as _, Sha256};
+use torse_types::{BlockPos, Compatibility, Digest, Revision, SectionPos};
 
 use crate::registry::BlockStateId;
 use crate::section::{Section, SectionError};
@@ -46,6 +48,43 @@ impl WorldBounds {
     }
 }
 
+/// Which storage faces are known empty instead of a solid boundary.
+///
+/// The default preserves movement above the build ceiling and blocks the lower
+/// face. Opening a face does not make an unloaded section inside the store empty.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExteriorPolicy {
+    /// Space below [`WorldBounds::min_y`] is empty.
+    pub below: bool,
+    /// Space at and above [`WorldBounds::max_y`] is empty.
+    pub above: bool,
+}
+
+impl Default for ExteriorPolicy {
+    fn default() -> Self {
+        Self {
+            below: false,
+            above: true,
+        }
+    }
+}
+
+/// Mix a non-default exterior policy into the authority compatibility identity.
+///
+/// The default policy leaves `compatibility` unchanged, so existing worlds stay
+/// compatible. A different policy produces a different rules digest.
+pub fn bind_exterior(mut compatibility: Compatibility, policy: ExteriorPolicy) -> Compatibility {
+    if policy == ExteriorPolicy::default() {
+        return compatibility;
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"torse/exterior-policy/v1\0");
+    hash.update(compatibility.rules_digest.0);
+    hash.update([u8::from(policy.below), u8::from(policy.above)]);
+    compatibility.rules_digest = Digest(hash.finalize().into());
+    compatibility
+}
+
 /// Result of a terrain query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerrainQuery {
@@ -55,6 +94,10 @@ pub enum TerrainQuery {
     NotLoaded,
     /// The coordinate is outside the supported world extent.
     OutOfBounds,
+    /// Known empty space outside a storage face the host opened.
+    ///
+    /// This is not stored terrain and not an unloaded section.
+    Exterior,
 }
 
 impl TerrainQuery {
@@ -62,7 +105,7 @@ impl TerrainQuery {
     pub const fn ready(self) -> Option<BlockStateId> {
         match self {
             Self::Ready(state) => Some(state),
-            Self::NotLoaded | Self::OutOfBounds => None,
+            Self::NotLoaded | Self::OutOfBounds | Self::Exterior => None,
         }
     }
 }
@@ -168,6 +211,7 @@ impl Entry {
 pub struct SectionStore {
     side: u32,
     bounds: WorldBounds,
+    exterior: ExteriorPolicy,
     sections: BTreeMap<SectionPos, Entry>,
     retired: BTreeMap<SectionPos, Revision>,
     retired_floor: Option<Revision>,
@@ -182,6 +226,7 @@ impl SectionStore {
         Ok(Self {
             side,
             bounds,
+            exterior: ExteriorPolicy::default(),
             sections: BTreeMap::new(),
             retired: BTreeMap::new(),
             retired_floor: None,
@@ -196,6 +241,17 @@ impl SectionStore {
     /// Supported vertical extent.
     pub const fn bounds(&self) -> WorldBounds {
         self.bounds
+    }
+
+    /// How space outside the stored height is reported.
+    pub const fn exterior(&self) -> ExteriorPolicy {
+        self.exterior
+    }
+
+    /// Replace the exterior policy. Hosts should do this through the authority
+    /// so the compatibility identity changes with it.
+    pub fn set_exterior(&mut self, policy: ExteriorPolicy) {
+        self.exterior = policy;
     }
 
     /// Current phase of a section, or `None` when it is absent.
@@ -371,7 +427,13 @@ impl SectionStore {
     /// Read an authoritative cell.
     pub fn query(&self, pos: BlockPos) -> TerrainQuery {
         if !self.bounds.contains_y(pos.y) {
-            return TerrainQuery::OutOfBounds;
+            let opened = (pos.y < self.bounds.min_y && self.exterior.below)
+                || (pos.y >= self.bounds.max_y && self.exterior.above);
+            return if opened {
+                TerrainQuery::Exterior
+            } else {
+                TerrainQuery::OutOfBounds
+            };
         }
         let (section_pos, local) = match pos.to_section(self.side) {
             Ok(converted) => converted,
@@ -501,7 +563,9 @@ impl SectionStore {
             TerrainQuery::NotLoaded => Err(StoreError::NotLoaded {
                 pos: self.section_of(pos)?,
             }),
-            TerrainQuery::OutOfBounds => Err(StoreError::OutOfBounds { pos }),
+            TerrainQuery::OutOfBounds | TerrainQuery::Exterior => {
+                Err(StoreError::OutOfBounds { pos })
+            }
         }
     }
 
@@ -516,7 +580,9 @@ impl SectionStore {
             TerrainQuery::NotLoaded => Err(StoreError::NotLoaded {
                 pos: self.section_of(pos)?,
             }),
-            TerrainQuery::OutOfBounds => Err(StoreError::OutOfBounds { pos }),
+            TerrainQuery::OutOfBounds | TerrainQuery::Exterior => {
+                Err(StoreError::OutOfBounds { pos })
+            }
         }
     }
 
@@ -865,7 +931,7 @@ mod tests {
         );
         assert_eq!(
             store.query(BlockPos::new(0, 300, 0)),
-            TerrainQuery::OutOfBounds
+            TerrainQuery::Exterior
         );
         assert_eq!(store.phase(SectionPos::ZERO), None);
     }
@@ -1128,6 +1194,47 @@ mod tests {
             "later edits in the same batch win"
         );
     }
+
+    #[test]
+    fn opened_exterior_is_empty_and_unloaded_sections_stay_unloaded() {
+        let mut store = store();
+        assert_eq!(
+            store.query(BlockPos::new(0, -1, 0)),
+            TerrainQuery::OutOfBounds
+        );
+        store.set_exterior(ExteriorPolicy {
+            below: true,
+            above: false,
+        });
+        assert_eq!(store.query(BlockPos::new(0, -1, 0)), TerrainQuery::Exterior);
+        assert_eq!(store.query(BlockPos::new(0, 0, 0)), TerrainQuery::NotLoaded);
+        assert_eq!(
+            store.query(BlockPos::new(0, 256, 0)),
+            TerrainQuery::OutOfBounds
+        );
+        assert!(
+            store
+                .edit(BlockPos::new(0, -1, 0), BlockStateId(1))
+                .is_err()
+        );
+        let base = torse_types::Compatibility {
+            authority_schema: 1,
+            rules_digest: torse_types::Digest([9; 32]),
+            content_digest: torse_types::Digest([3; 32]),
+        };
+        assert_eq!(bind_exterior(base, ExteriorPolicy::default()), base);
+        assert_ne!(
+            bind_exterior(
+                base,
+                ExteriorPolicy {
+                    below: true,
+                    above: false,
+                }
+            ),
+            base
+        );
+    }
+
     #[test]
     fn long_travel_bounds_retired_metadata_without_reusing_old_revisions() {
         let mut store = store();

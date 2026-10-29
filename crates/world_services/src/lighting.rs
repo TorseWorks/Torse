@@ -317,7 +317,7 @@ impl LightJob {
                 let mut direct_absorption = 15;
                 match store.query(pos) {
                     TerrainQuery::NotLoaded => self.complete = false,
-                    TerrainQuery::OutOfBounds => {}
+                    TerrainQuery::OutOfBounds | TerrainQuery::Exterior => {}
                     TerrainQuery::Ready(state) if state.is_empty() => {
                         self.absorption[index] = 1;
                         direct_absorption = 0;

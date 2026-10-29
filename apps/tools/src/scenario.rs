@@ -311,6 +311,7 @@ impl CollisionSource for CollisionView<'_> {
             },
             TerrainQuery::NotLoaded => CollisionCell::NotLoaded,
             TerrainQuery::OutOfBounds => CollisionCell::OutOfBounds,
+            TerrainQuery::Exterior => CollisionCell::Empty,
         }
     }
 }
@@ -334,7 +335,7 @@ fn sample_render(store: &SectionStore, registry: &BlockStateRegistry, pos: Block
             })
         }
         TerrainQuery::NotLoaded => MeshSample::NotLoaded,
-        TerrainQuery::OutOfBounds => MeshSample::OutOfBounds,
+        TerrainQuery::OutOfBounds | TerrainQuery::Exterior => MeshSample::OutOfBounds,
     }
 }
 

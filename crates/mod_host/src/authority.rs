@@ -794,6 +794,7 @@ impl torse::behavior::query::Host for AuthorityHost {
                                 state_values: values.to_vec(),
                             })
                         }
+                        TerrainQuery::Exterior => Cell::Empty,
                         TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => Cell::NotLoaded,
                     };
                     self.budget

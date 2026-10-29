@@ -313,11 +313,12 @@ impl WorldAuthority {
         let (schemas, compatibility) = schemas
             .bind_compatibility(compatibility)
             .map_err(|error| AuthorityError::Store(error.to_string()))?;
-        let store = SectionStore::new(side, bounds).map_err(|error| {
+        let mut store = SectionStore::new(side, bounds).map_err(|error| {
             AuthorityError::World(ExchangeError::Store {
                 detail: error.to_string(),
             })
         })?;
+        store.set_exterior(schemas.exterior_policy());
         let entities =
             EntityStore::new(side).map_err(|error| AuthorityError::Store(error.to_string()))?;
         let mut coordinator = CommitCoordinator::new(world);
@@ -350,6 +351,37 @@ impl WorldAuthority {
     /// Mutable terrain access for load and generation paths.
     pub fn store_mut(&mut self) -> &mut SectionStore {
         &mut self.store
+    }
+
+    /// Configure storage faces as known empty space or closed boundaries.
+    ///
+    /// The default opens the upper face and closes the lower face. Run before the first
+    /// commit, and it changes the authority compatibility identity when the
+    /// policy is not the default. Unloaded sections inside the store stay
+    /// unloaded. Entity coordinates stay on the movement limit, not these bounds.
+    pub fn set_exterior_policy(
+        &mut self,
+        policy: torse_world::ExteriorPolicy,
+    ) -> Result<(), AuthorityError> {
+        if self.coordinator.seq() != CommitSeq::INITIAL {
+            return Err(AuthorityError::Store(
+                "exterior policy is fixed after the first commit".to_owned(),
+            ));
+        }
+        if self.store.exterior() != torse_world::ExteriorPolicy::default()
+            || self.schemas.exterior_policy() != torse_world::ExteriorPolicy::default()
+        {
+            return Err(AuthorityError::Store(
+                "exterior policy is already set".to_owned(),
+            ));
+        }
+        let compatibility = self
+            .schemas
+            .bind_exterior_policy(policy)
+            .map_err(|error| AuthorityError::Store(error.to_string()))?;
+        self.store.set_exterior(policy);
+        self.coordinator.set_compatibility(compatibility);
+        Ok(())
     }
 
     /// Entity store.
@@ -874,11 +906,16 @@ impl<'a> Recovery<'a> {
         // The coordinator starts at the recovered position, so the next prepared
         // change receives exactly the following sequence number.
         let coordinator = coordinator.resumed_at(self.seq);
+        let mut store = restored.store;
+        // The snapshot bytes keep the historical layout. The host schemas carry
+        // the opened faces, and the compatibility check above rejected a digest
+        // that does not include that same policy.
+        store.set_exterior(self.schemas.exterior_policy());
         Ok(WorldAuthority {
             world: self.world,
             registry: self.registry.clone(),
             schemas: self.schemas.clone(),
-            store: restored.store,
+            store,
             entities: restored.entities,
             coordinator,
         })

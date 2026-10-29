@@ -656,7 +656,7 @@ impl CommitCoordinator {
                     TerrainQuery::NotLoaded => {
                         return Err(PrepareError::Rejected(RejectCode::NotLoaded));
                     }
-                    TerrainQuery::OutOfBounds => {
+                    TerrainQuery::OutOfBounds | TerrainQuery::Exterior => {
                         return Err(PrepareError::Rejected(RejectCode::MissingTarget));
                     }
                 }
@@ -972,7 +972,7 @@ impl CommitCoordinator {
                 TerrainQuery::NotLoaded => {
                     return Err(PrepareError::Rejected(RejectCode::NotLoaded));
                 }
-                TerrainQuery::OutOfBounds => {
+                TerrainQuery::OutOfBounds | TerrainQuery::Exterior => {
                     return Err(PrepareError::Rejected(RejectCode::MissingTarget));
                 }
             }

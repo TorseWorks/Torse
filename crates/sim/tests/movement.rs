@@ -10,8 +10,8 @@ use torse_types::{
     SectionPos, SnapshotMeta, TransactionId, TransactionOutcome, TransactionResult, WorldId,
 };
 use torse_world::{
-    BlockStateId, BlockStateRegistry, ComponentSchemas, EntityMove, Position, Section,
-    TerrainQuery, WorldBounds,
+    BlockStateId, BlockStateRegistry, ComponentSchemas, EntityMove, ExteriorPolicy, Position,
+    Section, TerrainQuery, WorldBounds,
 };
 
 fn key(value: &str) -> ContentKey {
@@ -98,7 +98,8 @@ fn movement_and_prediction_above_build_ceiling_land_on_the_highest_layer() {
             torse_sim::player::WALKER_HALF
         )
         .unwrap()
-        .is_empty()
+        .iter()
+        .all(|(_, query)| *query == TerrainQuery::Exterior)
     );
     let handle = world.entities_mut().spawn(start).unwrap();
     let predicted = torse_sim::player::predict_step(
@@ -148,7 +149,7 @@ fn movement_and_prediction_above_build_ceiling_land_on_the_highest_layer() {
     assert!(walker.grounded);
     assert_eq!(
         world.store().query(BlockPos::new(2, 32, 2)),
-        TerrainQuery::OutOfBounds
+        TerrainQuery::Exterior
     );
     assert!(
         world
@@ -758,4 +759,233 @@ fn malformed_replay_moves_are_validated_before_any_terrain_write() {
         assert_eq!(entities.get(handle).expect("entity").position.x, 2.0);
         assert_eq!(entities.indexed_count(), 1);
     }
+}
+
+#[test]
+fn explicit_exterior_faces_control_crossings_and_recover_with_the_same_rules() {
+    for below in [false, true] {
+        for above in [false, true] {
+            let mut world = authority();
+            world
+                .set_exterior_policy(ExteriorPolicy { below, above })
+                .unwrap();
+            let upper = SectionPos::new(0, 1, 0);
+            world.store_mut().request(upper).unwrap();
+            world
+                .store_mut()
+                .install(upper, Section::empty(16).unwrap())
+                .unwrap();
+            world.store_mut().finish_load(upper).unwrap();
+            for (start, delta, open) in [
+                (Position::new(2.5, 30.0, 2.5), 4.0, above),
+                (Position::new(4.5, 2.0, 2.5), -4.0, below),
+            ] {
+                let handle = world.entities_mut().spawn(start).unwrap();
+                committed(
+                    world
+                        .commit(&movement(&world, handle, [0.0, delta, 0.0]))
+                        .unwrap(),
+                );
+                let y = world.entities().get(handle).unwrap().position.y;
+                assert_eq!(
+                    y < 0.0 || y > 32.0,
+                    open,
+                    "policy={below:?}/{above:?}, y={y}"
+                );
+            }
+            let exterior = Position::new(2.5, 34.0, 2.5);
+            assert_eq!(
+                torse_sim::movement::observe_body(
+                    world.store(),
+                    world.registry(),
+                    exterior,
+                    torse_sim::player::WALKER_HALF,
+                )
+                .is_ok(),
+                above
+            );
+            let snapshot = world.capture_snapshot(snapshot_meta(&world)).unwrap();
+            let mut recovery =
+                torse_sim::Recovery::new(world.world(), world.registry(), world.schemas());
+            recovery.restore_snapshot(&snapshot).unwrap();
+            let restored = recovery.finish().unwrap();
+            assert_eq!(restored.store().exterior(), ExteriorPolicy { below, above });
+            assert_eq!(
+                restored.store().query(BlockPos::new(2, 32, 2)),
+                if above {
+                    TerrainQuery::Exterior
+                } else {
+                    TerrainQuery::OutOfBounds
+                }
+            );
+            assert_eq!(
+                restored.store().query(BlockPos::new(2, -1, 2)),
+                if below {
+                    TerrainQuery::Exterior
+                } else {
+                    TerrainQuery::OutOfBounds
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn opened_storage_face_is_empty_and_unloaded_sections_stay_solid() {
+    let mut closed = authority();
+    let before = closed.coordinator().compatibility();
+    closed
+        .set_exterior_policy(ExteriorPolicy::default())
+        .expect("default policy is a no-op");
+    assert_eq!(closed.coordinator().compatibility(), before);
+    let standing = closed
+        .entities_mut()
+        .spawn(Position::new(2.0, 1.0, 2.0))
+        .expect("spawn");
+    let id = closed.entities().get(standing).expect("entity").id;
+    committed(
+        closed
+            .commit(&movement(&closed, standing, [0.0, -2.0, 0.0]))
+            .expect("commit"),
+    );
+    let stopped = closed.entities().get(standing).expect("entity").position.y;
+    assert!(
+        stopped > 0.5,
+        "a closed face stays solid, center ended at {stopped}"
+    );
+    assert_eq!(closed.entities().get(standing).expect("entity").id, id);
+    assert!(
+        closed
+            .set_exterior_policy(ExteriorPolicy {
+                below: true,
+                above: false,
+            })
+            .is_err(),
+        "the policy is fixed after the first commit"
+    );
+    assert_eq!(
+        closed.store().query(BlockPos::new(0, -1, 0)),
+        TerrainQuery::OutOfBounds
+    );
+
+    let mut opened = authority();
+    opened
+        .set_exterior_policy(ExteriorPolicy {
+            below: true,
+            above: false,
+        })
+        .expect("open the lower face");
+    assert_ne!(opened.coordinator().compatibility(), before);
+    assert!(
+        opened
+            .set_exterior_policy(ExteriorPolicy {
+                below: true,
+                above: true,
+            })
+            .is_err()
+    );
+    assert!(
+        opened
+            .store_mut()
+            .edit(BlockPos::new(0, -1, 0), BlockStateId(1))
+            .is_err(),
+        "known empty space is not stored terrain"
+    );
+    let falling = opened
+        .entities_mut()
+        .spawn(Position::new(2.0, 1.0, 2.0))
+        .expect("spawn");
+    committed(
+        opened
+            .commit(&movement(&opened, falling, [0.0, -2.0, 0.0]))
+            .expect("commit"),
+    );
+    let fallen = opened.entities().get(falling).expect("entity").position.y;
+    assert!(
+        fallen < 0.0,
+        "an opened face is empty space, center ended at {fallen}"
+    );
+    let climber = opened
+        .entities_mut()
+        .spawn(Position::new(2.0, 14.5, 2.0))
+        .expect("spawn");
+    committed(
+        opened
+            .commit(&movement(&opened, climber, [0.0, 4.0, 0.0]))
+            .expect("commit"),
+    );
+    let climbed = opened.entities().get(climber).expect("entity").position.y;
+    assert!(
+        climbed < 16.0,
+        "an unloaded in-bounds section stays solid, center ended at {climbed}"
+    );
+    assert_eq!(
+        opened.store().query(BlockPos::new(2, 16, 2)),
+        TerrainQuery::NotLoaded
+    );
+    assert_eq!(
+        opened.store().query(BlockPos::new(0, 32, 0)),
+        TerrainQuery::OutOfBounds
+    );
+
+    let mut capped = authority();
+    let high = capped
+        .entities_mut()
+        .spawn(Position::new(
+            2.0,
+            torse_sim::movement::MAX_MOVEMENT_COORDINATE - 1.0,
+            2.0,
+        ))
+        .expect("spawn");
+    let too_far = movement(&capped, high, [0.0, 16.0, 0.0]);
+    rejected(&mut capped, &too_far, RejectCode::InvalidData);
+
+    let snapshot = opened
+        .capture_snapshot(snapshot_meta(&opened))
+        .expect("snapshot");
+    let content = compile(m0_fixture_pack()).expect("fixture content");
+    let registry = BlockStateRegistry::build(&content).expect("registry");
+    let schemas = ComponentSchemas::build(&content);
+    let (mut schemas, _) = schemas
+        .bind_compatibility(Compatibility {
+            authority_schema: 1,
+            rules_digest: Digest([1; 32]),
+            content_digest: Digest([2; 32]),
+        })
+        .expect("bind");
+    let mut mismatched = torse_sim::Recovery::new(opened.world(), &registry, &schemas);
+    assert!(
+        mismatched.restore_snapshot(&snapshot).is_err(),
+        "a world without the opened face cannot adopt this identity"
+    );
+    schemas
+        .bind_exterior_policy(ExteriorPolicy {
+            below: true,
+            above: false,
+        })
+        .expect("same policy");
+    let mut matched = torse_sim::Recovery::new(opened.world(), &registry, &schemas);
+    matched.restore_snapshot(&snapshot).expect("restore");
+    let restored = matched.finish().expect("finish");
+    assert_eq!(
+        restored.store().query(BlockPos::new(0, -1, 0)),
+        TerrainQuery::Exterior
+    );
+    assert_eq!(
+        restored.store().query(BlockPos::new(40, 0, 0)),
+        TerrainQuery::NotLoaded
+    );
+    let fallen_id = opened.entities().get(falling).expect("entity").id;
+    let restored_handle = restored
+        .entities()
+        .handle_of(fallen_id)
+        .expect("identity survives recovery");
+    assert_eq!(
+        restored.entities().get(restored_handle).expect("entity").id,
+        fallen_id
+    );
+    assert_eq!(
+        restored.coordinator().compatibility(),
+        opened.coordinator().compatibility()
+    );
 }

@@ -57,6 +57,7 @@ pub(crate) fn plan(
                 torse_world::TerrainQuery::Ready(state) => {
                     tx.read_block(pos, state);
                 }
+                torse_world::TerrainQuery::Exterior => {}
                 torse_world::TerrainQuery::NotLoaded | torse_world::TerrainQuery::OutOfBounds => {
                     return Err(RejectCode::NotLoaded);
                 }
