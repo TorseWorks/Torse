@@ -425,6 +425,53 @@ pub(crate) fn observe_body_with_edits(
     Ok(reads)
 }
 
+/// Validate translations against the final terrain and declared collider state.
+pub(crate) fn validate_destinations(
+    store: &SectionStore,
+    entities: &EntityStore,
+    registry: &BlockStateRegistry,
+    edits: &[BlockEdit],
+    moves: &[EntityMove],
+    requests: &[Movement],
+    components: &[torse_world::ComponentEdit],
+) -> Result<Vec<(BlockPos, TerrainQuery)>, RejectCode> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let view = CollisionView {
+        store,
+        registry,
+        overlay: edits.iter().map(|e| (e.pos, e.state)).collect(),
+        reads: RefCell::new(BTreeMap::new()),
+        unknown: RefCell::new(false),
+    };
+    for request in requests {
+        let entity = entities
+            .get(request.handle)
+            .ok_or(RejectCode::MissingTarget)?;
+        let Some(half) =
+            crate::body::of(entity, components, request.half_bits.map(f64::from_bits))?
+        else {
+            continue;
+        };
+        let movement = moves
+            .iter()
+            .find(|m| m.id == request.id)
+            .ok_or(RejectCode::MissingTarget)?;
+        let position = Position::from_bits(movement.position_bits);
+        let center = bounded_center([position.x, position.y, position.z], half)
+            .ok_or(RejectCode::InvalidData)?;
+        let blocked = collides(&view, &Aabb::from_center(center, half));
+        if *view.unknown.borrow() {
+            return Err(RejectCode::NotLoaded);
+        }
+        if blocked {
+            return Err(RejectCode::Conflict);
+        }
+    }
+    Ok(view.reads.into_inner().into_iter().collect())
+}
+
 /// Validate resized bodies at their resolved final positions, including terrain writes.
 pub(crate) fn validate_bodies(
     store: &SectionStore,

@@ -808,6 +808,18 @@ impl CommitCoordinator {
         }
         for member in &group.members {
             movement_reads.extend(
+                crate::movement::validate_destinations(
+                    store,
+                    entities,
+                    registry,
+                    &edits,
+                    &entity_moves,
+                    &member.movements,
+                    &component_edits,
+                )
+                .map_err(PrepareError::Rejected)?,
+            );
+            movement_reads.extend(
                 crate::relocation::validate_final(
                     store,
                     entities,

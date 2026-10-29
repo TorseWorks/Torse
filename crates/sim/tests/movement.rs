@@ -187,6 +187,55 @@ fn ceiling_air_does_not_make_unknown_terrain_or_the_lower_boundary_passable() {
     assert_eq!(world.entities().get(below).unwrap().position.y, -1.0);
 }
 
+#[test]
+fn group_movement_checks_other_members_final_terrain() {
+    for body in [
+        None,
+        Some(torse_world::EntityCollider::Box {
+            half: [300_000, 900_000, 300_000],
+        }),
+        Some(torse_world::EntityCollider::Disabled),
+    ] {
+        let mut world = authority();
+        let handle = spawn(&mut world, 2.0);
+        let original = world.entities().get(handle).unwrap().position;
+        if let Some(body) = body {
+            let schemas = world.schemas().clone();
+            world
+                .entities_mut()
+                .components_mut(handle)
+                .unwrap()
+                .insert(&schemas, &torse_world::collider_schema(), body.fields())
+                .unwrap();
+        }
+        let motion = movement(&world, handle, [2.0, 0.0, 0.0]);
+        let stone = world.registry().default_state(&key("base:stone")).unwrap();
+        let cell = BlockPos::new(4, 2, 2);
+        let mut terrain = Transaction::new(TransactionId(2), key("test:terrain"), motion.ordering);
+        terrain.write_block(cell, stone);
+        let group = torse_sim::TransactionGroup::new(
+            TransactionId(3),
+            motion.ordering,
+            vec![motion, terrain],
+        )
+        .unwrap();
+        let outcome = world.commit_group(&group).unwrap().outcome;
+        if body == Some(torse_world::EntityCollider::Disabled) {
+            assert!(matches!(outcome, TransactionOutcome::Committed { .. }));
+            assert_eq!(world.entities().get(handle).unwrap().position.x, 4.0);
+            assert_eq!(world.store().query(cell), TerrainQuery::Ready(stone));
+        } else {
+            assert_eq!(outcome, TransactionOutcome::Rejected(RejectCode::Conflict));
+            assert_eq!(world.entities().get(handle).unwrap().position, original);
+            assert_eq!(
+                world.store().query(cell),
+                TerrainQuery::Ready(BlockStateId::EMPTY)
+            );
+            assert_eq!(world.seq(), torse_types::CommitSeq::INITIAL);
+        }
+    }
+}
+
 fn committed(result: TransactionResult<torse_sim::Committed>) -> torse_sim::Committed {
     match result.outcome {
         TransactionOutcome::Committed { value, .. } => value,
