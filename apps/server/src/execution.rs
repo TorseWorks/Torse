@@ -630,9 +630,15 @@ impl ExecutionHost {
                                 .plan_movement(&q.request)
                                 .map(|tx| ActionOutput::Mutation(Box::new(tx)));
                         }
-                        self.actions.plan(
+                        let actor = crate::item_drops::pickup_actor(
                             self.world(),
                             &s.actor,
+                            &s.scope,
+                            &q.request.input,
+                        )?;
+                        self.actions.plan(
+                            self.world(),
+                            &actor,
                             phase,
                             &ActionRequest {
                                 action: q.request.input.action.clone(),

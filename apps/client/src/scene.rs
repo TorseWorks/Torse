@@ -134,6 +134,7 @@ mod borders;
 mod items;
 mod lighting;
 mod memory;
+mod models;
 mod surfaces;
 
 /// One content pack for every client mode, matching the server demo assembly
@@ -154,7 +155,8 @@ fn compile_content() -> Result<(BlockStateRegistry, ComponentSchemas, Compatibil
         BlockStateRegistry::build(&content).map_err(|error| format!("registry failed: {error}"))?;
     let schemas = ComponentSchemas::build(&content);
     let catalog = torse_items::fixture_catalog(&registry)
-        .map_err(|error| format!("item rules: {error:?}"))?;
+        .map_err(|error| format!("item rules: {error:?}"))?
+        .with_world_drops();
     let compatibility = catalog.bind_compatibility(Compatibility {
         authority_schema: 4,
         rules_digest: content.authority_digest,
@@ -1135,6 +1137,7 @@ impl Scene {
         let schemas = ComponentSchemas::build(&content);
         let compatibility = torse_items::block_catalog(&registry)
             .map_err(|error| format!("item rules: {error:?}"))?
+            .with_world_drops()
             .bind_compatibility(Compatibility {
                 authority_schema: 4,
                 rules_digest: content.authority_digest,
@@ -1231,6 +1234,9 @@ impl Scene {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         for (handle, entity) in self.authority.entities().iter() {
+            if self.append_drop_model(entity, &mut vertices, &mut indices) {
+                continue;
+            }
             // The walker is the camera; drawing its body would fill the view.
             if Some(handle) == self.walker.map(|walker| walker.handle)
                 || entity
@@ -1354,27 +1360,11 @@ impl Scene {
             indices.extend(mesh.indices.iter().map(|value| base + value));
             faces += mesh.face_count();
         }
-        for (handle, entity) in self.authority.entities().iter() {
-            // The walker is the camera; drawing its body would fill the view.
-            if Some(handle) == self.walker.map(|walker| walker.handle)
-                || entity
-                    .components
-                    .component(&torse_world::block_instance_schema())
-                    .is_some()
-            {
-                continue;
-            }
-            faces += push_entity_box(
-                &mut vertices,
-                &mut indices,
-                [
-                    entity.position.x as f32,
-                    entity.position.y as f32,
-                    entity.position.z as f32,
-                ],
-                u32::from(self.palette.entity_slot()),
-            );
-        }
+        let (entity_vertices, entity_indices) = self.entity_geometry();
+        let base = vertices.len() as u32;
+        faces += entity_indices.len() / 6;
+        vertices.extend(entity_vertices);
+        indices.extend(entity_indices.into_iter().map(|i| i + base));
         (vertices, indices, faces)
     }
 

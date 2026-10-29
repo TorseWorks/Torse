@@ -222,7 +222,8 @@ fn assemble(
     let item_catalog = if items {
         Some(
             torse_items::fixture_catalog(&registry)
-                .map_err(|e| Fault::invalid_data(format!("items: {e:?}")))?,
+                .map_err(|e| Fault::invalid_data(format!("items: {e:?}")))?
+                .with_world_drops(),
         )
     } else {
         None

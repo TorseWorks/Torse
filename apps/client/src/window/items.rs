@@ -1,5 +1,72 @@
 use super::*;
 impl WindowApp {
+    pub(super) fn submit_item_call(&mut self, call: torse_sim::durable::Call) {
+        if let Some(net) = self.net.as_mut() {
+            match net.request(call) {
+                Ok(_) => {
+                    self.requests_sent += 1;
+                    self.last_result.clear();
+                }
+                Err(error) => self.last_result = format!("item request failed: {error}"),
+            }
+        } else if let Some(scene) = self.scene.as_mut() {
+            match scene.apply_item_call(call) {
+                Ok(()) => {
+                    self.actions_ok += 1;
+                    self.last_result.clear();
+                }
+                Err(error) => {
+                    self.actions_rejected += 1;
+                    self.last_result = error;
+                }
+            }
+        }
+    }
+    pub(super) fn pickup_item(&mut self, manual: bool) {
+        let Some(camera) = &self.camera else {
+            return;
+        };
+        let eye = Position::new(
+            camera.eye[0] as f64,
+            camera.eye[1] as f64,
+            camera.eye[2] as f64,
+        );
+        let Some(scene) = &self.scene else {
+            return;
+        };
+        let Some(owner) = scene.item_owner() else {
+            return;
+        };
+        let Some((drop, _)) = scene.nearest_drop(eye) else {
+            if manual {
+                self.last_result = "no reachable item".into();
+            }
+            return;
+        };
+        let mut call = torse_items::pickup_call(owner, drop);
+        if self.net.is_none() {
+            call = torse_items::with_position(call, eye);
+        }
+        self.submit_item_call(call);
+    }
+    pub(super) fn throw_item(&mut self) {
+        let Some(camera) = &self.camera else {
+            return;
+        };
+        let Some(owner) = self.scene.as_ref().and_then(Scene::item_owner) else {
+            return;
+        };
+        let eye = Position::new(
+            camera.eye[0] as f64,
+            camera.eye[1] as f64,
+            camera.eye[2] as f64,
+        );
+        let mut call = torse_items::throw_call(owner, self.material as u32);
+        if self.net.is_none() {
+            call = torse_items::with_position(call, eye);
+        }
+        self.submit_item_call(call);
+    }
     pub(super) fn sync_inventory(&mut self) {
         if let Some(scene) = self.scene.as_mut() {
             if scene.item_owner().is_none()

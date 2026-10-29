@@ -24,6 +24,180 @@ fn stock(server: &base::Files, id: EntityId) -> Inventory {
     )
     .unwrap()
 }
+
+#[test]
+fn physical_drops_recover_and_pickup_is_scoped_and_durable() {
+    let directory = Directory::new();
+    let (mut world, actions) = base::world().unwrap();
+    base::fill_floor(&mut world).unwrap();
+    let player = base::spawn_players(&mut world, 1).unwrap()[0];
+    let pos = BlockPos::new(4, 2, 6);
+    let stone = world.registry().default_state(&key("base:stone")).unwrap();
+    world.store_mut().edit(pos, stone).unwrap();
+    let compatibility = world.coordinator().compatibility();
+    let rules = vec![Box::new(torse_server::item_drops::DropPhysics::new(
+        fixture_catalog(world.registry())
+            .unwrap()
+            .with_world_drops(),
+    )) as Box<dyn DurableRule>];
+    let mut server = base::Files::create_file(
+        directory.acquire(),
+        compatibility,
+        base::Codec::new(base::codec_limits()).unwrap(),
+        base::file_policy(),
+        |binding| ExecutionHost::new(binding, world, actions, rules, base::execution_limits()),
+    )
+    .unwrap();
+    let actor = [
+        "world:permission/edit",
+        "items:permission/use",
+        "inventory:permission/insert",
+        "items:permission/pickup",
+        "world:permission/spawn",
+        "world:permission/despawn",
+    ]
+    .into_iter()
+    .fold(
+        ActorContext::new(key("test:owner"))
+            .target(ActionTarget::Entity(player))
+            .section(SectionPos::ZERO),
+        |actor, p| actor.permission(key(p)),
+    );
+    server
+        .register_session(
+            Viewer {
+                session: SessionId(1),
+                actor: ActorContextId(1),
+            },
+            actor,
+            base::scope(),
+        )
+        .unwrap();
+    let before = stock(&server, player);
+    let first = RequestId {
+        world: base::WORLD,
+        epoch: server.binding().epoch,
+        session: SessionId(1),
+        seq: RequestSeq(1),
+    };
+    assert!(matches!(
+        server.submit(WorldRequest {
+            id: first,
+            actor: ActorContextId(1),
+            input: edit_call(player, false, 2, pos, 0)
+        }),
+        Admission::Queued { .. }
+    ));
+    for _ in 0..25 {
+        server.drive_tick(&mut NoReplicas, 1024).unwrap();
+    }
+    assert_eq!(
+        server.receipt(first).unwrap().unwrap().reply.status,
+        ReplyStatus::Committed
+    );
+    assert_eq!(stock(&server, player), before);
+    let drop_id = server
+        .authority()
+        .unwrap()
+        .world()
+        .entities()
+        .iter()
+        .find(|(_, e)| {
+            e.components
+                .component(&torse_items::drops::schema())
+                .is_some()
+        })
+        .unwrap()
+        .1
+        .id;
+    drop(server);
+    let (world, actions) = base::world().unwrap();
+    let rules = vec![Box::new(torse_server::item_drops::DropPhysics::new(
+        fixture_catalog(world.registry())
+            .unwrap()
+            .with_world_drops(),
+    )) as Box<dyn DurableRule>];
+    let mut server = base::Files::open_file(
+        directory.acquire(),
+        compatibility,
+        base::Codec::new(base::codec_limits()).unwrap(),
+        base::file_policy(),
+        |binding| {
+            Ok(ExecutionRecovery::new(
+                binding,
+                world.registry(),
+                world.schemas(),
+                actions,
+                rules,
+                base::execution_limits(),
+            ))
+        },
+    )
+    .unwrap();
+    let actor = [
+        "items:permission/pickup",
+        "inventory:permission/insert",
+        "world:permission/despawn",
+    ]
+    .into_iter()
+    .fold(
+        ActorContext::new(key("test:owner"))
+            .target(ActionTarget::Entity(player))
+            .section(SectionPos::ZERO),
+        |actor, p| actor.permission(key(p)),
+    );
+    server
+        .register_session(
+            Viewer {
+                session: SessionId(2),
+                actor: ActorContextId(2),
+            },
+            actor,
+            base::scope(),
+        )
+        .unwrap();
+    let pickup = RequestId {
+        world: base::WORLD,
+        epoch: server.binding().epoch,
+        session: SessionId(2),
+        seq: RequestSeq(1),
+    };
+    let call = torse_items::pickup_call(player, drop_id);
+    assert!(matches!(
+        server.submit(WorldRequest {
+            id: pickup,
+            actor: ActorContextId(2),
+            input: call.clone()
+        }),
+        Admission::Queued { .. }
+    ));
+    server.drive_tick(&mut NoReplicas, 1024).unwrap();
+    assert_eq!(
+        server.receipt(pickup).unwrap().unwrap().reply.status,
+        ReplyStatus::Committed
+    );
+    assert!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .handle_of(drop_id)
+            .is_none()
+    );
+    assert_eq!(
+        stock(&server, player).slots()[4].as_ref().unwrap().item,
+        key("base:stone")
+    );
+    assert_eq!(
+        server.submit(WorldRequest {
+            id: pickup,
+            actor: ActorContextId(2),
+            input: call
+        }),
+        Admission::Duplicate
+    );
+}
 #[test]
 fn item_groups_are_durable_deduplicated_and_projected_only_to_the_owner() {
     let directory = Directory::new();

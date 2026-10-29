@@ -12,6 +12,7 @@ mod directory;
 mod generation;
 pub use generation::GenerationIdentity;
 pub mod execution;
+pub mod item_drops;
 mod lifecycle;
 #[cfg(feature = "mods")]
 pub mod mods;

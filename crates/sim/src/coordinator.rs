@@ -158,6 +158,12 @@ impl PreparedChange {
         &self.entity_moves
     }
 
+    /// Terrain observations used to resolve translations and body clearance.
+    /// Native rules may freeze ready-cell reads with a derived velocity update.
+    pub fn collision_reads(&self) -> &[(BlockPos, TerrainQuery)] {
+        &self.movement_reads
+    }
+
     /// Metadata that will appear in the commit record.
     pub const fn meta(&self) -> CommitMeta {
         self.meta

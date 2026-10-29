@@ -183,6 +183,7 @@ struct Gpu {
 
 struct WindowApp {
     preferences_dirty: Option<Instant>,
+    pickup_elapsed: f64,
     debug_lines: Vec<String>,
     current_fps: u32,
     work_budget: FrameBudget,
@@ -279,6 +280,7 @@ impl WindowApp {
             .collect();
         Self {
             preferences_dirty: None,
+            pickup_elapsed: 0.0,
             debug_lines: Vec::new(),
             current_fps: 0,
             work_budget: FrameBudget::new(FRAME_LIMITS, 16_666),
@@ -1131,7 +1133,17 @@ impl WindowApp {
         } else {
             self.pump_fly(steps, motion);
         }
+        if let Some(scene) = self.scene.as_mut() {
+            for _ in 0..steps {
+                scene.step_items()?;
+            }
+        }
         self.apply_presented_eye();
+        self.pickup_elapsed += dt;
+        if self.ui.settings.auto_pickup && self.pickup_elapsed >= 0.2 {
+            self.pickup_elapsed = 0.0;
+            self.pickup_item(false);
+        }
         Ok(())
     }
 
@@ -1978,6 +1990,14 @@ impl ApplicationHandler for WindowApp {
                         return;
                     }
                     if !self.ui.modal() && !event.repeat {
+                        if code == self.ui.settings.bindings.pickup {
+                            self.pickup_item(true);
+                            return;
+                        }
+                        if code == self.ui.settings.bindings.drop {
+                            self.throw_item();
+                            return;
+                        }
                         if code == self.ui.settings.bindings.debug {
                             self.toggle_debug();
                             return;

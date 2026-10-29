@@ -49,7 +49,7 @@ impl ActionHandler for BlockGuard {
     }
 }
 pub fn descriptors() -> Vec<ActionDescriptor> {
-    NAMES
+    let mut result: Vec<_> = NAMES
         .into_iter()
         .map(|name| ActionDescriptor {
             id: key(&format!("items:action/{name}")),
@@ -78,10 +78,12 @@ pub fn descriptors() -> Vec<ActionDescriptor> {
             },
             commands: vec![],
         })
-        .collect()
+        .collect();
+    result.extend(crate::drop_actions::descriptors());
+    result
 }
 pub fn register_content(pack: &mut ContentPack) {
-    let components = NAMES
+    let mut components: Vec<_> = NAMES
         .into_iter()
         .chain(["result"])
         .map(|name| {
@@ -116,6 +118,7 @@ pub fn register_content(pack: &mut ContentPack) {
             }
         })
         .collect();
+    components.extend(crate::drop_actions::declarations());
     register_action_module(
         pack,
         owner(),
@@ -127,7 +130,7 @@ pub fn register_content(pack: &mut ContentPack) {
 }
 pub fn handlers(catalog: Catalog) -> Vec<NativeHandler> {
     let catalog = Arc::new(catalog);
-    NAMES
+    let mut result: Vec<_> = NAMES
         .into_iter()
         .map(|name| NativeHandler {
             handler: key(&format!("items:handler/{name}")),
@@ -141,7 +144,9 @@ pub fn handlers(catalog: Catalog) -> Vec<NativeHandler> {
                 name,
             }),
         })
-        .collect()
+        .collect();
+    result.extend(crate::drop_actions::handlers(catalog));
+    result
 }
 fn number(fields: &ComponentFields, name: &str) -> Result<usize, RejectCode> {
     match fields.get(&key(&format!("items:field/{name}"))) {
@@ -182,6 +187,22 @@ impl ActionHandler for Handler {
         let ActionTarget::Block(pos) = request.target else {
             return Err(RejectCode::InvalidData);
         };
+        if self.name == "harvest" && self.catalog.world_drops {
+            return Ok(ActionOutput::Invoke(vec![
+                ActionInvocation {
+                    action: key("world:action/break"),
+                    api_version: 1,
+                    target: request.target,
+                    parameters: ComponentFields::new(),
+                },
+                ActionInvocation {
+                    action: key("items:action/spawn_harvest"),
+                    api_version: 1,
+                    target: request.target,
+                    parameters: ComponentFields::new(),
+                },
+            ]));
+        }
         let Some(ComponentValue::Entity(target)) =
             request.parameters.get(&key("items:field/inventory"))
         else {

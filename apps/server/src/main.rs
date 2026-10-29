@@ -213,10 +213,16 @@ fn run() -> Result<(), Fault> {
     std::fs::create_dir_all(&path).map_err(|e| Fault::invalid_data(e.to_string()))?;
     let (mut world, actions, rules, machine_targets) = if mod_dirs.is_empty() {
         let (world, actions) = base::world()?;
+        let catalog = torse_items::fixture_catalog(world.registry())
+            .map_err(|e| Fault::invalid_data(format!("item physics: {e:?}")))?
+            .with_world_drops();
         (
             world,
             actions,
-            Vec::new(),
+            vec![
+                Box::new(torse_server::item_drops::DropPhysics::new(catalog))
+                    as Box<dyn torse_server::execution::DurableRule>,
+            ],
             Vec::<torse_types::EntityId>::new(),
         )
     } else {
@@ -426,6 +432,9 @@ fn run() -> Result<(), Fault> {
                                 "inventory:permission/consume",
                                 "inventory:permission/swap",
                                 "inventory:permission/read",
+                                "items:permission/pickup",
+                                "world:permission/spawn",
+                                "world:permission/despawn",
                             ]
                             .into_iter()
                             .fold(

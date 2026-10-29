@@ -7,6 +7,7 @@ pub(super) struct Stock {
     catalog: torse_items::Catalog,
     owner: EntityId,
     _memory: Option<MemoryLease>,
+    tick: u64,
 }
 
 impl Scene {
@@ -19,7 +20,8 @@ impl Scene {
         } else {
             torse_items::fixture_catalog(self.authority.registry())
         }
-        .map_err(|error| format!("item catalog: {error:?}"))?;
+        .map_err(|error| format!("item catalog: {error:?}"))?
+        .with_world_drops();
         let memory = self
             .reserve_memory(
                 MemoryClass::World,
@@ -115,11 +117,15 @@ impl Scene {
             catalog,
             owner,
             _memory: memory,
+            tick: 0,
         });
         Ok(())
     }
     pub fn item_owner(&self) -> Option<EntityId> {
         self.items.as_ref().map(|stock| stock.owner)
+    }
+    pub fn item_block(&self, item: &ContentKey) -> Option<ContentKey> {
+        self.items.as_ref()?.catalog.block(item).cloned()
     }
     pub fn inventory_slots(&self) -> Vec<Option<ItemStack>> {
         let Some(stock) = &self.items else {
@@ -160,6 +166,10 @@ impl Scene {
             "inventory:permission/insert",
             "inventory:permission/consume",
             "inventory:permission/swap",
+            "items:permission/pickup",
+            "items:permission/host_position",
+            "world:permission/spawn",
+            "world:permission/despawn",
         ]
         .into_iter()
         .fold(
@@ -168,6 +178,40 @@ impl Scene {
                 .target(call.target),
             |actor, permission| actor.permission(key(permission)),
         );
+        let mut actor = actor;
+        let coordinates: Option<Vec<_>> = ["x", "y", "z"]
+            .into_iter()
+            .map(
+                |axis| match call.parameters.get(&key(&format!("items:field/{axis}"))) {
+                    Some(ComponentValue::I64(value)) => Some(*value as f64 / 1_000_000.0),
+                    _ => None,
+                },
+            )
+            .collect();
+        if let Some(point) = coordinates {
+            let from = Position::new(point[0], point[1], point[2]);
+            let to = if let ActionTarget::Entity(id) = call.target {
+                self.authority
+                    .entities()
+                    .handle_of(id)
+                    .and_then(|h| self.authority.entities().get(h))
+                    .map_or(from, |e| e.position)
+            } else {
+                from
+            };
+            for step in 0..=24 {
+                let t = f64::from(step) / 24.0;
+                if let Some(cell) = Position::new(
+                    from.x + (to.x - from.x) * t,
+                    from.y + (to.y - from.y) * t,
+                    from.z + (to.z - from.z) * t,
+                )
+                .checked_block()
+                {
+                    actor = actor.target(ActionTarget::Block(cell));
+                }
+            }
+        }
         let request = ActionRequest {
             action: call.action,
             api_version: call.version,
@@ -220,6 +264,60 @@ impl Scene {
         drop(preview);
         self.reconcile_world_memory(growth)
             .map_err(|error| error.to_string())
+    }
+
+    pub fn step_items(&mut self) -> Result<(), String> {
+        if self.is_network() {
+            return Ok(());
+        }
+        let Some(stock) = &mut self.items else {
+            return Ok(());
+        };
+        stock.tick = stock.tick.wrapping_add(1);
+        let groups = torse_items::drops::plans(
+            &self.authority,
+            &stock.catalog,
+            torse_types::Tick(stock.tick),
+        );
+        for group in groups {
+            let Ok(prepared) = self.authority.prepare_group(&group) else {
+                continue;
+            };
+            let growth = self
+                .reserve_memory(
+                    MemoryClass::World,
+                    self.authority.growth_reservation(&prepared),
+                    EvictionRank::Pinned,
+                )
+                .map_err(|e| e.to_string())?;
+            self.authority
+                .publish(prepared)
+                .map_err(|e| e.to_string())?;
+            self.reconcile_world_memory(growth)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub fn nearest_drop(&self, at: Position) -> Option<(EntityId, ItemStack)> {
+        let stock = self.items.as_ref()?;
+        self.authority
+            .entities()
+            .iter()
+            .filter_map(|(_, e)| {
+                let state = torse_items::drops::DropState::read(e, &stock.catalog).ok()?;
+                torse_items::drops::near(at, e.position, torse_items::drops::PICKUP_REACH)
+                    .then_some((e, state.stack))
+            })
+            .min_by(|(a, _), (b, _)| {
+                let distance = |e: &torse_world::Entity| {
+                    (at.x - e.position.x).powi(2)
+                        + (at.y - e.position.y).powi(2)
+                        + (at.z - e.position.z).powi(2)
+                };
+                distance(a).total_cmp(&distance(b)).then(a.id.cmp(&b.id))
+            })
+            .map(|(e, stack)| (e.id, stack))
     }
 }
 
@@ -294,6 +392,17 @@ mod tests {
         scene
             .apply_item_call(torse_items::edit_call(owner, false, 2, pos, 0))
             .unwrap();
+        assert_eq!(scene.inventory_slots(), after);
+        let eye = Position::new(8.5, 15.5, 8.5);
+        let (drop_id, _) = scene.nearest_drop(eye).unwrap();
+        assert!(!scene.entity_geometry().0.is_empty());
+        scene
+            .apply_item_call(torse_items::with_position(
+                torse_items::pickup_call(owner, drop_id),
+                eye,
+            ))
+            .unwrap();
+        assert!(scene.nearest_drop(eye).is_none());
         assert_eq!(scene.inventory_slots(), before);
         drop(scene);
         assert_eq!(pool.usage().total, 0);

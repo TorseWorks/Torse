@@ -50,6 +50,11 @@ impl Layout {
             Tab::Gameplay => {
                 row(0, Action::Toggle(OptionId::InvertY), "settings_invert_y");
                 row(1, Action::Toggle(OptionId::AutoJump), "settings_auto_jump");
+                row(
+                    2,
+                    Action::Toggle(OptionId::AutoPickup),
+                    "settings_auto_pickup",
+                );
             }
             Tab::Graphics => {
                 row(0, Action::Toggle(OptionId::Vsync), "settings_vsync");
@@ -74,14 +79,16 @@ impl Layout {
                         Binding::Screenshot => "bind_screenshot",
                         Binding::Debug => "bind_debug",
                         Binding::Inventory => "bind_inventory",
+                        Binding::Pickup => "bind_pickup",
+                        Binding::Drop => "bind_drop",
                     };
                     buttons.push((
                         Action::Rebind(binding),
                         Rect::new(
                             p.x + 12 + (index % 2) as i32 * (column + 4) as i32,
-                            p.y + 62 + (index / 2) as i32 * 26,
+                            p.y + 62 + (index / 2) as i32 * 22,
                             column,
-                            22,
+                            20,
                         ),
                         label,
                     ));

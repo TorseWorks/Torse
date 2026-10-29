@@ -2,7 +2,10 @@
 #![forbid(unsafe_code)]
 
 mod actions;
+mod drop_actions;
+pub mod drops;
 pub use actions::{block_handlers, descriptors, handlers, register_content};
+pub use drop_actions::{pickup_call, throw_call, with_position};
 use std::collections::BTreeMap;
 use torse_inventory::{Inventory, ItemCatalog, ItemStack};
 use torse_types::{Compatibility, ContentKey, Digest, RejectCode};
@@ -30,6 +33,7 @@ pub struct Catalog {
     drops: BTreeMap<ContentKey, ItemStack>,
     pub(crate) states: BTreeMap<BlockStateId, ItemStack>,
     pub(crate) stacks: ItemCatalog,
+    pub(crate) world_drops: bool,
 }
 impl Catalog {
     /// Conservative retained catalog charge for a host's module budget.
@@ -90,10 +94,16 @@ impl Catalog {
             drops: drop_map,
             states,
             stacks,
+            world_drops: false,
         })
     }
     pub fn definitions(&self) -> impl Iterator<Item = &ItemDefinition> {
         self.definitions.values()
+    }
+    /// Opt into physical harvest drops instead of direct insertion into stock.
+    pub fn with_world_drops(mut self) -> Self {
+        self.world_drops = true;
+        self
     }
     pub fn stack_rules(&self) -> &ItemCatalog {
         &self.stacks
@@ -106,6 +116,9 @@ impl Catalog {
         let mut result = self.stacks.bind_compatibility(base);
         let mut hash = Sha256::new();
         hash.update(b"torse:items/rules/v1\0");
+        if self.world_drops {
+            hash.update(b"physical-drops/v1\0");
+        }
         hash.update(result.rules_digest.0);
         hash.update((self.definitions.len() as u64).to_le_bytes());
         for entry in self.definitions.values() {
