@@ -263,6 +263,39 @@ impl Settings {
             }
             settings.version = 2;
         }
+        let input: toml::Value = toml::from_str(&text).map_err(|error| error.to_string())?;
+        for (name, binding) in [("pickup", Binding::Pickup), ("drop", Binding::Drop)] {
+            if input
+                .get("bindings")
+                .and_then(|table| table.get(name))
+                .is_none()
+            {
+                let current = settings.bindings.key(binding);
+                if settings.bindings.rebind(binding, current).is_err() {
+                    let free = [
+                        KeyCode::KeyF,
+                        KeyCode::KeyQ,
+                        KeyCode::KeyG,
+                        KeyCode::KeyR,
+                        KeyCode::KeyT,
+                        KeyCode::KeyY,
+                        KeyCode::KeyU,
+                        KeyCode::KeyI,
+                        KeyCode::KeyO,
+                        KeyCode::KeyP,
+                        KeyCode::F6,
+                        KeyCode::F7,
+                        KeyCode::F9,
+                        KeyCode::F10,
+                    ]
+                    .into_iter()
+                    .find(|candidate| settings.bindings.rebind(binding, *candidate).is_ok());
+                    if free.is_none() {
+                        return Err("no free default item binding".into());
+                    }
+                }
+            }
+        }
         settings.validate()?;
         Ok(settings)
     }
@@ -427,6 +460,34 @@ mod tests {
         assert_eq!(current.bindings, legacy.bindings);
         current.save(&path).unwrap();
         assert_eq!(Settings::load(&path).unwrap(), current);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn adding_item_bindings_preserves_old_custom_keys() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../.work/settings-item-migration-{}.toml",
+            std::process::id()
+        ));
+        let old = Settings {
+            bindings: Bindings {
+                forward: KeyCode::KeyF,
+                back: KeyCode::KeyQ,
+                ..Bindings::default()
+            },
+            ..Settings::default()
+        };
+        let mut source = toml::Value::try_from(&old).unwrap();
+        let bindings = source.get_mut("bindings").unwrap().as_table_mut().unwrap();
+        bindings.remove("pickup");
+        bindings.remove("drop");
+        std::fs::write(&path, toml::to_string(&source).unwrap()).unwrap();
+        let migrated = Settings::load(&path).unwrap();
+        assert_eq!(migrated.bindings.forward, KeyCode::KeyF);
+        assert_eq!(migrated.bindings.back, KeyCode::KeyQ);
+        assert_ne!(migrated.bindings.pickup, KeyCode::KeyF);
+        assert_ne!(migrated.bindings.drop, KeyCode::KeyQ);
+        assert_ne!(migrated.bindings.pickup, migrated.bindings.drop);
+        migrated.validate().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 }

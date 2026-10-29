@@ -1404,6 +1404,8 @@ impl Renderer {
             &state,
             crate::ui::Hud {
                 scene: Some(scene),
+                pickup: None,
+                catalog_pages: 1,
                 debug_lines: &[],
                 inventory: scene.inventory_slots(),
                 bar: scene.inventory_slots().into_iter().take(9).collect(),

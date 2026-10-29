@@ -53,6 +53,7 @@ pub enum Action {
     ResetSettings,
     Slot(usize),
     Skin(SkinChoice),
+    CatalogPage(i32),
 }
 
 #[derive(Default)]
@@ -63,6 +64,7 @@ pub struct State {
     pub tab: Tab,
     pub rebinding: Option<Binding>,
     pub inventory_source: Option<usize>,
+    pub catalog_page: usize,
     capture: torse_ui::Pointer<Action>,
 }
 impl State {
@@ -87,17 +89,17 @@ impl State {
     }
     pub fn pointer(&mut self, down: bool, size: [u32; 2]) -> Option<Action> {
         let layout = Layout::new(size);
-        let controls = layout.controls(self.mode, self.tab);
+        let controls = layout.controls(self.mode, self.tab, self.settings.infinite_supply);
         self.capture.cursor = layout.point(self.cursor);
         Self::event(self.capture.button(down, &controls))
     }
     pub fn motion(&mut self, cursor: [f64; 2], size: [u32; 2]) -> Option<Action> {
         self.cursor = cursor;
         let layout = Layout::new(size);
-        Self::event(
-            self.capture
-                .motion(layout.point(cursor), &layout.controls(self.mode, self.tab)),
-        )
+        Self::event(self.capture.motion(
+            layout.point(cursor),
+            &layout.controls(self.mode, self.tab, self.settings.infinite_supply),
+        ))
     }
 }
 struct Layout {
@@ -116,7 +118,7 @@ impl Layout {
     }
     fn panel(&self, mode: Mode) -> Rect {
         let (w, h) = if mode == Mode::Inventory {
-            (324, 226)
+            (452, 240)
         } else if mode == Mode::Settings {
             (400, 248)
         } else if mode == Mode::Pause {
@@ -190,7 +192,7 @@ impl Layout {
         let p = self.panel(mode);
         Rect::new(p.x + p.w as i32 - 22, p.y + 3, 18, 16)
     }
-    fn controls(&self, mode: Mode, tab: Tab) -> Vec<torse_ui::Control<Action>> {
+    fn controls(&self, mode: Mode, tab: Tab, infinite: bool) -> Vec<torse_ui::Control<Action>> {
         if mode == Mode::Game {
             return Vec::new();
         }
@@ -223,15 +225,21 @@ impl Layout {
                     }),
             );
         }
+        if mode == Mode::Inventory && infinite {
+            controls.extend([-1, 1].map(|direction| torse_ui::Control::Button {
+                key: Action::CatalogPage(direction),
+                rect: self.catalog_button(direction),
+            }));
+        }
         if mode == Mode::Inventory {
             controls.extend((0..36).map(|slot| torse_ui::Control::Button {
                 key: Action::Slot(slot),
-                rect: self.inventory_slot(slot),
+                rect: self.inventory_slot(slot, infinite),
             }));
         }
         controls
     }
-    fn hit(&self, mode: Mode, cursor: [f64; 2], tab: Tab) -> Option<Action> {
+    fn hit(&self, mode: Mode, cursor: [f64; 2], tab: Tab, infinite: bool) -> Option<Action> {
         if mode == Mode::Game {
             return None;
         }
@@ -243,8 +251,15 @@ impl Layout {
             return Some(Action::Resume);
         }
         if mode == Mode::Inventory {
+            if infinite
+                && let Some(direction) = [-1, 1]
+                    .into_iter()
+                    .find(|d| self.catalog_button(*d).contains(p))
+            {
+                return Some(Action::CatalogPage(direction));
+            }
             return (0..36)
-                .find(|slot| self.inventory_slot(*slot).contains(p))
+                .find(|slot| self.inventory_slot(*slot, infinite).contains(p))
                 .map(Action::Slot);
         }
         self.buttons(mode, tab)
@@ -276,6 +291,9 @@ struct View {
     debug_lines: Vec<String>,
     inventory: Vec<Option<torse_inventory::ItemStack>>,
     inventory_source: Option<usize>,
+    catalog_page: usize,
+    catalog_pages: usize,
+    pickup: Option<torse_inventory::ItemStack>,
     bar: Vec<Option<torse_inventory::ItemStack>>,
 }
 
@@ -293,6 +311,8 @@ pub struct Layer {
 }
 pub struct Hud<'a> {
     pub scene: Option<&'a crate::scene::Scene>,
+    pub pickup: Option<torse_inventory::ItemStack>,
+    pub catalog_pages: usize,
     pub material: usize,
     pub network: bool,
     pub ready: bool,
@@ -401,7 +421,12 @@ impl Layer {
             result: hud.result.chars().take(120).collect(),
             names,
             sensitivity: (hud.sensitivity * 100.0).round() as u16,
-            hover: layout.hit(state.mode, state.cursor, state.tab),
+            hover: layout.hit(
+                state.mode,
+                state.cursor,
+                state.tab,
+                state.settings.infinite_supply,
+            ),
             pressed: state.capture.active(),
             frame_limit: state.settings.frame_limit,
             dragging_fps: state.capture.dragging(),
@@ -411,6 +436,9 @@ impl Layer {
             inventory: hud.inventory,
             bar: hud.bar,
             inventory_source: state.inventory_source,
+            catalog_page: state.catalog_page,
+            catalog_pages: hud.catalog_pages,
+            pickup: hud.pickup,
             debug_lines: if state.settings.debug {
                 hud.debug_lines.to_vec()
             } else {
@@ -613,58 +641,103 @@ impl Layer {
     }
     /// HUD is shared by all modes: hotbar, status chip, result toast, help.
     fn paint_hud(&mut self, c: &mut Canvas, l: &Layout, v: &View, w: i32, h: i32) {
-        let count = if v.bar.is_empty() { 3 } else { 9 };
-        let slot_x = w / 2 - (count * 26 - 2) / 2;
-        let slot_y = h - 36;
-        let packaged = v.names.is_empty();
-        for i in 0..count as usize {
-            let x = slot_x + i as i32 * 26;
-            self.theme
-                .slot(c, Rect::new(x, slot_y, 24, 24), i == v.material);
-            if !v.bar.is_empty() {
-                self.paint_item(
+        if v.mode == Mode::Game {
+            let count = if v.bar.is_empty() { 3 } else { 9 };
+            let slot_x = w / 2 - (count * 34 - 2) / 2;
+            let slot_y = h - 46;
+            let packaged = v.names.is_empty();
+            for i in 0..count as usize {
+                let x = slot_x + i as i32 * 34;
+                self.theme
+                    .slot(c, Rect::new(x, slot_y, 32, 32), i == v.material);
+                if !v.bar.is_empty() {
+                    self.paint_item(
+                        c,
+                        Rect::new(x, slot_y, 32, 32),
+                        v.bar.get(i).and_then(Option::as_ref),
+                        !v.settings.infinite_supply,
+                    );
+                } else if packaged {
+                    let item = torse_items::key(["base:stone", "base:glass_slab", "base:plant"][i]);
+                    if let Some(sprite) = self.models.get(&item) {
+                        c.sprite(sprite, Rect::new(x + 1, slot_y + 1, 30, 30), 0);
+                    }
+                }
+                self.text.draw(
                     c,
-                    Rect::new(x, slot_y, 24, 24),
-                    v.bar.get(i).and_then(Option::as_ref),
+                    &(i + 1).to_string(),
+                    Rect::new(x + 3, slot_y + 2, 8, 8),
+                    8,
+                    MUTED,
                 );
-            } else if packaged {
-                let item = torse_items::key(["base:stone", "base:glass_slab", "base:plant"][i]);
-                if let Some(sprite) = self.models.get(&item) {
-                    c.sprite(sprite, Rect::new(x + 1, slot_y + 1, 22, 22), 0);
+            }
+            // The selected item name would collide with the modal panels.
+            if v.mode == Mode::Game {
+                match v.names.get(v.material) {
+                    Some(name) => {
+                        let name = name.clone();
+                        let width = self.text.measure(&name, 12);
+                        self.text.draw(
+                            c,
+                            &name,
+                            Rect::new(w / 2 - width as i32 / 2, slot_y - 18, width, 16),
+                            12,
+                            TEXT,
+                        );
+                    }
+                    None => {
+                        let selected =
+                            ["item_stone", "item_glass", "item_plant"][v.material.min(2)];
+                        let width = self.text.measure(self.labels[selected], 12);
+                        self.shadow_label(
+                            c,
+                            selected,
+                            Rect::new(w / 2 - width as i32 / 2, slot_y - 18, width, 16),
+                            12,
+                        );
+                    }
                 }
             }
-            self.text.draw(
-                c,
-                &(i + 1).to_string(),
-                Rect::new(x + 3, slot_y + 2, 8, 8),
-                8,
-                MUTED,
-            );
         }
-        // The selected item name would collide with the modal panels.
         if v.mode == Mode::Game {
-            match v.names.get(v.material) {
-                Some(name) => {
-                    let name = name.clone();
-                    let width = self.text.measure(&name, 12);
-                    self.text.draw(
-                        c,
-                        &name,
-                        Rect::new(w / 2 - width as i32 / 2, slot_y - 18, width, 16),
-                        12,
-                        TEXT,
-                    );
-                }
-                None => {
-                    let selected = ["item_stone", "item_glass", "item_plant"][v.material.min(2)];
-                    let width = self.text.measure(self.labels[selected], 12);
-                    self.shadow_label(
-                        c,
-                        selected,
-                        Rect::new(w / 2 - width as i32 / 2, slot_y - 18, width, 16),
-                        12,
-                    );
-                }
+            let mode = if v.settings.infinite_supply {
+                "inventory_supply"
+            } else {
+                "inventory_finite"
+            };
+            let width = self
+                .text
+                .measure(self.labels.get(mode).copied().unwrap_or(""), 10)
+                + 16;
+            self.theme
+                .paint(c, Part::Chip, Rect::new(w - width as i32 - 8, 8, width, 20));
+            self.label(
+                c,
+                mode,
+                Rect::new(w - width as i32, 12, width.saturating_sub(8), 14),
+                10,
+                TEXT,
+            );
+            if let Some(stack) = &v.pickup {
+                let key = format!("{:?}", v.settings.bindings.pickup);
+                let key = key.strip_prefix("Key").unwrap_or(&key);
+                let prompt = format!(
+                    "[{}] {} {} x{}",
+                    key,
+                    self.labels.get("hud_pickup").copied().unwrap_or(""),
+                    self.item_name(stack),
+                    stack.count
+                );
+                let width = (self.text.measure(&prompt, 10) + 16).min(l.width.saturating_sub(24));
+                let rect = Rect::new(w / 2 - width as i32 / 2, h / 2 + 20, width, 21);
+                self.theme.paint(c, Part::Chip, rect);
+                self.text.draw(
+                    c,
+                    &prompt,
+                    Rect::new(rect.x + 8, rect.y + 4, rect.w.saturating_sub(16), 14),
+                    10,
+                    TITLE_TEXT,
+                );
             }
         }
         let info = if !v.network {
@@ -684,7 +757,7 @@ impl Layer {
             9,
         );
         if !v.result.is_empty() {
-            let rw = l.width.saturating_sub(16);
+            let rw = (self.text.measure(&v.result, 10) + 12).min(l.width.saturating_sub(16));
             self.theme.paint(c, Part::Chip, Rect::new(8, 32, rw, 20));
             self.text.draw(
                 c,
@@ -815,6 +888,8 @@ mod tests {
         let mut state = State::default();
         let hud = || Hud {
             scene: None,
+            pickup: None,
+            catalog_pages: 1,
             bar: Vec::new(),
             material: 0,
             network: false,
@@ -872,10 +947,10 @@ mod tests {
                 f64::from((r.y + 10) * l.scale as i32),
             ];
             assert_eq!(
-                l.hit(Mode::MachinePreview, cursor, Tab::Graphics),
+                l.hit(Mode::MachinePreview, cursor, Tab::Graphics, false),
                 Some(Action::Resume)
             );
-            assert_eq!(l.hit(Mode::Game, cursor, Tab::Graphics), None);
+            assert_eq!(l.hit(Mode::Game, cursor, Tab::Graphics, false), None);
         }
     }
 

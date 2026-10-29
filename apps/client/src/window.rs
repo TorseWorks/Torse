@@ -451,6 +451,11 @@ impl WindowApp {
             // Connected but no baseline yet: keep presenting cleared frames
             // so polling continues and the window does not sit on an
             // uninitialized surface.
+            let pickup = self.nearby_pickup();
+            let catalog_pages = self
+                .scene
+                .as_ref()
+                .map_or(1, |scene| scene.item_count().div_ceil(36).max(1));
             let inventory = self.displayed_inventory();
             let bar = self.displayed_bar();
             if let Some(gpu) = self.gpu.as_mut() {
@@ -472,6 +477,8 @@ impl WindowApp {
                             &self.ui,
                             crate::ui::Hud {
                                 scene: self.scene.as_ref(),
+                                pickup: pickup.clone(),
+                                catalog_pages,
                                 material: self.material,
                                 network: self.net.is_some(),
                                 ready: false,
@@ -906,6 +913,11 @@ impl WindowApp {
             None => return,
         };
 
+        let pickup = self.nearby_pickup();
+        let catalog_pages = self
+            .scene
+            .as_ref()
+            .map_or(1, |scene| scene.item_count().div_ceil(36).max(1));
         let inventory = self.displayed_inventory();
         let bar = self.displayed_bar();
         let Some(gpu) = self.gpu.as_mut() else {
@@ -958,6 +970,8 @@ impl WindowApp {
             &self.ui,
             crate::ui::Hud {
                 scene: self.scene.as_ref(),
+                pickup: pickup.clone(),
+                catalog_pages,
                 material: self.material,
                 network: self.net.is_some(),
                 ready: self.scene.is_some(),
@@ -1575,6 +1589,18 @@ impl WindowApp {
             return;
         }
         match action {
+            crate::ui::Action::CatalogPage(direction) => {
+                let pages = self
+                    .scene
+                    .as_ref()
+                    .map_or(1, |scene| scene.item_count().div_ceil(36).max(1));
+                self.ui.catalog_page = self
+                    .ui
+                    .catalog_page
+                    .saturating_add_signed(direction as isize)
+                    .min(pages - 1);
+                return;
+            }
             crate::ui::Action::Slot(slot) => {
                 self.inventory_slot_clicked(slot);
                 return;
@@ -2036,7 +2062,6 @@ impl ApplicationHandler for WindowApp {
                             self.set_grab(!self.ui.modal());
                             return;
                         }
-                        _ if self.ui.modal() => return,
                         KeyCode::Digit1 => self.material = 0,
                         KeyCode::Digit2 => self.material = 1,
                         KeyCode::Digit3 => self.material = 2,
@@ -2046,6 +2071,7 @@ impl ApplicationHandler for WindowApp {
                         KeyCode::Digit7 if self.materials.len() > 6 => self.material = 6,
                         KeyCode::Digit8 if self.materials.len() > 7 => self.material = 7,
                         KeyCode::Digit9 if self.materials.len() > 8 => self.material = 8,
+                        _ if self.ui.modal() => return,
                         _ => {}
                     }
                 }

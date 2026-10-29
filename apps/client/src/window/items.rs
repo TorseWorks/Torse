@@ -22,6 +22,16 @@ impl WindowApp {
             }
         }
     }
+    pub(super) fn nearby_pickup(&self) -> Option<torse_inventory::ItemStack> {
+        let scene = self.scene.as_ref()?;
+        if scene.supply_mode() == torse_items::supply::SupplyMode::Infinite {
+            return None;
+        }
+        let eye = self.camera.as_ref()?.eye;
+        scene
+            .nearest_drop(Position::new(eye[0] as f64, eye[1] as f64, eye[2] as f64))
+            .map(|(_, stack)| stack)
+    }
     pub(super) fn pickup_item(&mut self, manual: bool) {
         let Some(camera) = &self.camera else {
             return;
@@ -86,9 +96,8 @@ impl WindowApp {
         self.scene.as_ref().map_or_else(Vec::new, |scene| {
             if scene.supply_mode() == torse_items::supply::SupplyMode::Infinite {
                 scene
-                    .item_catalog()
+                    .item_catalog_page(self.ui.catalog_page)
                     .into_iter()
-                    .take(36)
                     .map(Some)
                     .collect()
             } else {
@@ -99,17 +108,15 @@ impl WindowApp {
     pub(super) fn displayed_bar(&self) -> Vec<Option<torse_inventory::ItemStack>> {
         self.scene.as_ref().map_or_else(Vec::new, |scene| {
             if scene.supply_mode() == torse_items::supply::SupplyMode::Infinite {
-                let catalog = scene.item_catalog();
                 self.ui
                     .settings
                     .supply_slots
                     .iter()
                     .take(9)
                     .map(|id| {
-                        catalog
-                            .iter()
-                            .find(|entry| entry.item.to_string() == *id)
-                            .cloned()
+                        ContentKey::parse(id)
+                            .ok()
+                            .and_then(|id| scene.catalog_stack(&id))
                     })
                     .collect()
             } else {
@@ -141,7 +148,7 @@ impl WindowApp {
                 self.ui.settings.infinite_supply =
                     scene.supply_mode() == torse_items::supply::SupplyMode::Infinite;
                 if self.ui.settings.infinite_supply {
-                    let catalog = scene.item_catalog();
+                    let catalog = scene.item_catalog_page(0);
                     if self.ui.settings.supply_slots.is_empty() {
                         self.ui.settings.supply_slots = catalog
                             .iter()
@@ -156,10 +163,9 @@ impl WindowApp {
                         .iter()
                         .take(9)
                         .map(|id| {
-                            catalog
-                                .iter()
-                                .find(|entry| entry.item.to_string() == *id)
-                                .and_then(|entry| scene.item_block(&entry.item))
+                            ContentKey::parse(id)
+                                .ok()
+                                .and_then(|id| scene.item_block(&id))
                                 .unwrap_or_else(|| torse_items::key("client:empty_slot"))
                         })
                         .collect();
@@ -272,5 +278,43 @@ mod tests {
         app.set_ui_mode(crate::ui::Mode::Game);
         assert_eq!(app.ui.inventory_source, None);
         assert_eq!(app.scene.as_ref().unwrap().inventory_slots(), after);
+    }
+    #[test]
+    fn supply_catalog_selection_does_not_swap_or_consume_finite_slots() {
+        let mut app = super::super::tests::app();
+        let mut scene = Scene::new(0).unwrap();
+        scene.enable_items(None).unwrap();
+        let owner = scene.item_owner().unwrap();
+        let before = scene.inventory_slots();
+        scene
+            .apply_item_call(torse_items::supply::call(
+                owner,
+                torse_items::supply::SupplyMode::Infinite,
+            ))
+            .unwrap();
+        app.scene = Some(scene);
+        app.sync_inventory();
+        app.material = 7;
+        app.inventory_slot_clicked(3);
+        assert_eq!(
+            app.materials[7],
+            torse_items::key("base:vertical_glass_slab")
+        );
+        assert_eq!(app.scene.as_ref().unwrap().inventory_slots(), before);
+        assert_eq!(
+            app.displayed_bar()[7].as_ref().unwrap().item,
+            torse_items::key("base:vertical_glass_slab")
+        );
+        app.scene
+            .as_mut()
+            .unwrap()
+            .apply_item_call(torse_items::supply::call(
+                owner,
+                torse_items::supply::SupplyMode::Finite,
+            ))
+            .unwrap();
+        app.sync_inventory();
+        assert_eq!(app.scene.as_ref().unwrap().inventory_slots(), before);
+        assert_eq!(app.materials[2], torse_items::key("base:stone"));
     }
 }

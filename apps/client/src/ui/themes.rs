@@ -140,6 +140,8 @@ mod tests {
             &state,
             Hud {
                 scene: None,
+                pickup: None,
+                catalog_pages: 1,
                 bar: Vec::new(),
                 material: 0,
                 network: false,

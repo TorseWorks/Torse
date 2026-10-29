@@ -391,6 +391,28 @@ fn supply_requires_host_permission_and_stale_unlimited_edits_are_rejected() {
     let prepared = world.prepare(&tx).unwrap();
     world.publish(prepared).unwrap();
     let mut place = request(id, true, 0, 2);
+    let snapshot = world
+        .capture_snapshot(SnapshotMeta {
+            cursor: CommitCursor {
+                world: world.world(),
+                seq: world.seq(),
+            },
+            compatibility: world.coordinator().compatibility(),
+            resume_at: world.coordinator().resume_point(),
+        })
+        .unwrap();
+    let mut recovery = torse_sim::Recovery::new(world.world(), world.registry(), world.schemas());
+    recovery.restore_snapshot(&snapshot).unwrap();
+    let recovered = recovery.finish().unwrap();
+    let entity = recovered
+        .entities()
+        .get(recovered.entities().handle_of(id).unwrap())
+        .unwrap();
+    assert_eq!(torse_items::supply::mode(entity), SupplyMode::Infinite);
+    assert_eq!(
+        inventory(&recovered, &catalog, id),
+        catalog.starter(36).unwrap()
+    );
     place.parameters.insert(
         key("items:field/supply_item"),
         ComponentValue::Content(key("base:stone")),

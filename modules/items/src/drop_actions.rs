@@ -336,23 +336,24 @@ impl ActionHandler for Handler {
             let at = position(view, inventory, &request.parameters)?;
             let mut tx = Transaction::new(request.transaction, owner(), request.ordering);
             drops::spawn(&mut tx, at, stack, [0, 1_500_000, 0]);
+            if infinite {
+                let fields = view.component(inventory, &crate::supply::schema())?.clone();
+                tx.components.push(torse_world::ComponentEdit {
+                    id: inventory,
+                    schema: crate::supply::schema(),
+                    previous: Some(fields.clone()),
+                    fields: Some(fields),
+                });
+            }
             return mutation(tx);
         }
         if infinite {
-            return Ok(ActionOutput::Invoke(vec![
-                ActionInvocation {
-                    action: key("items:action/throw_drop"),
-                    api_version: 1,
-                    target: request.target,
-                    parameters: request.parameters.clone(),
-                },
-                ActionInvocation {
-                    action: key("items:action/supply_guard"),
-                    api_version: 1,
-                    target: request.target,
-                    parameters: ComponentFields::new(),
-                },
-            ]));
+            return Ok(ActionOutput::Invoke(vec![ActionInvocation {
+                action: key("items:action/throw_drop"),
+                api_version: 1,
+                target: request.target,
+                parameters: request.parameters.clone(),
+            }]));
         }
         Ok(ActionOutput::Invoke(
             ["throw_inventory", "throw_drop"]

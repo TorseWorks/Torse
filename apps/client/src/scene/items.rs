@@ -131,6 +131,41 @@ impl Scene {
             .map(torse_items::supply::mode)
             .unwrap_or_default()
     }
+    pub fn item_count(&self) -> usize {
+        self.items
+            .as_ref()
+            .map_or(0, |stock| stock.catalog.definitions().count())
+    }
+    pub fn catalog_stack(&self, id: &ContentKey) -> Option<ItemStack> {
+        let entry = self
+            .items
+            .as_ref()?
+            .catalog
+            .definitions()
+            .find(|entry| &entry.id == id)?;
+        Some(ItemStack {
+            item: entry.id.clone(),
+            count: entry.limit,
+        })
+    }
+    pub fn item_catalog_page(&self, page: usize) -> Vec<ItemStack> {
+        self.items
+            .as_ref()
+            .map(|stock| {
+                stock
+                    .catalog
+                    .definitions()
+                    .skip(page.saturating_mul(36))
+                    .take(36)
+                    .map(|entry| ItemStack {
+                        item: entry.id.clone(),
+                        count: entry.limit,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    #[cfg(test)]
     pub fn item_catalog(&self) -> Vec<ItemStack> {
         self.items
             .as_ref()
@@ -338,8 +373,10 @@ impl Scene {
             .iter()
             .filter_map(|(_, e)| {
                 let state = torse_items::drops::DropState::read(e, &stock.catalog).ok()?;
-                torse_items::drops::near(at, e.position, torse_items::drops::PICKUP_REACH)
-                    .then_some((e, state.stack))
+                (torse_items::drops::near(at,e.position,torse_items::drops::PICKUP_REACH) && (1..24).all(|step| {
+                    let t = f64::from(step)/24.0;
+                    Position::new(at.x+(e.position.x-at.x)*t,at.y+(e.position.y-at.y)*t,at.z+(e.position.z-at.z)*t).checked_block().is_some_and(|pos| matches!(self.authority.store().query(pos), TerrainQuery::Ready(state) if state.is_empty()))
+                })).then_some((e,state.stack))
             })
             .min_by(|(a, _), (b, _)| {
                 let distance = |e: &torse_world::Entity| {
@@ -384,6 +421,24 @@ mod tests {
             .apply_item_call(torse_items::edit_call(owner, false, 0, pos, 0))
             .unwrap();
         assert!(scene.nearest_drop(Position::new(8.5, 14.5, 8.5)).is_none());
+        let eye = Position::new(8.5, 15.0, 8.5);
+        scene
+            .apply_item_call(torse_items::with_position(
+                with_item(torse_items::throw_call(owner, 0), key("base:stone")),
+                eye,
+            ))
+            .unwrap();
+        let (drop_id, stack) = scene.nearest_drop(eye).unwrap();
+        assert_eq!(stack.item, key("base:stone"));
+        assert_eq!(stack.count, 1);
+        assert!(
+            scene
+                .apply_item_call(torse_items::with_position(
+                    torse_items::pickup_call(owner, drop_id),
+                    eye
+                ))
+                .is_err()
+        );
         assert_eq!(scene.inventory_slots(), before);
         assert!(
             scene
