@@ -433,6 +433,8 @@ fn run() -> Result<(), Fault> {
                                 "inventory:permission/swap",
                                 "inventory:permission/read",
                                 "items:permission/pickup",
+                                "items:permission/configure_supply",
+                                "items:permission/unlimited",
                                 "world:permission/spawn",
                                 "world:permission/despawn",
                             ]

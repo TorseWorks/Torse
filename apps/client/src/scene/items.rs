@@ -124,6 +124,36 @@ impl Scene {
     pub fn item_owner(&self) -> Option<EntityId> {
         self.items.as_ref().map(|stock| stock.owner)
     }
+    pub fn supply_mode(&self) -> torse_items::supply::SupplyMode {
+        self.item_owner()
+            .and_then(|id| self.authority.entities().handle_of(id))
+            .and_then(|h| self.authority.entities().get(h))
+            .map(torse_items::supply::mode)
+            .unwrap_or_default()
+    }
+    pub fn item_catalog(&self) -> Vec<ItemStack> {
+        self.items
+            .as_ref()
+            .map(|stock| {
+                stock
+                    .catalog
+                    .definitions()
+                    .map(|entry| ItemStack {
+                        item: entry.id.clone(),
+                        count: entry.limit,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    pub fn item_for_block(&self, block: &ContentKey) -> Option<ContentKey> {
+        self.items
+            .as_ref()?
+            .catalog
+            .definitions()
+            .find(|entry| entry.block.as_ref() == Some(block))
+            .map(|entry| entry.id.clone())
+    }
     pub fn item_block(&self, item: &ContentKey) -> Option<ContentKey> {
         self.items.as_ref()?.catalog.block(item).cloned()
     }
@@ -168,6 +198,8 @@ impl Scene {
             "inventory:permission/swap",
             "items:permission/pickup",
             "items:permission/host_position",
+            "items:permission/configure_supply",
+            "items:permission/unlimited",
             "world:permission/spawn",
             "world:permission/despawn",
         ]
@@ -324,6 +356,58 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn supply_switch_preserves_stock_and_catalog_selection_is_authoritative() {
+        use torse_items::supply::{SupplyMode, call, with_item};
+        let mut scene = Scene::new(0).unwrap();
+        scene.enable_items(None).unwrap();
+        let owner = scene.item_owner().unwrap();
+        let pos = BlockPos::new(8, 14, 8);
+        let before = scene.inventory_slots();
+        scene
+            .apply_item_call(call(owner, SupplyMode::Infinite))
+            .unwrap();
+        assert_eq!(scene.supply_mode(), SupplyMode::Infinite);
+        // Select stone even though the slot contains a glass slab.
+        scene
+            .apply_item_call(with_item(
+                torse_items::edit_call(owner, true, 0, pos, 0),
+                key("base:stone"),
+            ))
+            .unwrap();
+        let state = scene.authority.store().query(pos).ready().unwrap();
+        assert_eq!(
+            scene.authority.registry().definition(state).unwrap().id,
+            key("base:stone")
+        );
+        scene
+            .apply_item_call(torse_items::edit_call(owner, false, 0, pos, 0))
+            .unwrap();
+        assert!(scene.nearest_drop(Position::new(8.5, 14.5, 8.5)).is_none());
+        assert_eq!(scene.inventory_slots(), before);
+        assert!(
+            scene
+                .apply_item_call(with_item(
+                    torse_items::edit_call(owner, true, 0, pos, 0),
+                    key("unknown:item")
+                ))
+                .is_err()
+        );
+        scene
+            .apply_item_call(call(owner, SupplyMode::Finite))
+            .unwrap();
+        scene
+            .apply_item_call(with_item(
+                torse_items::edit_call(owner, true, 2, pos, 0),
+                key("base:plant"),
+            ))
+            .unwrap();
+        assert_eq!(
+            scene.inventory_slots()[2].as_ref().unwrap().count,
+            before[2].as_ref().unwrap().count - 1
+        );
+        assert_eq!(scene.inventory_slots()[0], before[0]);
+    }
     #[test]
     fn vertical_glass_places_each_side_and_rejects_wrong_axis_completion() {
         for side in 0..4 {

@@ -30,7 +30,17 @@ impl Layout {
         let mut row = |index: i32, action, label| {
             buttons.push((
                 action,
-                Rect::new(p.x + 12, p.y + 62 + index * 24, p.w.saturating_sub(24), 20),
+                if tab == Tab::Gameplay {
+                    let column = p.w.saturating_sub(28) / 2;
+                    Rect::new(
+                        p.x + 12 + (index % 2) * (column + 4) as i32,
+                        p.y + 62 + (index / 2) * 28,
+                        column,
+                        22,
+                    )
+                } else {
+                    Rect::new(p.x + 12, p.y + 62 + index * 24, p.w.saturating_sub(24), 20)
+                },
                 label,
             ))
         };
@@ -54,6 +64,11 @@ impl Layout {
                     2,
                     Action::Toggle(OptionId::AutoPickup),
                     "settings_auto_pickup",
+                );
+                row(
+                    3,
+                    Action::Toggle(OptionId::InfiniteSupply),
+                    "settings_infinite_supply",
                 );
             }
             Tab::Graphics => {

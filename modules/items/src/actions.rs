@@ -80,6 +80,7 @@ pub fn descriptors() -> Vec<ActionDescriptor> {
         })
         .collect();
     result.extend(crate::drop_actions::descriptors());
+    result.extend(crate::supply::descriptors());
     result
 }
 pub fn register_content(pack: &mut ContentPack) {
@@ -119,6 +120,19 @@ pub fn register_content(pack: &mut ContentPack) {
         })
         .collect();
     components.extend(crate::drop_actions::declarations());
+    components.extend(crate::supply::declarations());
+    for component in &mut components {
+        if ["place", "harvest", "settle"]
+            .iter()
+            .any(|name| component.id == key(&format!("items:schema/{name}")))
+        {
+            component.fields.push(ComponentField {
+                id: key("items:field/supply_item"),
+                field_type: ComponentFieldType::ContentReference,
+                required: false,
+            });
+        }
+    }
     register_action_module(
         pack,
         owner(),
@@ -146,6 +160,7 @@ pub fn handlers(catalog: Catalog) -> Vec<NativeHandler> {
         })
         .collect();
     result.extend(crate::drop_actions::handlers(catalog));
+    result.extend(crate::supply::handlers());
     result
 }
 fn number(fields: &ComponentFields, name: &str) -> Result<usize, RejectCode> {
@@ -187,6 +202,54 @@ impl ActionHandler for Handler {
         let ActionTarget::Block(pos) = request.target else {
             return Err(RejectCode::InvalidData);
         };
+        let Some(ComponentValue::Entity(target)) =
+            request.parameters.get(&key("items:field/inventory"))
+        else {
+            return Err(RejectCode::InvalidData);
+        };
+        if self.name != "settle"
+            && crate::supply::mode(view.entity(*target)?.1) == crate::supply::SupplyMode::Infinite
+        {
+            if !view.actor().permits(&key("items:permission/unlimited")) {
+                return Err(RejectCode::PermissionDenied);
+            }
+            let mut parameters = ComponentFields::new();
+            if self.name == "place" {
+                let Some(ComponentValue::Content(item)) =
+                    request.parameters.get(&key("items:field/supply_item"))
+                else {
+                    return Err(RejectCode::InvalidData);
+                };
+                let block = self.catalog.block(item).ok_or(RejectCode::MissingTarget)?;
+                let half = number(&request.parameters, "half")?;
+                if half > 3 {
+                    return Err(RejectCode::InvalidData);
+                }
+                parameters.insert(
+                    key("world:field/block"),
+                    ComponentValue::Content(block.clone()),
+                );
+                parameters.insert(key("world:field/half"), ComponentValue::U32(half as u32));
+            }
+            return Ok(ActionOutput::Invoke(vec![
+                ActionInvocation {
+                    action: key(if self.name == "place" {
+                        "world:action/place"
+                    } else {
+                        "world:action/break"
+                    }),
+                    api_version: 1,
+                    target: request.target,
+                    parameters,
+                },
+                ActionInvocation {
+                    action: key("items:action/supply_guard"),
+                    api_version: 1,
+                    target: ActionTarget::Entity(*target),
+                    parameters: ComponentFields::new(),
+                },
+            ]));
+        }
         if self.name == "harvest" && self.catalog.world_drops {
             return Ok(ActionOutput::Invoke(vec![
                 ActionInvocation {
@@ -203,11 +266,6 @@ impl ActionHandler for Handler {
                 },
             ]));
         }
-        let Some(ComponentValue::Entity(target)) =
-            request.parameters.get(&key("items:field/inventory"))
-        else {
-            return Err(RejectCode::InvalidData);
-        };
         let Some(ComponentValue::Bool(place)) = request.parameters.get(&key("items:field/place"))
         else {
             return Err(RejectCode::InvalidData);

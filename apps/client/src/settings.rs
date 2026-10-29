@@ -31,6 +31,7 @@ pub enum OptionId {
     InvertY,
     AutoJump,
     AutoPickup,
+    InfiniteSupply,
     Entities,
     Vsync,
     Fov,
@@ -177,6 +178,8 @@ pub struct Settings {
     pub invert_y: bool,
     pub auto_jump: bool,
     pub auto_pickup: bool,
+    pub infinite_supply: bool,
+    pub supply_slots: Vec<String>,
     pub entities: bool,
     pub vsync: bool,
     pub fov: u16,
@@ -198,6 +201,8 @@ impl Default for Settings {
             invert_y: false,
             auto_jump: false,
             auto_pickup: false,
+            infinite_supply: false,
+            supply_slots: vec![],
             entities: true,
             vsync: false,
             fov: 55,
@@ -219,6 +224,8 @@ impl Settings {
         if self.version != 2
             || !(MIN_FPS..=MAX_FPS).contains(&self.frame_limit.fps)
             || !(40..=110).contains(&self.fov)
+            || self.supply_slots.len() > 9
+            || self.supply_slots.iter().any(|id| id.len() > 256)
             || self.radius > 16
             || !(1..=300).contains(&self.fly_speed)
             || !(20..=500).contains(&self.sensitivity)
@@ -298,6 +305,7 @@ impl Settings {
             OptionId::InvertY => &mut self.invert_y,
             OptionId::AutoJump => &mut self.auto_jump,
             OptionId::AutoPickup => &mut self.auto_pickup,
+            OptionId::InfiniteSupply => &mut self.infinite_supply,
             OptionId::Entities => &mut self.entities,
             OptionId::Vsync => &mut self.vsync,
             _ => return,
@@ -313,6 +321,7 @@ impl Settings {
             OptionId::InvertY => self.invert_y,
             OptionId::AutoJump => self.auto_jump,
             OptionId::AutoPickup => self.auto_pickup,
+            OptionId::InfiniteSupply => self.infinite_supply,
             OptionId::Entities => self.entities,
             OptionId::Vsync => self.vsync,
             _ => false,

@@ -451,6 +451,8 @@ impl WindowApp {
             // Connected but no baseline yet: keep presenting cleared frames
             // so polling continues and the window does not sit on an
             // uninitialized surface.
+            let inventory = self.displayed_inventory();
+            let bar = self.displayed_bar();
             if let Some(gpu) = self.gpu.as_mut() {
                 match gpu.surface.get_current_texture() {
                     CurrentSurfaceTexture::Success(frame)
@@ -476,10 +478,8 @@ impl WindowApp {
                                 names: names.clone(),
                                 sensitivity: self.look_sensitivity,
                                 debug_lines: &self.debug_lines,
-                                inventory: self
-                                    .scene
-                                    .as_ref()
-                                    .map_or_else(Vec::new, Scene::inventory_slots),
+                                inventory,
+                                bar,
                             },
                         );
                         gpu.ui.draw(&mut encoder, &view);
@@ -905,6 +905,8 @@ impl WindowApp {
             None => return,
         };
 
+        let inventory = self.displayed_inventory();
+        let bar = self.displayed_bar();
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
@@ -961,10 +963,8 @@ impl WindowApp {
                 names: names.to_vec(),
                 sensitivity: self.look_sensitivity,
                 debug_lines: &self.debug_lines,
-                inventory: self
-                    .scene
-                    .as_ref()
-                    .map_or_else(Vec::new, Scene::inventory_slots),
+                inventory,
+                bar,
             },
         );
         gpu.ui.draw(&mut encoder, &view);

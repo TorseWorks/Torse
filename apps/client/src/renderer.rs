@@ -1401,6 +1401,7 @@ impl Renderer {
             crate::ui::Hud {
                 debug_lines: &[],
                 inventory: vec![],
+                bar: vec![],
                 material: 0,
                 network: false,
                 ready: true,

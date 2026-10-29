@@ -63,3 +63,5 @@ inventory_help=点击来源槽，再点击目标槽交换物品
 inventory_unavailable=当前会话未授权物品栏
 inventory_hotbar=第一行是快捷栏；Tab关闭；1–9选择槽位
 bind_hint=点击后按键，Esc取消；菜单和数字键保留
+
+settings_infinite_supply=无限供应

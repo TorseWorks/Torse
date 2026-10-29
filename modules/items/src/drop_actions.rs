@@ -75,6 +75,9 @@ pub(crate) fn declarations() -> Vec<ComponentSchema> {
                 },
                 true,
             ));
+            if !name.starts_with("pickup") {
+                fields.push(("supply_item", ComponentFieldType::ContentReference, false));
+            }
             for axis in ["x", "y", "z"] {
                 fields.push((axis, ComponentFieldType::Signed64, false));
             }
@@ -167,6 +170,9 @@ fn pickup_targets(
     parameters: &ComponentFields,
 ) -> Result<(EntityId, EntityId), RejectCode> {
     let inventory = entity(parameters, "inventory")?;
+    if crate::supply::mode(view.entity(inventory)?.1) == crate::supply::SupplyMode::Infinite {
+        return Err(RejectCode::Conflict);
+    }
     let drop = entity(parameters, "drop")?;
     let from = position(view, inventory, parameters)?;
     let target = view.entity(drop)?.1.position;
@@ -271,18 +277,40 @@ impl ActionHandler for Handler {
         if request.target != ActionTarget::Entity(inventory) {
             return Err(RejectCode::InvalidData);
         }
+        let infinite =
+            crate::supply::mode(view.entity(inventory)?.1) == crate::supply::SupplyMode::Infinite;
         let previous = view
             .component(inventory, &torse_inventory::schema())?
             .clone();
-        let stock = Inventory::from_fields(&previous, &self.catalog.stacks)?;
-        let stack = stock
-            .slots()
-            .get(*slot as usize)
-            .and_then(Option::as_ref)
-            .ok_or(RejectCode::MissingTarget)?;
-        let stack = ItemStack {
-            item: stack.item.clone(),
-            count: 1,
+        let stack = if infinite {
+            if !view.actor().permits(&key("items:permission/unlimited"))
+                || self.name == "throw_inventory"
+            {
+                return Err(RejectCode::PermissionDenied);
+            }
+            let Some(Value::Content(item)) =
+                request.parameters.get(&key("items:field/supply_item"))
+            else {
+                return Err(RejectCode::InvalidData);
+            };
+            if !self.catalog.definitions.contains_key(item) {
+                return Err(RejectCode::InvalidData);
+            }
+            ItemStack {
+                item: item.clone(),
+                count: 1,
+            }
+        } else {
+            let stock = Inventory::from_fields(&previous, &self.catalog.stacks)?;
+            let stack = stock
+                .slots()
+                .get(*slot as usize)
+                .and_then(Option::as_ref)
+                .ok_or(RejectCode::MissingTarget)?;
+            ItemStack {
+                item: stack.item.clone(),
+                count: 1,
+            }
         };
         if self.name == "throw_inventory" {
             parent(view, "throw")?;
@@ -309,6 +337,22 @@ impl ActionHandler for Handler {
             let mut tx = Transaction::new(request.transaction, owner(), request.ordering);
             drops::spawn(&mut tx, at, stack, [0, 1_500_000, 0]);
             return mutation(tx);
+        }
+        if infinite {
+            return Ok(ActionOutput::Invoke(vec![
+                ActionInvocation {
+                    action: key("items:action/throw_drop"),
+                    api_version: 1,
+                    target: request.target,
+                    parameters: request.parameters.clone(),
+                },
+                ActionInvocation {
+                    action: key("items:action/supply_guard"),
+                    api_version: 1,
+                    target: request.target,
+                    parameters: ComponentFields::new(),
+                },
+            ]));
         }
         Ok(ActionOutput::Invoke(
             ["throw_inventory", "throw_drop"]

@@ -300,6 +300,7 @@ struct View {
     debug_lines: Vec<String>,
     inventory: Vec<Option<torse_inventory::ItemStack>>,
     inventory_source: Option<usize>,
+    bar: Vec<Option<torse_inventory::ItemStack>>,
 }
 
 pub struct Layer {
@@ -325,6 +326,7 @@ pub struct Hud<'a> {
     pub sensitivity: f64,
     pub debug_lines: &'a [String],
     pub inventory: Vec<Option<torse_inventory::ItemStack>>,
+    pub bar: Vec<Option<torse_inventory::ItemStack>>,
 }
 impl Layer {
     pub fn attach_memory(&mut self, pool: torse_types::MemoryPool) -> Result<(), String> {
@@ -391,10 +393,10 @@ impl Layer {
         hud: Hud<'_>,
     ) {
         let layout = Layout::new(size);
-        let names = if hud.inventory.is_empty() {
+        let names = if hud.bar.is_empty() {
             hud.names.into_iter().take(3).collect()
         } else {
-            hud.inventory
+            hud.bar
                 .iter()
                 .take(9)
                 .map(|stack| {
@@ -407,9 +409,7 @@ impl Layer {
         let view = View {
             size,
             mode: state.mode,
-            material: hud
-                .material
-                .min(if hud.inventory.is_empty() { 2 } else { 8 }),
+            material: hud.material.min(if hud.bar.is_empty() { 2 } else { 8 }),
             network: hud.network,
             ready: hud.ready,
             result: hud.result.chars().take(120).collect(),
@@ -423,6 +423,7 @@ impl Layer {
             tab: state.tab,
             rebinding: state.rebinding,
             inventory: hud.inventory,
+            bar: hud.bar,
             inventory_source: state.inventory_source,
             debug_lines: if state.settings.debug {
                 hud.debug_lines.to_vec()
@@ -626,7 +627,7 @@ impl Layer {
     }
     /// HUD is shared by all modes: hotbar, status chip, result toast, help.
     fn paint_hud(&mut self, c: &mut Canvas, l: &Layout, v: &View, w: i32, h: i32) {
-        let count = if v.inventory.is_empty() { 3 } else { 9 };
+        let count = if v.bar.is_empty() { 3 } else { 9 };
         let slot_x = w / 2 - (count * 26 - 2) / 2;
         let slot_y = h - 36;
         let packaged = v.names.is_empty();
@@ -634,11 +635,11 @@ impl Layer {
             let x = slot_x + i as i32 * 26;
             self.theme
                 .slot(c, Rect::new(x, slot_y, 24, 24), i == v.material);
-            if !v.inventory.is_empty() {
+            if !v.bar.is_empty() {
                 self.paint_item(
                     c,
                     Rect::new(x, slot_y, 24, 24),
-                    v.inventory.get(i).and_then(Option::as_ref),
+                    v.bar.get(i).and_then(Option::as_ref),
                 );
             } else if packaged {
                 c.sprite(&self.skin.icons[i], Rect::new(x + 4, slot_y + 4, 16, 16), 0);

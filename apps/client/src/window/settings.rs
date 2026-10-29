@@ -12,7 +12,12 @@ impl WindowApp {
                 self.ui.tab = tab;
                 self.ui.rebinding = None;
             }
-            Action::Toggle(option) => self.ui.settings.toggle(option),
+            Action::Toggle(option) => {
+                self.ui.settings.toggle(option);
+                if option == OptionId::InfiniteSupply {
+                    self.configure_supply();
+                }
+            }
             Action::Value(option, value) => self.ui.settings.set(option, value),
             Action::Rebind(binding) => self.ui.rebinding = Some(binding),
             Action::Skin(choice) => {
@@ -27,7 +32,27 @@ impl WindowApp {
         }
         true
     }
+    pub(super) fn configure_supply(&mut self) {
+        let Some(owner) = self.scene.as_ref().and_then(Scene::item_owner) else {
+            return;
+        };
+        let desired = if self.ui.settings.infinite_supply {
+            torse_items::supply::SupplyMode::Infinite
+        } else {
+            torse_items::supply::SupplyMode::Finite
+        };
+        if self
+            .scene
+            .as_ref()
+            .is_some_and(|scene| scene.supply_mode() != desired)
+        {
+            self.submit_item_call(torse_items::supply::call(owner, desired));
+        }
+    }
     pub(super) fn apply_preferences(&mut self) {
+        if self.net.is_none() {
+            self.configure_supply();
+        }
         self.look_sensitivity = f64::from(self.ui.settings.sensitivity) / 100.0;
         self.input.reset();
         self.input.bindings = self.ui.settings.bindings.clone();

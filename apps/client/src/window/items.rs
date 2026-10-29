@@ -34,6 +34,9 @@ impl WindowApp {
         let Some(scene) = &self.scene else {
             return;
         };
+        if scene.supply_mode() == torse_items::supply::SupplyMode::Infinite {
+            return;
+        }
         let Some(owner) = scene.item_owner() else {
             return;
         };
@@ -62,10 +65,57 @@ impl WindowApp {
             camera.eye[2] as f64,
         );
         let mut call = torse_items::throw_call(owner, self.material as u32);
+        if let Some(scene) = &self.scene
+            && scene.supply_mode() == torse_items::supply::SupplyMode::Infinite
+        {
+            let Some(item) = self
+                .materials
+                .get(self.material)
+                .and_then(|block| scene.item_for_block(block))
+            else {
+                return;
+            };
+            call = torse_items::supply::with_item(call, item);
+        }
         if self.net.is_none() {
             call = torse_items::with_position(call, eye);
         }
         self.submit_item_call(call);
+    }
+    pub(super) fn displayed_inventory(&self) -> Vec<Option<torse_inventory::ItemStack>> {
+        self.scene.as_ref().map_or_else(Vec::new, |scene| {
+            if scene.supply_mode() == torse_items::supply::SupplyMode::Infinite {
+                scene
+                    .item_catalog()
+                    .into_iter()
+                    .take(36)
+                    .map(Some)
+                    .collect()
+            } else {
+                scene.inventory_slots()
+            }
+        })
+    }
+    pub(super) fn displayed_bar(&self) -> Vec<Option<torse_inventory::ItemStack>> {
+        self.scene.as_ref().map_or_else(Vec::new, |scene| {
+            if scene.supply_mode() == torse_items::supply::SupplyMode::Infinite {
+                let catalog = scene.item_catalog();
+                self.ui
+                    .settings
+                    .supply_slots
+                    .iter()
+                    .take(9)
+                    .map(|id| {
+                        catalog
+                            .iter()
+                            .find(|entry| entry.item.to_string() == *id)
+                            .cloned()
+                    })
+                    .collect()
+            } else {
+                scene.inventory_slots().into_iter().take(9).collect()
+            }
+        })
     }
     pub(super) fn sync_inventory(&mut self) {
         if let Some(scene) = self.scene.as_mut() {
@@ -88,7 +138,34 @@ impl WindowApp {
                 self.last_result = error;
             }
             if scene.item_owner().is_some() {
-                self.materials = scene.item_blocks();
+                self.ui.settings.infinite_supply =
+                    scene.supply_mode() == torse_items::supply::SupplyMode::Infinite;
+                if self.ui.settings.infinite_supply {
+                    let catalog = scene.item_catalog();
+                    if self.ui.settings.supply_slots.is_empty() {
+                        self.ui.settings.supply_slots = catalog
+                            .iter()
+                            .take(9)
+                            .map(|entry| entry.item.to_string())
+                            .collect();
+                    }
+                    self.materials = self
+                        .ui
+                        .settings
+                        .supply_slots
+                        .iter()
+                        .take(9)
+                        .map(|id| {
+                            catalog
+                                .iter()
+                                .find(|entry| entry.item.to_string() == *id)
+                                .and_then(|entry| scene.item_block(&entry.item))
+                                .unwrap_or_else(|| torse_items::key("client:empty_slot"))
+                        })
+                        .collect();
+                } else {
+                    self.materials = scene.item_blocks();
+                }
                 self.materials.resize_with(9, || {
                     ContentKey::parse("client:empty_slot").expect("slot key")
                 });
@@ -104,7 +181,19 @@ impl WindowApp {
         half: u32,
     ) -> torse_sim::durable::Call {
         match self.scene.as_ref().and_then(Scene::item_owner) {
-            Some(owner) => torse_items::edit_call(owner, place, self.material as u32, target, half),
+            Some(owner) => {
+                let call = torse_items::edit_call(owner, place, self.material as u32, target, half);
+                self.scene
+                    .as_ref()
+                    .filter(|scene| {
+                        scene.supply_mode() == torse_items::supply::SupplyMode::Infinite
+                    })
+                    .and_then(|scene| scene.item_for_block(block))
+                    .map_or_else(
+                        || call.clone(),
+                        |item| torse_items::supply::with_item(call.clone(), item),
+                    )
+            }
             None => crate::net::edit_call(place, block, target, half),
         }
     }
@@ -112,6 +201,19 @@ impl WindowApp {
         let Some(owner) = self.scene.as_ref().and_then(Scene::item_owner) else {
             return;
         };
+        if self
+            .scene
+            .as_ref()
+            .is_some_and(|scene| scene.supply_mode() == torse_items::supply::SupplyMode::Infinite)
+        {
+            if let Some(Some(stack)) = self.displayed_inventory().get(slot) {
+                self.ui.settings.supply_slots.resize(9, String::new());
+                self.ui.settings.supply_slots[self.material.min(8)] = stack.item.to_string();
+                self.sync_inventory();
+                self.save_preferences();
+            }
+            return;
+        }
         if slot >= 36 {
             return;
         }

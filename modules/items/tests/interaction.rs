@@ -361,6 +361,67 @@ fn inventory(world: &WorldAuthority, catalog: &Catalog, id: EntityId) -> Invento
     )
     .unwrap()
 }
+#[test]
+fn supply_requires_host_permission_and_stale_unlimited_edits_are_rejected() {
+    use torse_items::supply::{SupplyMode, call};
+    let (mut world, service, catalog, id) = setup_policy(true);
+    let mut req = request(id, true, 0, 1);
+    let config = call(id, SupplyMode::Infinite);
+    req.action = config.action;
+    req.target = config.target;
+    req.parameters = config.parameters;
+    assert!(
+        service
+            .plan(&world, &actor(id), Phase::Interaction, &req)
+            .is_err()
+    );
+    let manager = actor(id).permission(key("items:permission/configure_supply"));
+    assert!(
+        service
+            .plan(&world, &manager, Phase::Interaction, &req)
+            .is_err()
+    );
+    let manager = manager.permission(key("items:permission/unlimited"));
+    let ActionOutput::Mutation(tx) = service
+        .plan(&world, &manager, Phase::Interaction, &req)
+        .unwrap()
+    else {
+        panic!("mode mutation")
+    };
+    let prepared = world.prepare(&tx).unwrap();
+    world.publish(prepared).unwrap();
+    let mut place = request(id, true, 0, 2);
+    place.parameters.insert(
+        key("items:field/supply_item"),
+        ComponentValue::Content(key("base:stone")),
+    );
+    assert!(
+        service
+            .plan(&world, &actor(id), Phase::Interaction, &place)
+            .is_err()
+    );
+    let ActionOutput::Atomic(group) = service
+        .plan(&world, &manager, Phase::Interaction, &place)
+        .unwrap()
+    else {
+        panic!("supply edit group")
+    };
+    req.parameters = call(id, SupplyMode::Finite).parameters;
+    req.transaction = TransactionId(3);
+    let ActionOutput::Mutation(tx) = service
+        .plan(&world, &manager, Phase::Interaction, &req)
+        .unwrap()
+    else {
+        panic!("mode mutation")
+    };
+    let prepared = world.prepare(&tx).unwrap();
+    world.publish(prepared).unwrap();
+    assert!(world.prepare_group(&group).is_err());
+    assert_eq!(
+        inventory(&world, &catalog, id),
+        catalog.starter(36).unwrap()
+    );
+}
 fn commit(world: &mut WorldAuthority, service: &ActionService, id: EntityId, req: &ActionRequest) {
     let ActionOutput::Atomic(group) = service
         .plan(world, &actor(id), Phase::Interaction, req)

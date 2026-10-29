@@ -4,6 +4,7 @@
 mod actions;
 mod drop_actions;
 pub mod drops;
+pub mod supply;
 pub use actions::{block_handlers, descriptors, handlers, register_content};
 pub use drop_actions::{pickup_call, throw_call, with_position};
 use std::collections::BTreeMap;

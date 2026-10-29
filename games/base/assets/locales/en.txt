@@ -63,3 +63,5 @@ inventory_help=Click a source slot, then a destination to swap
 inventory_unavailable=Inventory access is unavailable in this session
 inventory_hotbar=Top row: hotbar. Tab closes; 1-9 select a slot.
 bind_hint=Click then press a key; Esc cancels. Menu and digits are reserved.
+
+settings_infinite_supply=Infinite supply
