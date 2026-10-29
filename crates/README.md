@@ -1,6 +1,6 @@
 # 框架库
 
-本目录保存Torse的通用库。世界、模拟与数据交换已有可运行实现；部分资源管理和诊断接口仍为预留入口。本目录只提供网格生成与GPU探测，图形窗口与绘制装配由外部客户端完成；持久执行与网络会话装配位于[服务端](../apps/server/README.md)。
+本目录保存Torse的通用库，涵盖世界、模拟、数据交换、资源生命周期、派生光照与有界诊断等能力。窗口、GPU绘制和界面装配位于[客户端](../apps/client/README.md)，持久执行与网络会话装配位于[服务端](../apps/server/README.md)。
 
 | 目录 | 职责与当前范围 |
 |---|---|
@@ -11,7 +11,7 @@
 | [sim](sim/src/lib.rs) | 固定步长、阶段排序、事务仲裁、动作授权、持久任务、授权复制与行走领域逻辑 |
 | [actions](actions/src/lib.rs) | 动作声明、命令冲突与注册检查 |
 | [modules](modules/src/lib.rs) | 模块依赖、服务与注册解析 |
-| [world_services](world_services/src/lib.rs) | 确定性地形生成与AABB碰撞；光照和寻路尚未实现 |
+| [world_services](world_services/src/lib.rs) | 确定性地形生成、AABB碰撞、有界天空光与发光传播、调用方提供通行策略的格点寻路 |
 | [mod_api](mod_api/src/lib.rs) | 公共Mod接口，行为边界定义于[behavior.wit](mod_api/wit/behavior.wit) |
 | [mod_sdk](mod_sdk/src/lib.rs) | Guest端绑定与确定性随机数辅助，供Mod代码依赖 |
 | [mod_host](mod_host/src/lib.rs) | Wasm组件宿主、权威桥、包解析、场景运行与持久派发，按特性启用 |
@@ -20,7 +20,7 @@
 | [protocol](protocol/README.md) | 兼容握手、请求、结果、订阅和授权复制消息 |
 | [net](net/README.md) | 会话、速率、有界内存与TCP传输、原子客户端镜像 |
 | [render](render/src/lib.rs) | CPU网格、逐面材质槽与局部贴图坐标、遮挡剔除、依赖修订校验、按焦点距离驱逐的网格缓存与内存账本汇报，另含可选GPU初始化实验 |
-| [assets](assets/src/lib.rs) | 图集PNG解码、材质包校验与mipmap生成（实色填充与边缘扩张）；UI资源与基础游戏材质声明仍由客户端提供 |
+| [assets](assets/src/lib.rs) | 资源身份、句柄、依赖与生命周期、图集PNG解码、材质包校验及mipmap生成；具体资源声明由应用或模块提供 |
 | [diagnostics](diagnostics/src/lib.rs) | 可选、有界的串行分项计时；其他指标由各实现提供 |
 
 ## 依赖与执行

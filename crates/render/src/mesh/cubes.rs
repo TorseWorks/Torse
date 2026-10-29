@@ -1,4 +1,4 @@
-//! Bounded occupancy rows and opaque, identically shaded coplanar runs.
+//! Bounded occupancy rows and opaque, identically shaded coplanar rectangles.
 use super::*;
 
 pub(super) fn eligible(block: RenderBlock) -> bool {
@@ -43,52 +43,93 @@ pub(super) fn emit(
             if cancelled() {
                 return Err(MeshBuildError::Cancelled);
             }
-            for row in 0..side {
-                let visible = |u| {
-                    let mut cell = [0; 3];
-                    cell[normal] = plane;
-                    cell[a] = u;
-                    cell[b] = row;
-                    if !occupied(cell) {
-                        return None;
-                    }
-                    let mut neighbor = cell;
-                    let inside = if face.is_negative() {
-                        plane.checked_sub(1)
-                    } else {
-                        plane.checked_add(1).filter(|p| *p < side)
-                    };
-                    if let Some(n) = inside {
-                        neighbor[normal] = n;
-                        if occupied(neighbor) {
-                            return None;
-                        }
-                    }
-                    let MeshSample::Ready(block) = sample(position(cell)) else {
-                        return None;
-                    };
-                    if !eligible(block) || face_culled(face, &block, sample, position(cell)) {
-                        return None;
-                    }
-                    Some((cell, FaceAppearance::new(&block, face)))
+            let visible = |u: usize, v: usize| {
+                let mut cell = [0; 3];
+                cell[normal] = plane;
+                cell[a] = u;
+                cell[b] = v;
+                if !occupied(cell) {
+                    return None;
+                }
+                let mut neighbor = cell;
+                let inside = if face.is_negative() {
+                    plane.checked_sub(1)
+                } else {
+                    plane.checked_add(1).filter(|next| *next < side)
                 };
-                let mut u = 0;
-                while u < side {
-                    let Some((cell, appearance)) = visible(u) else {
-                        u += 1;
+                if let Some(next) = inside {
+                    neighbor[normal] = next;
+                    if occupied(neighbor) {
+                        return None;
+                    }
+                }
+                let MeshSample::Ready(block) = sample(position(cell)) else {
+                    return None;
+                };
+                if !eligible(block) || face_culled(face, &block, sample, position(cell)) {
+                    return None;
+                }
+                Some(FaceAppearance::new(&block, face))
+            };
+            let mut cells = vec![None; side * side];
+            for v in 0..side {
+                for u in 0..side {
+                    cells[v * side + u] = visible(u, v);
+                }
+            }
+            let mut used = vec![false; side * side];
+            for v in 0..side {
+                if cancelled() {
+                    return Err(MeshBuildError::Cancelled);
+                }
+                for u in 0..side {
+                    let start = v * side + u;
+                    let Some(appearance) = cells[start] else {
                         continue;
                     };
-                    let start = u;
-                    u += 1;
-                    while u < side && visible(u).is_some_and(|(_, next)| next == appearance) {
-                        u += 1;
+                    if used[start] {
+                        continue;
+                    }
+                    let mut width = 1;
+                    while u + width < side {
+                        let index = v * side + u + width;
+                        if used[index] || cells[index] != Some(appearance) {
+                            break;
+                        }
+                        width += 1;
+                    }
+                    let mut height = 1;
+                    'grow: while v + height < side {
+                        for step in 0..width {
+                            let index = (v + height) * side + u + step;
+                            if used[index] || cells[index] != Some(appearance) {
+                                break 'grow;
+                            }
+                        }
+                        height += 1;
+                    }
+                    for dv in 0..height {
+                        for du in 0..width {
+                            used[(v + dv) * side + u + du] = true;
+                        }
                     }
                     if limit.is_some_and(|n| mesh.face_count() >= n) {
                         return Err(MeshBuildError::OutputLimit);
                     }
+                    let mut cell = [0; 3];
+                    cell[normal] = plane;
+                    cell[a] = u;
+                    cell[b] = v;
                     let mut bounds = RenderBox::FULL_CUBE;
-                    bounds.max[a] = (u - start) as f32;
-                    emit_face(mesh, face, bounds, cell.map(|v| v as f32), appearance);
+                    bounds.max[a] = width as f32;
+                    bounds.max[b] = height as f32;
+                    emit_face(
+                        mesh,
+                        face,
+                        bounds,
+                        cell.map(|value| value as f32),
+                        appearance,
+                    );
                 }
             }
         }
@@ -188,12 +229,28 @@ mod tests {
                 .unwrap();
         assert_eq!(surfaces(&ordinary), surfaces(&merged));
         assert_eq!(ordinary.face_count(), 6 * 8 * 8);
-        assert_eq!(merged.face_count(), 6 * 8);
+        assert_eq!(merged.face_count(), 6);
+        let top = merged
+            .positions
+            .chunks(4)
+            .zip(merged.normals.chunks(4))
+            .find(|(_, normals)| normals[0] == Face::PosY.normal())
+            .map(|(quad, _)| quad)
+            .expect("top rectangle");
+        assert_eq!(
+            top,
+            [
+                [0.0, 8.0, 8.0],
+                [8.0, 8.0, 8.0],
+                [8.0, 8.0, 0.0],
+                [0.0, 8.0, 0.0]
+            ]
+        );
         assert!(calls.get() < ordinary_calls);
         assert!(merged.byte_size() < ordinary.byte_size());
         assert!(merged.uvs.iter().flatten().any(|v| v.abs() > 1.0));
         assert_eq!(
-            build_mesh_optimized_bounded(8, SectionPos::ZERO, sample, || false, 47),
+            build_mesh_optimized_bounded(8, SectionPos::ZERO, sample, || false, 5),
             Err(MeshBuildError::OutputLimit)
         );
         assert_eq!(

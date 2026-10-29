@@ -1,0 +1,146 @@
+width = 160
+height = 32
+
+[[regions]]
+part = "window"
+x = 0
+y = 0
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "group"
+x = 16
+y = 0
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "button"
+x = 32
+y = 0
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "button_hover"
+x = 48
+y = 0
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "button_pressed"
+x = 64
+y = 0
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "field"
+x = 80
+y = 0
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "slot"
+x = 96
+y = 0
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "slot_selected"
+x = 112
+y = 0
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "track"
+x = 128
+y = 0
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "thumb"
+x = 144
+y = 0
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "thumb_hover"
+x = 0
+y = 16
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "chip"
+x = 16
+y = 16
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "progress"
+x = 32
+y = 16
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "check"
+x = 48
+y = 16
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "check_active"
+x = 64
+y = 16
+width = 16
+height = 16
+border = 1
+
+[[regions]]
+part = "close"
+x = 80
+y = 16
+width = 16
+height = 16
+border = 0
+
+[[regions]]
+part = "close_hover"
+x = 96
+y = 16
+width = 16
+height = 16
+border = 0
+
+[[regions]]
+part = "crosshair"
+x = 112
+y = 16
+width = 16
+height = 16
+border = 0

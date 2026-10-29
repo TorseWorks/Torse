@@ -5,6 +5,68 @@ use std::collections::{BTreeSet, VecDeque};
 const WORK: usize = 4096;
 
 impl Lighting {
+    fn emission(scene: &Scene, pos: BlockPos) -> u8 {
+        match scene.authority.store().query(pos) {
+            TerrainQuery::Ready(state) => {
+                scene.authority.registry().definition(state).map_or(0, |d| {
+                    (d.light_transport.emission * 15.0).round().clamp(0.0, 15.0) as u8
+                })
+            }
+            _ => 0,
+        }
+    }
+
+    fn preview_removed(
+        &mut self,
+        scene: &Scene,
+        kind: usize,
+        positions: &[BlockPos],
+        changed: &mut BTreeSet<(usize, SectionPos)>,
+    ) -> Vec<BlockPos> {
+        // Stage the entire removal before publishing. A room larger than the
+        // fixed allowance keeps its previous image until exact jobs finish.
+        let mut removed = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        for &pos in positions.iter().take(WORK) {
+            if let Some(level) = self.level(scene, kind, pos)
+                && level > 0
+                && removed.insert(pos)
+            {
+                queue.push_back((pos, level));
+            }
+        }
+        while let Some((pos, source)) = queue.pop_front() {
+            for face in torse_render::Face::ALL {
+                let (dx, dy, dz) = face.offset();
+                let Ok(neighbor) = pos.checked_add(dx, dy, dz) else {
+                    continue;
+                };
+                let Some(level) = self.level(scene, kind, neighbor) else {
+                    continue;
+                };
+                if level > 0
+                    && (level < source || (kind == 1 && source == 15 && level == 15 && dy == -1))
+                    && !removed.contains(&neighbor)
+                {
+                    if removed.len() == WORK {
+                        return Vec::new();
+                    }
+                    removed.insert(neighbor);
+                    queue.push_back((neighbor, level));
+                }
+            }
+        }
+        for &pos in &removed {
+            let (section, local) = pos.to_section(scene.side).expect("cached light position");
+            let entry = self.entries[kind]
+                .get_mut(&section)
+                .expect("cached light section");
+            entry.levels[torse_world::linear_index(scene.side, local)] = 0;
+            changed.insert((kind, section));
+        }
+        removed.into_iter().collect()
+    }
+
     fn level(&self, scene: &Scene, kind: usize, pos: BlockPos) -> Option<u8> {
         let bounds = scene.authority.store().bounds();
         if !bounds.contains_y(pos.y) {
@@ -76,11 +138,16 @@ impl Lighting {
         for kind in 0..2 {
             queue.clear();
             let mut remaining = WORK;
-            for &pos in positions.iter().take(WORK) {
+            let removed = self.preview_removed(scene, kind, positions, &mut changed);
+            for &pos in removed.iter().chain(positions).take(WORK) {
                 let Some(absorption) = Self::absorption(scene, pos) else {
                     continue;
                 };
-                let mut level = 0;
+                let mut level = if kind == 0 {
+                    Self::emission(scene, pos)
+                } else {
+                    0
+                };
                 for face in torse_render::Face::ALL {
                     let (dx, dy, dz) = face.offset();
                     let Ok(neighbor) = pos.checked_add(dx, dy, dz) else {

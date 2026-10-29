@@ -100,6 +100,7 @@ pub struct Scene {
     principal: ContentKey,
     edit_counter: u64,
     walker: Option<torse_sim::player::WalkerState>,
+    items: Option<items::Stock>,
     generator: Option<HillTerrain>,
     /// Data-driven terrain used when the scene comes from a content pack.
     layered: Option<Arc<crate::game::LayeredTerrain>>,
@@ -109,6 +110,7 @@ pub struct Scene {
     /// a neighbour edit is detected by validating this stored job.
     meshes: BTreeMap<SectionPos, (MeshStamp, MeshData)>,
     sections: Vec<SectionPos>,
+    stream_interest: Option<(SectionPos, i64, i64)>,
     epoch: WorldEpoch,
     asset_generation: u64,
     next_load_generation: u64,
@@ -126,9 +128,13 @@ pub struct Scene {
     memory: Option<memory::Memory>,
     startup_notice: Option<String>,
     lighting: Option<lighting::Lighting>,
+    surfaces: surfaces::Previews,
 }
+mod borders;
+mod items;
 mod lighting;
 mod memory;
+mod surfaces;
 
 /// One content pack for every client mode, matching the server demo assembly
 /// so the handshake compatibility and the block colours agree everywhere.
@@ -136,6 +142,7 @@ fn content_pack() -> torse_content::ContentPack {
     let mut pack = m0_fixture_pack();
     block_actions::register_content(&mut pack);
     torse_inventory::register_content(&mut pack);
+    torse_items::register_content(&mut pack);
     pack
 }
 
@@ -146,7 +153,7 @@ fn compile_content() -> Result<(BlockStateRegistry, ComponentSchemas, Compatibil
     let registry =
         BlockStateRegistry::build(&content).map_err(|error| format!("registry failed: {error}"))?;
     let schemas = ComponentSchemas::build(&content);
-    let catalog = torse_inventory::ItemCatalog::new([(key("base:stone"), 64)])
+    let catalog = torse_items::fixture_catalog(&registry)
         .map_err(|error| format!("item rules: {error:?}"))?;
     let compatibility = catalog.bind_compatibility(Compatibility {
         authority_schema: 4,
@@ -254,13 +261,16 @@ impl Scene {
             principal: key("client:player"),
             edit_counter: 0,
             walker: None,
+            items: None,
             generator: Some(generator),
             layered: None,
             side,
             radius,
             meshes: BTreeMap::new(),
             lighting: None,
+            surfaces: surfaces::Previews::default(),
             sections: Vec::new(),
+            stream_interest: None,
             epoch: scene_epoch()?,
             asset_generation: palette.asset_generation(),
             next_load_generation: 1,
@@ -307,13 +317,16 @@ impl Scene {
             principal: key("client:player"),
             edit_counter: 0,
             walker: None,
+            items: None,
             generator: None,
             layered: None,
             side: snapshot.side,
             radius: 0,
             meshes: BTreeMap::new(),
             lighting: None,
+            surfaces: surfaces::Previews::default(),
             sections: Vec::new(),
+            stream_interest: None,
             epoch: scene_epoch()?,
             asset_generation: palette.asset_generation(),
             next_load_generation: 1,
@@ -595,7 +608,7 @@ impl Scene {
                     uv: [0.0, 0.0],
                     material: 0,
                     overlay_material: u32::MAX,
-                    tint: [1.0; 3],
+                    tint: [0.05; 3],
                     overlay_tint: [1.0; 3],
                     light: -1.0,
                 });
@@ -639,10 +652,33 @@ impl Scene {
     /// directly through the entity store the same way the server bootstrap
     /// installs its fixtures; movement still goes through transactions.
     /// Server projections reject local walking until server movement exists.
-    pub fn spawn_walker(&mut self, at: Position) -> Result<(), String> {
+    pub fn spawn_walker(&mut self, at: Position) -> Result<Position, String> {
         if self.is_network() {
             return Err("network mirrors cannot settle local movement".to_owned());
         }
+        if self.walker.is_some() {
+            return Err("walk mode already has an entity".to_owned());
+        }
+        // Correct a near-floor fly viewpoint without creating a buried body.
+        // Unknown terrain is never searched through or treated as empty.
+        let mut safe = None;
+        for step in 0..=8 {
+            let candidate = at.translated([0.0, f64::from(step) * 0.25, 0.0]);
+            match torse_sim::movement::observe_body(
+                self.authority.store(),
+                self.authority.registry(),
+                candidate,
+                torse_sim::player::WALKER_HALF,
+            ) {
+                Ok(_) => {
+                    safe = Some(candidate);
+                    break;
+                }
+                Err(torse_types::RejectCode::Conflict) => continue,
+                Err(error) => return Err(format!("walk entry rejected: {error:?}")),
+            }
+        }
+        let at = safe.ok_or("walk entry has no clear body position within two blocks")?;
         let growth = self
             .reserve_memory(
                 torse_types::MemoryClass::World,
@@ -661,6 +697,18 @@ impl Scene {
         self.walker = Some(torse_sim::player::WalkerState::new(handle));
         self.reconcile_world_memory(growth)
             .map_err(|error| error.to_string())?;
+        Ok(at)
+    }
+
+    /// Release a camera binding; local walk bodies belong to this mode only.
+    pub fn stop_walker(&mut self) -> Result<(), String> {
+        if let Some(walker) = self.walker.take()
+            && !self.is_network()
+        {
+            self.authority.entities_mut().despawn(walker.handle);
+            self.reconcile_world_memory(None)
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 
@@ -746,16 +794,15 @@ impl Scene {
         target: BlockPos,
         half: u32,
     ) -> Result<(), String> {
-        let _preview_memory = if self.lighting.is_some() {
+        let _preview_memory = {
             self.reserve_memory(
                 torse_types::MemoryClass::Executor,
                 lighting::PREVIEW_BYTES,
                 torse_types::EvictionRank::Pinned,
             )
             .map_err(|error| error.to_string())?
-        } else {
-            None
         };
+        let surfaces = self.prepare_surfaces(target)?;
         self.edit_counter += 1;
         let counter = self.edit_counter;
         let action = if place {
@@ -810,6 +857,7 @@ impl Scene {
         self.authority
             .publish(prepared)
             .map_err(|fault| format!("{fault:?}"))?;
+        self.surfaces.record(surfaces);
         self.preview_lighting(&[target])?;
         self.reconcile_world_memory(growth)
             .map_err(|error| error.to_string())?;
@@ -819,6 +867,12 @@ impl Scene {
     /// Loaded section coordinates.
     pub fn sections(&self) -> &[SectionPos] {
         &self.sections
+    }
+    /// Change local streaming interest; mirrors retain their authorized scope.
+    pub fn set_view_radius(&mut self, radius: i64) {
+        if !self.is_network() {
+            self.radius = radius.clamp(0, 16);
+        }
     }
 
     /// Number of cached meshes.
@@ -846,10 +900,18 @@ impl Scene {
         if self.generator.is_none() && self.layered.is_none() {
             return Ok(());
         }
-        let wanted = self.wanted_sections(center)?;
+        let interest = (center, self.radius, self.layers);
+        let wanted = if self.stream_interest == Some(interest) {
+            self.sections.clone()
+        } else {
+            self.wanted_sections(center)?
+        };
         if let Some(mut background) = self.background.take() {
             let result = background.stream(self, wanted, budget);
             self.background = Some(background);
+            if result.is_ok() {
+                self.stream_interest = Some(interest);
+            }
             self.reconcile_world_memory(None)
                 .map_err(|error| error.to_string())?;
             return result;
@@ -887,8 +949,9 @@ impl Scene {
                 }
             }
         }
+        let membership: std::collections::BTreeSet<_> = wanted.iter().copied().collect();
         for pos in self.sections.clone() {
-            if !wanted.contains(&pos) {
+            if !membership.contains(&pos) {
                 if self.authority.store().phase(pos).is_some() {
                     self.authority
                         .store_mut()
@@ -900,6 +963,7 @@ impl Scene {
             }
         }
         self.sections = wanted;
+        self.stream_interest = Some(interest);
         self.reconcile_world_memory(None)
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -1058,15 +1122,18 @@ impl Scene {
         let mut pack = game.content.clone();
         block_actions::register_content(&mut pack);
         torse_inventory::register_content(&mut pack);
+        torse_items::register_content(&mut pack);
         let content = compile(pack).map_err(|errors| format!("content failed: {errors:?}"))?;
         let registry = BlockStateRegistry::build(&content)
             .map_err(|error| format!("registry failed: {error}"))?;
         let schemas = ComponentSchemas::build(&content);
-        let compatibility = Compatibility {
-            authority_schema: 4,
-            rules_digest: content.authority_digest,
-            content_digest: content.presentation_digest,
-        };
+        let compatibility = torse_items::block_catalog(&registry)
+            .map_err(|error| format!("item rules: {error:?}"))?
+            .bind_compatibility(Compatibility {
+                authority_schema: 4,
+                rules_digest: content.authority_digest,
+                content_digest: content.presentation_digest,
+            });
         let (palette, state_materials) = material_tables(&registry, &game.texture)?;
         let side = 16;
         let bounds = WorldBounds::new(0, 64).map_err(|error| error.to_string())?;
@@ -1086,13 +1153,16 @@ impl Scene {
             principal: key("client:player"),
             edit_counter: 0,
             walker: None,
+            items: None,
             generator: None,
             layered: Some(Arc::new(terrain)),
             side,
             radius,
             meshes: BTreeMap::new(),
             lighting: None,
+            surfaces: surfaces::Previews::default(),
             sections: Vec::new(),
+            stream_interest: None,
             epoch: scene_epoch()?,
             asset_generation: palette.asset_generation(),
             next_load_generation: 1,
@@ -1161,6 +1231,14 @@ impl Scene {
                     .components
                     .component(&torse_world::block_instance_schema())
                     .is_some()
+                || (entity
+                    .components
+                    .component(&torse_inventory::schema())
+                    .is_some()
+                    && matches!(
+                        torse_world::EntityCollider::of(entity),
+                        Ok(Some(torse_world::EntityCollider::Disabled))
+                    ))
             {
                 continue;
             }
@@ -1528,6 +1606,23 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use torse_types::EntityId;
 
+    #[test]
+    fn foreground_visuals_honor_the_frame_budget_and_eventually_match_full_refresh() {
+        let mut scene = Scene::new(1).unwrap();
+        assert!(scene.background.is_none());
+        assert!(scene.refresh_visuals(0).unwrap().is_empty());
+        assert_eq!(scene.mesh_count(), 0);
+        let sections = scene.sections.len();
+        for expected in 1..=sections {
+            assert_eq!(scene.refresh_visuals(1).unwrap().len(), 1);
+            assert_eq!(scene.mesh_count(), expected);
+        }
+        assert!(scene.refresh_visuals(1).unwrap().is_empty());
+        let incremental = scene.geometry();
+        scene.meshes.clear();
+        assert_eq!(scene.refresh_meshes().len(), sections);
+        assert_eq!(scene.geometry(), incremental);
+    }
     struct RegionTint(AtomicU64);
 
     impl torse_assets::texture::PositionTintProvider for RegionTint {
@@ -1918,8 +2013,7 @@ mod tests {
         scene
             .apply_edit(true, &plant, target, 0)
             .expect("place plant");
-        // A panel is a thin vertical slab along x: its sampled bounds hug the
-        // cell's x midline while y spans the full cell.
+        // Crossed quads span the cell; selection uses a separate tight box.
         let (plant_min_x, plant_max_x, _plant_min_y, plant_max_y) = {
             match scene.authority.store().query(target) {
                 TerrainQuery::Ready(state) => {
@@ -1939,11 +2033,42 @@ mod tests {
                 other => panic!("plant state: {other:?}"),
             }
         };
-        assert!(
-            plant_min_x >= target.x as f32 + 0.44 && plant_max_x <= target.x as f32 + 0.56,
-            "plant x range [{plant_min_x}, {plant_max_x}] must hug the panel"
-        );
+        assert!((plant_min_x - target.x as f32).abs() < 1e-4);
+        assert!((plant_max_x - (target.x as f32 + 1.0)).abs() < 1e-4);
         assert!((plant_max_y - (target.y as f32 + 1.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn crossed_plant_uses_a_tight_pick_box_and_outline_without_blocking_walking() {
+        let mut scene = Scene::new(0).unwrap();
+        let plant = key("base:plant");
+        let pos = BlockPos::new(8, 14, 8);
+        scene.apply_edit(true, &plant, pos, 0).unwrap();
+        scene
+            .apply_edit(true, &key("base:stone"), BlockPos::new(10, 14, 8), 0)
+            .unwrap();
+        let state = scene.authority().store().query(pos).ready().unwrap();
+        let registry = scene.authority().registry();
+        assert_eq!(registry.render_shape(state), Some(Shape::Cross));
+        assert!(registry.collision_shape(state).is_none());
+        let hit = scene.pick([6.5, 14.5, 8.5], [1.0, 0.0, 0.0], 64.0);
+        let PickOutcome::Hit(hit) = hit else {
+            panic!("expected the plant");
+        };
+        assert_eq!(hit.block, pos);
+        assert!((hit.entry[0] - 8.125).abs() < 1e-5);
+        let bytes = scene.outline_bytes(&hit);
+        assert_eq!(bytes.len(), 24 * Vertex::STRIDE);
+        for vertex in bytes.chunks_exact(Vertex::STRIDE) {
+            let x = f32::from_le_bytes(vertex[..4].try_into().unwrap());
+            assert!((8.1209..=8.8791).contains(&x));
+        }
+        let outside = scene.pick([6.5, 14.5, 8.05], [1.0, 0.0, 0.0], 64.0);
+        assert!(matches!(outside, PickOutcome::Hit(hit) if hit.block == BlockPos::new(10, 14, 8)));
+        let at = Position::new(8.5, 14.4, 8.5);
+        assert_eq!(scene.spawn_walker(at).unwrap(), at);
+        let moved = scene.step_walker([1.0, 0.0, 0.0], false, 0.05).unwrap().0;
+        assert!(moved.x > at.x);
     }
 
     #[test]
@@ -2296,6 +2421,41 @@ mod tests {
         assert!(final_position.z < 8.0, "moved to {final_position:?}");
         assert!(grounded);
         assert!(final_position.y > 0.0 && final_position.y < 16.0);
+    }
+
+    #[test]
+    fn rejected_and_duplicate_walk_entry_leave_entity_counts_unchanged() {
+        let mut scene = Scene::new(0).unwrap();
+        for position in [
+            Position::new(30.5, 12.0, 8.5),
+            Position::new(8.5, 1.0, 8.5),
+            Position::new(f64::NAN, 12.0, 8.5),
+        ] {
+            assert!(scene.spawn_walker(position).is_err());
+            assert_eq!(scene.authority().entities().len(), 0);
+            assert!(scene.walker.is_none());
+        }
+        scene.spawn_walker(Position::new(8.5, 13.0, 8.5)).unwrap();
+        let handle = scene.walker.unwrap().handle;
+        assert!(scene.spawn_walker(Position::new(8.5, 14.0, 8.5)).is_err());
+        assert_eq!(scene.authority().entities().len(), 1);
+        scene.stop_walker().unwrap();
+        scene.stop_walker().unwrap();
+        assert!(scene.authority().entities().get(handle).is_none());
+        scene.spawn_walker(Position::new(8.5, 13.0, 8.5)).unwrap();
+        assert_ne!(scene.walker.unwrap().handle, handle);
+    }
+
+    #[test]
+    fn leaving_network_walk_only_clears_the_camera_binding() {
+        let mut scene = Scene::from_snapshot(&replica_snapshot()).unwrap();
+        let meta = torse_sim::streaming::page_meta(scene.authority());
+        let before = scene.authority().capture_snapshot(meta).unwrap();
+        scene.view_player(EntityId(9));
+        assert!(scene.walker.is_some());
+        scene.stop_walker().unwrap();
+        assert!(scene.walker.is_none());
+        assert_eq!(scene.authority().capture_snapshot(meta).unwrap(), before);
     }
 
     #[test]

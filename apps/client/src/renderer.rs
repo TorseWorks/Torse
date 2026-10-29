@@ -84,28 +84,30 @@ struct VertexOut {
     @location(7) light: f32,
 };
 
+fn sample_rect(rect: vec4<f32>, uv: vec2<f32>, level: f32) -> vec4<f32> {
+    // Each mip has a larger filter footprint. Base-level padding does not
+    // prevent linear filtering from reading the atlas gutter at a distance.
+    let texel = 0.5 / vec2<f32>(textureDimensions(atlas, u32(level)));
+    let inset = min(texel, rect.zw * 0.5);
+    let point = clamp(rect.xy + fract(uv) * rect.zw,
+        rect.xy + inset, rect.xy + rect.zw - inset);
+    return textureSampleLevel(atlas, atlas_sampler, point, level);
+}
+
 fn sample_surface(surface: Surface, uv: vec2<f32>) -> vec4<f32> {
-    let local = fract(uv);
-    let texel = 0.5 / vec2<f32>(textureDimensions(atlas, 0));
-    let minimum = surface.rect.xy + texel;
-    let maximum = surface.rect.xy + surface.rect.zw - texel;
-    let first_uv = clamp(surface.rect.xy + local * surface.rect.zw, minimum, maximum);
-    var first: vec4<f32>;
-    if (surface.frame.y > 0.5) {
-        first = textureSampleLevel(atlas, atlas_sampler, first_uv, 0.0);
-    } else {
-        first = textureSampleGrad(atlas, atlas_sampler, first_uv,
-            dpdx(uv) * surface.rect.zw, dpdy(uv) * surface.rect.zw);
-    }
+    let size = surface.rect.zw * vec2<f32>(textureDimensions(atlas, 0));
+    let dx = dpdx(uv) * size;
+    let dy = dpdy(uv) * size;
+    let lod = clamp(0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1.0)),
+        0.0, f32(textureNumLevels(atlas) - 1u));
+    let low = select(floor(lod), 0.0, surface.frame.y > 0.5);
+    let high = select(ceil(lod), 0.0, surface.frame.y > 0.5);
+    let first = mix(sample_rect(surface.rect, uv, low),
+        sample_rect(surface.rect, uv, high), fract(lod));
     if (surface.frame.x <= 0.0) {
         return first;
     }
-    let second_uv = clamp(
-        surface.next_rect.xy + local * surface.next_rect.zw,
-        surface.next_rect.xy + texel,
-        surface.next_rect.xy + surface.next_rect.zw - texel,
-    );
-    let second = textureSampleLevel(atlas, atlas_sampler, second_uv, 0.0);
+    let second = sample_rect(surface.next_rect, uv, 0.0);
     return mix(first, second, surface.frame.x);
 }
 
@@ -238,14 +240,20 @@ struct Camera {
 @group(0) @binding(0)
 var<uniform> camera: Camera;
 
+struct LineOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec3<f32>,
+};
 @vertex
-fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
-    return camera.view_proj * vec4<f32>(position, 1.0);
+fn vs_main(@location(0) position: vec3<f32>, @location(1) color: vec3<f32>) -> LineOut {
+    var out: LineOut;
+    out.position = camera.view_proj * vec4<f32>(position, 1.0);
+    out.color = color;
+    return out;
 }
-
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    return vec4<f32>(0.05, 0.05, 0.05, 1.0);
+fn fs_main(input: LineOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(input.color, 1.0);
 }
 "#;
 
@@ -259,6 +267,7 @@ pub const SKY: Color = Color {
 
 /// Selection outline capacity: 12 cube edges of 2 vertices each.
 const MAX_LINE_VERTICES: usize = 24;
+const MAX_BORDER_VERTICES: usize = 384;
 
 /// Bytes per terrain vertex: position, normal, uv, and one material slot.
 const VERTEX_STRIDE: usize = 68;
@@ -269,6 +278,8 @@ const SURFACE_BYTES: u64 = 64;
 /// Synthetic key carrying the entity box buffers; retention never drops it.
 pub const ENTITY_SLOT: torse_types::SectionPos =
     torse_types::SectionPos::new(i64::MAX, 0, i64::MAX);
+pub const SURFACE_SLOT: torse_types::SectionPos =
+    torse_types::SectionPos::new(i64::MAX - 1, 0, i64::MAX);
 
 /// Device, queue, pipelines, camera uniform, and terrain buffers.
 pub struct GpuContext {
@@ -283,8 +294,10 @@ pub struct GpuContext {
     geometry_limit: u64,
     geometry_bytes: u64,
     geometry_evictions: u64,
+    frontier: std::cell::Cell<Option<(u128, torse_types::SectionPos)>>,
     draw_stats: std::cell::Cell<DrawStats>,
     line_pipeline: RenderPipeline,
+    border_pipeline: RenderPipeline,
     sky_pipeline: RenderPipeline,
     camera: Buffer,
     camera_bind: BindGroup,
@@ -297,6 +310,7 @@ pub struct GpuContext {
     terrain: BTreeMap<torse_types::SectionPos, SectionBuffers>,
     line_buffer: Buffer,
     line_count: u32,
+    border_count: u32,
     animation_origin: Instant,
 }
 
@@ -594,48 +608,62 @@ impl GpuContext {
         let transparent_pipeline = make_pipeline(true);
         // The outline only reads depth, so it never occludes the terrain it
         // marks. It ignores texture coordinates and material slots.
-        let line_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("client outline pipeline"),
-            layout: Some(&line_pipeline_layout),
-            vertex: VertexState {
-                module: &line_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: VERTEX_STRIDE as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x3,
-                        offset: 0,
-                        shader_location: 0,
-                    }],
-                })],
-            },
-            fragment: Some(FragmentState {
-                module: &line_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(ColorTargetState {
-                    format: color_format,
-                    blend: Some(BlendState::REPLACE),
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            primitive: PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
-                ..PrimitiveState::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_line = |label, compare| {
+            device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&line_pipeline_layout),
+                vertex: VertexState {
+                    module: &line_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: VERTEX_STRIDE as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 40,
+                                shader_location: 1,
+                            },
+                        ],
+                    })],
+                },
+                fragment: Some(FragmentState {
+                    module: &line_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(ColorTargetState {
+                        format: color_format,
+                        blend: Some(BlendState::REPLACE),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                primitive: PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    ..PrimitiveState::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(compare),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let line_pipeline = make_line("client outline pipeline", wgpu::CompareFunction::Less);
+        let border_pipeline = make_line(
+            "client section border pipeline",
+            wgpu::CompareFunction::LessEqual,
+        );
         // The sky covers the whole target behind the terrain, so it carries no
         // bind group and never writes depth.
         let sky_shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -680,7 +708,7 @@ impl GpuContext {
         });
         let line_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("client outline vertices"),
-            size: (MAX_LINE_VERTICES * VERTEX_STRIDE) as u64,
+            size: ((MAX_LINE_VERTICES + MAX_BORDER_VERTICES) * VERTEX_STRIDE) as u64,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -697,8 +725,10 @@ impl GpuContext {
             geometry_limit: 64 * 1024 * 1024,
             geometry_bytes: 0,
             geometry_evictions: 0,
+            frontier: std::cell::Cell::new(None),
             draw_stats: std::cell::Cell::new(DrawStats::default()),
             line_pipeline,
+            border_pipeline,
             sky_pipeline,
             camera,
             camera_bind,
@@ -708,6 +738,7 @@ impl GpuContext {
             terrain: BTreeMap::new(),
             line_buffer,
             line_count: 0,
+            border_count: 0,
             animation_origin: Instant::now(),
         }
     }
@@ -744,6 +775,9 @@ impl GpuContext {
     }
 
     pub fn set_section_focus(&mut self, center: torse_types::SectionPos) {
+        if self.focus != center {
+            self.frontier.set(None);
+        }
         self.focus = center;
     }
 
@@ -773,8 +807,14 @@ impl GpuContext {
             !self.terrain.contains_key(&section) && self.terrain.len() >= 4096,
             self.terrain
                 .iter()
-                .filter(|(pos, _)| **pos != section && **pos != ENTITY_SLOT)
-                .filter(|(pos, _)| section == ENTITY_SLOT || priority(**pos, self.focus) > rank)
+                .filter(|(pos, _)| {
+                    **pos != section && **pos != ENTITY_SLOT && **pos != SURFACE_SLOT
+                })
+                .filter(|(pos, _)| {
+                    section == ENTITY_SLOT
+                        || section == SURFACE_SLOT
+                        || priority(**pos, self.focus) > rank
+                })
                 .map(|(pos, b)| (*pos, b.bytes, priority(*pos, self.focus))),
         )?;
         Some(GeometryAdmission {
@@ -786,9 +826,50 @@ impl GpuContext {
     /// Borrow-only upload admission. Keep deferred CPU meshes until visible and
     /// closer geometry can fit; no GPU or expanded vertex data is allocated.
     pub fn should_upload(&self, section: torse_types::SectionPos, side: u32, bytes: usize) -> bool {
-        bytes == 0
-            || (Bounds::section(section, side).visible(&self.view_projection.get(), self.eye.get())
-                && self.admission(section, bytes as u64).is_some())
+        if bytes == 0 {
+            return true;
+        }
+        if !Bounds::section(section, side).visible(&self.view_projection.get(), self.eye.get()) {
+            return false;
+        }
+        let old = self.terrain.get(&section).map_or(0, |b| b.bytes);
+        let need_entry = !self.terrain.contains_key(&section) && self.terrain.len() >= 4096;
+        if bytes as u64 <= self.geometry_limit
+            && self.geometry_bytes - old <= self.geometry_limit - bytes as u64
+            && !need_entry
+        {
+            return true;
+        }
+        let rank = priority(section, self.focus);
+        let frontier = self.frontier.get().or_else(|| {
+            let farthest = self
+                .terrain
+                .keys()
+                .filter(|p| **p != ENTITY_SLOT && **p != SURFACE_SLOT)
+                .map(|p| priority(*p, self.focus))
+                .max();
+            self.frontier.set(farthest);
+            farthest
+        });
+        if frontier.is_none_or(|farthest| farthest <= rank) {
+            return false;
+        }
+        residency::can_admit(
+            self.geometry_limit,
+            self.geometry_bytes,
+            old,
+            bytes as u64,
+            need_entry,
+            self.terrain
+                .iter()
+                .filter(|(p, _)| {
+                    **p != section
+                        && **p != ENTITY_SLOT
+                        && **p != SURFACE_SLOT
+                        && priority(**p, self.focus) > rank
+                })
+                .map(|(_, buffers)| buffers.bytes),
+        )
     }
 
     /// Upload the atlas and material table used by the terrain pass.
@@ -797,6 +878,7 @@ impl GpuContext {
     /// material slots belong to that pack. The host uploads its new meshes.
     pub fn set_palette(&mut self, palette: &Palette) {
         self.terrain.clear();
+        self.frontier.set(None);
         self.geometry_bytes = 0;
         self.animation_origin = Instant::now();
         let materials = self.device.create_buffer(&BufferDescriptor {
@@ -909,6 +991,7 @@ impl GpuContext {
     ) -> bool {
         if vertex_bytes.is_empty() || indices.is_empty() {
             if let Some(old) = self.terrain.remove(&section) {
+                self.frontier.set(None);
                 self.geometry_bytes -= old.bytes;
             }
             return true;
@@ -1007,6 +1090,7 @@ impl GpuContext {
             self.geometry_bytes -= old.bytes;
         }
         self.geometry_bytes += bytes;
+        self.frontier.set(None);
         true
     }
 
@@ -1016,8 +1100,14 @@ impl GpuContext {
     /// survives every retention; callers re-upload its contents when entity
     /// positions change.
     pub fn retain_sections(&mut self, keep: &[torse_types::SectionPos]) {
-        self.terrain
-            .retain(|pos, _| keep.contains(pos) || *pos == ENTITY_SLOT);
+        let membership: std::collections::BTreeSet<_> = keep.iter().copied().collect();
+        let count = self.terrain.len();
+        self.terrain.retain(|pos, _| {
+            membership.contains(pos) || *pos == ENTITY_SLOT || *pos == SURFACE_SLOT
+        });
+        if self.terrain.len() != count {
+            self.frontier.set(None);
+        }
         self.geometry_bytes = self.terrain.values().map(|b| b.bytes).sum();
     }
 
@@ -1045,6 +1135,16 @@ impl GpuContext {
         self.line_count = (limit / VERTEX_STRIDE) as u32;
     }
 
+    pub fn write_borders(&mut self, vertex_bytes: &[u8]) {
+        let limit = vertex_bytes.len().min(MAX_BORDER_VERTICES * VERTEX_STRIDE);
+        self.queue.write_buffer(
+            &self.line_buffer,
+            (MAX_LINE_VERTICES * VERTEX_STRIDE) as u64,
+            &vertex_bytes[..limit],
+        );
+        self.border_count = (limit / VERTEX_STRIDE) as u32;
+    }
+
     /// Encode the one terrain pass onto any colour and depth view pair.
     pub fn encode_draw(
         &self,
@@ -1053,21 +1153,35 @@ impl GpuContext {
         depth: &TextureView,
     ) -> bool {
         let matrix = self.view_projection.get();
-        let visible = |section: &SectionBuffers| section.bounds.visible(&matrix, self.eye.get());
-        let visible_sections = self
+        let _visibility = match self
+            .memory
+            .as_ref()
+            .map(|pool| {
+                pool.reserve(
+                    torse_types::MemoryClass::Codec,
+                    (self.terrain.len() * size_of::<(&torse_types::SectionPos, &SectionBuffers)>()
+                        + 512) as u64,
+                    torse_types::EvictionRank::Pinned,
+                )
+            })
+            .transpose()
+        {
+            Ok(lease) => lease,
+            Err(_) => return false,
+        };
+        let visible: Vec<_> = self
             .terrain
-            .values()
-            .filter(|section| visible(section))
-            .count();
+            .iter()
+            .filter(|(_, section)| section.bounds.visible(&matrix, self.eye.get()))
+            .collect();
+        let visible_sections = visible.len();
         self.draw_stats.set(DrawStats {
             visible_sections,
             culled_sections: self.terrain.len() - visible_sections,
         });
-        let count = self
-            .terrain
-            .values()
-            .filter(|section| visible(section))
-            .map(|section| section.transparent.len())
+        let count = visible
+            .iter()
+            .map(|(_, section)| section.transparent.len())
             .sum::<usize>();
         let _sort = match self
             .memory
@@ -1086,10 +1200,7 @@ impl GpuContext {
             Err(_) => return false,
         };
         let mut transparent = Vec::with_capacity(count);
-        for (pos, section) in &self.terrain {
-            if !visible(section) {
-                continue;
-            }
+        for &(pos, section) in &visible {
             for face in &section.transparent {
                 transparent.push((
                     face_depth(&matrix, face.center),
@@ -1136,8 +1247,8 @@ impl GpuContext {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind, &[]);
             pass.set_bind_group(1, &palette.bind, &[]);
-            for section in self.terrain.values() {
-                if section.opaque_count == 0 || !visible(section) {
+            for &(_, section) in &visible {
+                if section.opaque_count == 0 {
                     continue;
                 }
                 pass.set_vertex_buffer(0, section.vertices.slice(..));
@@ -1156,6 +1267,15 @@ impl GpuContext {
             pass.set_bind_group(0, &self.camera_bind, &[]);
             pass.set_vertex_buffer(0, self.line_buffer.slice(..));
             pass.draw(0..self.line_count, 0..1);
+        }
+        if self.border_count > 0 {
+            pass.set_pipeline(&self.border_pipeline);
+            pass.set_bind_group(0, &self.camera_bind, &[]);
+            pass.set_vertex_buffer(0, self.line_buffer.slice(..));
+            pass.draw(
+                MAX_LINE_VERTICES as u32..MAX_LINE_VERTICES as u32 + self.border_count,
+                0..1,
+            );
         }
         true
     }
@@ -1279,6 +1399,8 @@ impl Renderer {
             [self.width, self.height],
             &state,
             crate::ui::Hud {
+                debug_lines: &[],
+                inventory: vec![],
                 material: 0,
                 network: false,
                 ready: true,
@@ -1433,6 +1555,116 @@ const fn align_256(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn minified_tiles_keep_their_color_and_world_borders_obey_depth() {
+        use crate::scene::{Scene, Vertex};
+        use torse_assets::texture::MipLevel;
+        use torse_types::SectionPos;
+        let levels = (0..3)
+            .map(|level| {
+                let width = 64 >> level;
+                let height = 32 >> level;
+                let mut pixels = vec![32; width * height * 4];
+                for pixel in pixels.chunks_exact_mut(4) {
+                    pixel[3] = 255;
+                }
+                for y in (8 >> level)..(24 >> level) {
+                    for x in (16 >> level)..(32 >> level) {
+                        pixels[(y * width + x) * 4..(y * width + x + 1) * 4].fill(255);
+                    }
+                }
+                MipLevel {
+                    width: width as u32,
+                    height: height as u32,
+                    pixels,
+                }
+            })
+            .collect();
+        let surface = crate::texture::Surface {
+            rect: [0.25, 0.25, 0.25, 0.5],
+            tint: [1.; 3],
+            tint_source: None,
+            animation: None,
+            alpha: torse_content::AlphaMode::Opaque,
+        };
+        let mut renderer = Renderer::new(128, 128).unwrap();
+        renderer.set_palette(&Palette::mips_for_tests(vec![surface], levels));
+        let positions = [
+            [-1., -1., 0.5],
+            [1., -1., 0.5],
+            [1., 1., 0.5],
+            [-1., 1., 0.5],
+        ];
+        // Offset the repeats so pixel centers hit a tile boundary at mip two.
+        let uv = [
+            [0.875, 0.875],
+            [32.875, 0.875],
+            [32.875, 32.875],
+            [0.875, 32.875],
+        ];
+        let vertices = std::array::from_fn::<_, 4, _>(|i| Vertex {
+            position: positions[i],
+            normal: [0., 0., -1.],
+            uv: uv[i],
+            material: 0,
+            overlay_material: u32::MAX,
+            tint: [1.; 3],
+            overlay_tint: [1.; 3],
+            light: 1.,
+        });
+        assert!(renderer.upload_section(
+            SectionPos::ZERO,
+            &Scene::vertex_bytes(&vertices),
+            &[0, 1, 2, 0, 2, 3]
+        ));
+        let matrix = [
+            1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+        ];
+        let folder =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.work/cln014-gpu");
+        std::fs::create_dir_all(&folder).unwrap();
+        for (name, depth) in [
+            ("tile", None),
+            ("hidden-border", Some(0.75)),
+            ("visible-border", Some(0.25)),
+        ] {
+            let lines: Vec<_> = depth
+                .into_iter()
+                .flat_map(|z| {
+                    [-0.8, 0.8].map(|x| Vertex {
+                        position: [x, 0., z],
+                        tint: [1., 0., 0.],
+                        ..Vertex::default()
+                    })
+                })
+                .collect();
+            renderer.context.write_borders(&Scene::vertex_bytes(&lines));
+            assert!(renderer.render(matrix, [0.; 3]));
+            let path = folder.join(format!("{name}.png"));
+            renderer.save_png(path.to_str().unwrap()).unwrap();
+            let image =
+                torse_assets::texture::Atlas::decode(&std::fs::read(path).unwrap()).unwrap();
+            let red = image
+                .pixels()
+                .chunks_exact(4)
+                .filter(|p| p[0] > 200 && p[1] < 20)
+                .count();
+            if name == "visible-border" {
+                assert!(red > 50);
+            } else {
+                assert_eq!(red, 0);
+                assert!(
+                    image
+                        .pixels()
+                        .chunks_exact(4)
+                        .all(|p| p[0] > 240 && p[1] > 240),
+                    "atlas gutter leaked at minification"
+                );
+            }
+        }
+    }
 
     #[cfg(feature = "gpu-tests")]
     #[test]

@@ -33,6 +33,28 @@ rustup target add wasm32-unknown-unknown
 
 运行方式见[服务端](apps/server/README.md)与[Mod示例](examples/mods/README.md)。各库职责见[框架库说明](crates/README.md)。
 
+### 编辑器分析
+
+rust-analyzer需要工具链的标准库源码，先在仓库根目录执行`rustup component add rust-src`。安装中断后出现`missing manifest in toolchain`时，应修复对应版本的安装，再核对`rustc --version`、`rustup component list --installed`和`cargo check --workspace --locked`，不要通过关闭诊断掩盖问题。
+
+新版分析器与旧标准库可能不兼容。[rust-analyzer安装说明](https://rust-analyzer.github.io/book/installation.html)说明其标准库支持范围。本机已验证Rust 1.99.1可用于当前编辑器分析，仓库命令行构建仍使用固定的1.93.1。需要分开配置时，先安装分析工具链并查询其标准库目录：
+
+```sh
+rustup toolchain install 1.99.1 --profile minimal --component rust-src,rustfmt,clippy
+rustup run 1.99.1 rustc --print sysroot
+```
+
+在本机工作区设置中配置下列项；已有环境变量保留并合并。这些绝对路径不提交到仓库。
+
+| 设置 | 值 |
+|---|---|
+| `rust-analyzer.server.extraEnv` | `RUSTUP_TOOLCHAIN`设为`1.99.1` |
+| `rust-analyzer.cargo.extraEnv` | `RUSTUP_TOOLCHAIN`设为`1.99.1` |
+| `rust-analyzer.cargo.sysroot` | 上述查询命令的输出目录 |
+| `rust-analyzer.procMacro.server` | 该目录内的`libexec/rust-analyzer-proc-macro-srv`，Windows文件名带`.exe` |
+
+打开多个工程的父目录时，通过`rust-analyzer.linkedProjects`列出正式的`Cargo.toml`，并用`rust-analyzer.files.exclude`排除`.work`等临时目录。分析可选Mod工具和示例时启用`rust-analyzer.cargo.features = "all"`，否则未启用特性的目标可能缺少依赖。修改工具链、标准库或宏服务后重启分析器；宏动态库与服务须来自同一编译器版本。编辑器分析通过不代替固定工具链的提交前检查。
+
 ## 修改约定
 
 一次PR集中处理一个问题。格式整理、重构和行为修改尽量分开，避免审核者需要从无关改动中寻找实际变化。遵循相邻代码的命名与组织方式，使用仓库现有的Rustfmt配置。

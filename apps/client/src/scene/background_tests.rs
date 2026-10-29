@@ -148,6 +148,54 @@ fn drain_meshes(scene: &mut Scene) {
 }
 
 #[test]
+fn stable_scan_rebuilds_after_eviction_and_terrain_change() {
+    let mut scene = Scene::new(0).unwrap();
+    scene.enable_background(config(1, 2)).unwrap();
+    drain_meshes(&mut scene);
+    scene.refresh_visuals(4).unwrap();
+    assert!(scene.background.as_ref().unwrap().scanned.is_some());
+    scene.forget_mesh(&SectionPos::ZERO);
+    drain_meshes(&mut scene);
+    scene.refresh_visuals(4).unwrap();
+    assert!(scene.background.as_ref().unwrap().scanned.is_some());
+    scene
+        .authority
+        .store_mut()
+        .edit(BlockPos::new(1, 1, 1), BlockStateId::EMPTY)
+        .unwrap();
+    drain_meshes(&mut scene);
+    assert_eq!(
+        scene.meshes[&SectionPos::ZERO].0,
+        MeshStamp::capture(&scene, SectionPos::ZERO)
+    );
+}
+
+#[test]
+fn sparse_validation_tracks_diagonal_halo_arrivals_and_reload_generations() {
+    let mut scene = Scene::new(0).unwrap();
+    scene.generator = None;
+    scene.enable_lighting().unwrap();
+    scene.enable_background(config(1, 2)).unwrap();
+    drain_meshes(&mut scene);
+    let admitted = scene.background_stats().admitted;
+    let diagonal = SectionPos::new(1, 0, 1);
+    scene
+        .install_generated(diagonal, Section::empty(16).unwrap())
+        .unwrap();
+    drain_meshes(&mut scene);
+    assert!(scene.background_stats().admitted > admitted);
+    let load = scene.load_generations[&diagonal];
+    let admitted = scene.background_stats().admitted;
+    scene.authority.store_mut().unload(diagonal).unwrap();
+    scene
+        .install_generated(diagonal, Section::empty(16).unwrap())
+        .unwrap();
+    assert!(scene.load_generations[&diagonal] > load);
+    drain_meshes(&mut scene);
+    assert!(scene.background_stats().admitted > admitted);
+}
+
+#[test]
 fn one_and_four_workers_match_serial_generation_and_meshes_under_backpressure() {
     let mut reference = Scene::new(1).unwrap();
     reference.refresh_meshes();
@@ -156,6 +204,10 @@ fn one_and_four_workers_match_serial_generation_and_meshes_under_backpressure() 
         let mut scene = Scene::new(0).unwrap();
         scene.radius = 1;
         scene.enable_background(config(workers, 2)).unwrap();
+        let memory =
+            torse_types::MemoryPool::new(torse_types::MemoryBudget::new(128 * 1024 * 1024));
+        scene.attach_memory(memory.clone()).unwrap();
+        let executor_idle = memory.usage().current[torse_types::MemoryClass::Executor.index()];
         drain(&mut scene, SectionPos::ZERO);
         assert_eq!(scene.geometry(), expected);
         let background = scene.background.as_ref().unwrap();
@@ -164,6 +216,11 @@ fn one_and_four_workers_match_serial_generation_and_meshes_under_backpressure() 
         assert!(background.stats.peak_input_bytes <= 2 * 1024 * 1024);
         assert!(background.stats.peak_output_bytes <= 32 * 1024 * 1024);
         assert_eq!(background.pool.usage().jobs, 0);
+        assert_eq!(
+            memory.usage().current[torse_types::MemoryClass::Executor.index()],
+            executor_idle,
+            "finished work must leave only the executor queue reservation"
+        );
         println!(
             "workers={workers} sections={} stats={:?}",
             scene.mesh_count(),
@@ -417,5 +474,69 @@ fn full_executor_defers_before_snapshot_and_old_generation_cannot_replace_a_new_
     assert_eq!(
         scene.authority.store().query(BlockPos::new(48, 1, 0)),
         TerrainQuery::Ready(BlockStateId::EMPTY)
+    );
+}
+
+fn shared_executor_scene(limit: u64) -> (Scene, torse_types::MemoryPool) {
+    let memory = torse_types::MemoryPool::new(
+        torse_types::MemoryBudget::new(128 * 1024 * 1024)
+            .with_class_limit(torse_types::MemoryClass::Executor, limit),
+    );
+    let mut scene = Scene::new(0).unwrap();
+    scene.enable_background(config(1, 8)).unwrap();
+    scene.attach_memory(memory.clone()).unwrap();
+    scene.radius = 1;
+    (scene, memory)
+}
+
+#[test]
+fn shared_executor_limit_tracks_one_reservation_and_refuses_the_next() {
+    let (mut probe, memory) = shared_executor_scene(64 * 1024 * 1024);
+    probe.stream_around(SectionPos::ZERO, 1).unwrap();
+    let one = memory.usage().current[torse_types::MemoryClass::Executor.index()];
+    assert!(one > 1);
+    assert_eq!(probe.background.as_ref().unwrap().pool.usage().jobs, 1);
+
+    let (mut scene, memory) = shared_executor_scene(one);
+    let origin = scene.authority.store().revision(SectionPos::ZERO);
+    scene.stream_around(SectionPos::ZERO, 4).unwrap();
+    let background = scene.background.as_ref().unwrap();
+    assert_eq!(background.generating.len(), 1);
+    assert!(background.stats.backpressure >= 1);
+    assert_eq!(background.pool.usage().jobs, 1);
+    assert_eq!(
+        memory.usage().current[torse_types::MemoryClass::Executor.index()],
+        one
+    );
+    assert_eq!(scene.authority.store().len(), 1);
+    assert_eq!(scene.authority.store().revision(SectionPos::ZERO), origin);
+    assert_eq!(
+        scene.authority.store().query(BlockPos::new(16, 1, 0)),
+        TerrainQuery::NotLoaded
+    );
+}
+
+#[test]
+fn shared_executor_rejects_an_impossible_reservation_without_changing_the_world() {
+    let (probe, memory) = shared_executor_scene(64 * 1024 * 1024);
+    let queue = memory.usage().current[torse_types::MemoryClass::Executor.index()];
+    drop(probe);
+    assert_eq!(memory.usage().total, 0);
+    let (mut scene, memory) = shared_executor_scene(queue);
+    let origin = scene.authority.store().revision(SectionPos::ZERO);
+    let error = scene.stream_around(SectionPos::ZERO, 4).unwrap_err();
+    assert!(error.contains("TooLarge"), "unexpected error: {error}");
+    let background = scene.background.as_ref().unwrap();
+    assert!(background.generating.is_empty());
+    assert_eq!(background.pool.usage().jobs, 0);
+    assert_eq!(
+        memory.usage().current[torse_types::MemoryClass::Executor.index()],
+        queue
+    );
+    assert_eq!(scene.authority.store().len(), 1);
+    assert_eq!(scene.authority.store().revision(SectionPos::ZERO), origin);
+    assert_eq!(
+        scene.authority.store().query(BlockPos::new(16, 1, 0)),
+        TerrainQuery::NotLoaded
     );
 }

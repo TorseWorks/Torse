@@ -107,12 +107,82 @@ pub(super) fn admission(
     None
 }
 
+pub(super) fn can_admit(
+    limit: u64,
+    used: u64,
+    old: u64,
+    incoming: u64,
+    need_entry: bool,
+    candidates: impl Iterator<Item = u64>,
+) -> bool {
+    if incoming > limit {
+        return false;
+    }
+    let Some(mut projected) = used
+        .checked_sub(old)
+        .and_then(|used| used.checked_add(incoming))
+    else {
+        return false;
+    };
+    if projected <= limit && !need_entry {
+        return true;
+    }
+    for bytes in candidates {
+        let Some(next) = projected.checked_sub(bytes) else {
+            return false;
+        };
+        projected = next;
+        if projected <= limit {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     const IDENTITY: [f32; 16] = [
         1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
     ];
+    #[test]
+    fn allocation_free_probe_matches_the_atomic_victim_plan() {
+        for length in 0..=3 {
+            let residents = &[
+                (SectionPos::ZERO, 1, (3, SectionPos::ZERO)),
+                (SectionPos::new(1, 0, 0), 3, (2, SectionPos::ZERO)),
+                (SectionPos::new(2, 0, 0), 5, (1, SectionPos::ZERO)),
+            ][..length];
+            for limit in 0..18 {
+                for old in [0, 4] {
+                    for incoming in 0..18 {
+                        for need in [false, true] {
+                            let used = residents.iter().map(|r| r.1).sum::<u64>() + old;
+                            assert_eq!(
+                                can_admit(
+                                    limit,
+                                    used,
+                                    old,
+                                    incoming,
+                                    need,
+                                    residents.iter().map(|r| r.1)
+                                ),
+                                admission(
+                                    limit,
+                                    used,
+                                    old,
+                                    incoming,
+                                    need,
+                                    residents.iter().copied()
+                                )
+                                .is_some()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn clip_bounds_keep_crossings_and_reject_all_six_outside_planes() {

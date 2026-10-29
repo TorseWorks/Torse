@@ -409,17 +409,38 @@ fn run() -> Result<(), Fault> {
                     } else {
                         actor
                     };
+                    player_peers.retain(|peer, _| hub.contains(*peer));
+                    let assigned = if tls.is_none() {
+                        player_ids
+                            .iter()
+                            .find(|id| !player_peers.values().any(|used| used == *id))
+                            .copied()
+                    } else {
+                        None
+                    };
+                    let actor =
+                        if let Some(player) = assigned.filter(|_| editors && mod_dirs.is_empty()) {
+                            [
+                                "items:permission/use",
+                                "inventory:permission/insert",
+                                "inventory:permission/consume",
+                                "inventory:permission/swap",
+                                "inventory:permission/read",
+                            ]
+                            .into_iter()
+                            .fold(
+                                actor.target(torse_sim::action::ActionTarget::Entity(player)),
+                                |actor, permission| actor.permission(base::key(permission)),
+                            )
+                        } else {
+                            actor
+                        };
                     let policy = PeerPolicy { actor, scope };
                     if let Ok(id) = hub.add(stream, policy, server.authority()?.resume_point().tick)
                     {
-                        player_peers.retain(|peer, _| hub.contains(*peer));
-                        if tls.is_none()
-                            && let Some(player) = player_ids
-                                .iter()
-                                .find(|id| !player_peers.values().any(|used| used == *id))
-                        {
-                            hub.assign_player(id, *player)?;
-                            player_peers.insert(id, *player);
+                        if let Some(player) = assigned {
+                            hub.assign_player(id, player)?;
+                            player_peers.insert(id, player);
                         }
                         peers.push(id);
                         if revoke_at.is_none() && revoke_after != 0 {

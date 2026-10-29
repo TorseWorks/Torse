@@ -14,10 +14,13 @@ use torse_sim::durable::Receipt;
 use torse_sim::replica::{ReplicaScope, WorldReplicaBatch, WorldReplicaSeed};
 use torse_storage::CommitJournal;
 use torse_types::*;
+#[path = "network_control.rs"]
+mod control;
 #[path = "network_interest.rs"]
 mod interest;
 #[path = "network_player.rs"]
 mod player;
+pub use control::{ControlBudget, ControlDispatch, ControlPolicy};
 pub use interest::PlayerFollow;
 
 pub type ClientMessage = torse_protocol::ClientMessage<torse_sim::durable::Call>;
@@ -227,6 +230,7 @@ struct Peer<T> {
     memory: Option<MemoryLease>,
     follow_scope: Option<ReplicaScope>,
     follow_ready: bool,
+    control_link: Option<control::PeerLink>,
 }
 pub struct NetworkHub<T> {
     peers: BTreeMap<u128, Peer<T>>,
@@ -240,6 +244,7 @@ pub struct NetworkHub<T> {
     _authentication_memory: Option<MemoryLease>,
     connection_timeout: Option<Duration>,
     follow: Option<PlayerFollow>,
+    control: Option<control::ControlPlane>,
 }
 impl<T: Transport> NetworkHub<T> {
     pub fn new(binding: Binding, limits: NetworkLimits) -> Result<Self, Fault> {
@@ -273,6 +278,7 @@ impl<T: Transport> NetworkHub<T> {
             _authentication_memory: None,
             connection_timeout: None,
             follow: None,
+            control: None,
         })
     }
     pub fn with_memory(
@@ -317,7 +323,8 @@ impl<T: Transport> NetworkHub<T> {
                     .saturating_mul(2)
                     .saturating_add(policy.scope.sections.len() as u64 * 8192)
                     .saturating_add(self.limits.movement_bytes)
-                    .saturating_add(self.limits.outstanding as u64 * 512);
+                    .saturating_add(self.limits.outstanding as u64 * 512)
+                    .saturating_add(self.control_reserve());
                 pool.reserve(MemoryClass::Executor, bytes, EvictionRank::Pinned)
             })
             .transpose()?;
@@ -341,6 +348,7 @@ impl<T: Transport> NetworkHub<T> {
                 memory,
                 follow_scope: None,
                 follow_ready: false,
+                control_link: None,
             },
         );
         Ok(id)
@@ -408,6 +416,7 @@ impl<T: Transport> NetworkHub<T> {
         id: u128,
         policy: PeerPolicy,
     ) -> Result<(), Fault> {
+        let control_bytes = self.control_reserve();
         let peer = self
             .peers
             .get_mut(&id)
@@ -430,6 +439,7 @@ impl<T: Transport> NetworkHub<T> {
             .saturating_mul(2)
             .saturating_add(policy.scope.sections.len() as u64 * 8192)
             .saturating_add(self.limits.movement_bytes)
+            .saturating_add(control_bytes)
             .saturating_add(self.limits.outstanding as u64 * 512);
         let mut growth = peer
             .memory
@@ -507,6 +517,7 @@ impl<T: Transport> NetworkHub<T> {
         wire::encode(&message, &mut bytes, limits.budget, limits.codec)?;
         peer.transport.send(bytes)
     }
+    #[allow(clippy::too_many_arguments)]
     fn handle<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>(
         peer: &mut Peer<T>,
         sessions: &mut SessionRegistry,
@@ -514,6 +525,8 @@ impl<T: Transport> NetworkHub<T> {
         message: ClientMessage,
         limits: NetworkLimits,
         following: bool,
+        peer_id: u128,
+        control: &mut Option<control::ControlPlane>,
     ) -> Result<(), Fault> {
         match message {
             ClientMessage::Hello {
@@ -660,6 +673,12 @@ impl<T: Transport> NetworkHub<T> {
                 Ok(())
             }
             ClientMessage::Move(input) => Self::receive_movement(peer, server, input, limits),
+            ClientMessage::ControlOffer { api } => {
+                Self::offer_control(peer_id, peer, server, control, api, limits)
+            }
+            ClientMessage::Control { seq, payload } => {
+                Self::receive_control(peer, server, control, seq, payload, limits)
+            }
             ClientMessage::Close => {
                 peer.closed = true;
                 peer.transport.close();
@@ -688,6 +707,8 @@ impl<T: Transport> NetworkHub<T> {
             server.poll_residency(self)?;
         }
         let tick = server.authority()?.resume_point().tick;
+        let control_bytes = self.control_reserve();
+        let mut control = self.control.take();
         let mut users: BTreeSet<_> = self
             .peers
             .values()
@@ -700,7 +721,7 @@ impl<T: Transport> NetworkHub<T> {
             .filter(|peer| !peer.closed)
             .filter_map(|peer| peer.player.as_ref().map(|player| player.entity))
             .collect();
-        for peer in self.peers.values_mut() {
+        for (peer_id, peer) in self.peers.iter_mut() {
             if peer.closed {
                 continue;
             }
@@ -754,7 +775,8 @@ impl<T: Transport> NetworkHub<T> {
                             .saturating_mul(2)
                             .saturating_add(grant.scope.sections.len() as u64 * 8192)
                             .saturating_add(self.limits.movement_bytes)
-                            .saturating_add(self.limits.outstanding as u64 * 512);
+                            .saturating_add(self.limits.outstanding as u64 * 512)
+                            .saturating_add(control_bytes);
                         if let Some(memory) = &mut peer.memory {
                             memory.resize(policy_bytes)?;
                         }
@@ -779,10 +801,15 @@ impl<T: Transport> NetworkHub<T> {
                         message,
                         self.limits,
                         following,
+                        *peer_id,
+                        &mut control,
                     )?;
                     if peer.closed {
                         return Ok(());
                     }
+                }
+                if let Some(plane) = control.as_mut() {
+                    Self::deliver_control(*peer_id, peer, plane, self.limits)?;
                 }
                 if let Some(viewer) = peer.viewer {
                     if let Some(config) = self.follow
@@ -851,6 +878,7 @@ impl<T: Transport> NetworkHub<T> {
                 peer.transport.close();
             }
         }
+        self.control = control;
         self.cleanup(server)?;
         self.update_follow_residency(server)
     }
@@ -866,6 +894,9 @@ impl<T: Transport> NetworkHub<T> {
             .collect();
         for id in dead {
             let mut peer = self.peers.remove(&id).expect("peer exists");
+            if let Some(plane) = &mut self.control {
+                Self::release_control(plane, id, &peer);
+            }
             peer.transport.close();
             if let Some(viewer) = peer.viewer {
                 if let Some(child) = peer.player.as_ref().and_then(|p| p.viewer) {

@@ -174,41 +174,88 @@ pub fn spawn_players(
                 torse_world::PlayerMotion::default().fields(),
             )
             .map_err(|e| Fault::invalid_data(e.to_string()))?;
+        if schemas.get(&key("items:schema/place")).is_some() {
+            let catalog = torse_items::fixture_catalog(world.registry())
+                .map_err(|e| Fault::invalid_data(format!("items: {e:?}")))?;
+            let stock = catalog
+                .starter(36)
+                .map_err(|e| Fault::invalid_data(format!("stock: {e:?}")))?;
+            world
+                .entities_mut()
+                .components_mut(handle)
+                .expect("player")
+                .insert(&schemas, &torse_inventory::schema(), stock.fields())
+                .map_err(|e| Fault::invalid_data(e.to_string()))?;
+        }
         ids.push(id);
     }
     Ok(ids)
 }
 pub fn world() -> Result<(WorldAuthority, ActionService), Fault> {
-    world_with_catalog(
-        torse_inventory::ItemCatalog::new([(key("base:stone"), 64)])
-            .map_err(|e| Fault::invalid_data(format!("catalog: {e:?}")))?,
+    assemble(
+        torse_inventory::ItemCatalog::new(
+            ["base:stone", "base:glass_slab", "base:plant"].map(|id| (key(id), 64)),
+        )
+        .map_err(|e| Fault::invalid_data(format!("catalog: {e:?}")))?,
+        true,
     )
 }
 /// Freeze the exact item rules used by native handlers into recovery and admission.
 pub fn world_with_catalog(
     catalog: torse_inventory::ItemCatalog,
 ) -> Result<(WorldAuthority, ActionService), Fault> {
+    assemble(catalog, false)
+}
+fn assemble(
+    catalog: torse_inventory::ItemCatalog,
+    items: bool,
+) -> Result<(WorldAuthority, ActionService), Fault> {
     let mut pack = m0_fixture_pack();
     block_actions::register_content(&mut pack);
     torse_inventory::register_content(&mut pack);
+    if items {
+        torse_items::register_content(&mut pack);
+    }
     let content = compile(pack).map_err(|e| Fault::invalid_data(format!("demo content: {e:?}")))?;
-    let compatibility = catalog.bind_compatibility(Compatibility {
+    let registry =
+        BlockStateRegistry::build(&content).map_err(|e| Fault::invalid_data(e.to_string()))?;
+    let item_catalog = if items {
+        Some(
+            torse_items::fixture_catalog(&registry)
+                .map_err(|e| Fault::invalid_data(format!("items: {e:?}")))?,
+        )
+    } else {
+        None
+    };
+    let base = Compatibility {
         authority_schema: 4,
         rules_digest: content.authority_digest,
         content_digest: content.presentation_digest,
-    });
+    };
+    let compatibility = item_catalog.as_ref().map_or_else(
+        || catalog.bind_compatibility(base),
+        |items| items.bind_compatibility(base),
+    );
     let (schemas, compatibility) =
         ComponentSchemas::assemble(&content, ComponentConfiguration::default(), compatibility)
             .map_err(|error| Fault::invalid_data(error.to_string()))?;
-    let mut handlers = block_actions::handlers();
+    let mut handlers = if items {
+        torse_items::block_handlers()
+    } else {
+        block_actions::handlers()
+    };
     handlers.extend(torse_inventory::handlers(catalog.clone()));
     let mut actions = block_actions::descriptors();
     actions.extend(torse_inventory::descriptors());
+    if let Some(catalog) = item_catalog {
+        handlers.extend(torse_items::handlers(catalog));
+        actions.extend(torse_items::descriptors());
+    }
     let service = ActionService::bind(actions, handlers, &schemas)
         .map_err(|e| Fault::invalid_data(e.to_string()))?;
     let mut world = WorldAuthority::new(
         WORLD,
-        BlockStateRegistry::build(&content).map_err(|e| Fault::invalid_data(e.to_string()))?,
+        registry,
         schemas.clone(),
         16,
         WorldBounds::new(0, 32).expect("bounds"),

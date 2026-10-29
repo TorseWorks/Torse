@@ -2,7 +2,7 @@
 
 包名：`torse-net`。提供有界内存传输、非阻塞TCP、会话序号/速率和原子客户端镜像；应用层NetworkHub接入真实权威与持久门槛。
 
-TcpTransport提供双向TLS，证书及应用协议验证完成后才报告对端指纹。记录I/O和帧均有界，关闭时释放预留。配置见[用户认证](../../benchmarks/M5-user-authentication.md)。
+TcpTransport提供双向TLS，证书及应用协议验证完成后才报告对端指纹。记录I/O和帧均有界，关闭时释放预留。配置见[用户认证](../../benchmarks/archive/network/M5-user-authentication.md)。
 
 | 文件 | 职责 |
 |---|---|
@@ -17,4 +17,4 @@ MemoryTransport和TcpTransport都提供独立close，清空尚未发送的数据
 
 ReplicaMirror先校验完整新状态再替换，拒绝错误Binding、重复/缺失ReplicaSeq、无效字典、Section尺寸或实体位置。连接关闭后应用应丢弃镜像并重新获取基线，不能继续使用旧权限状态。
 
-端到端见[执行与网络记录](../../benchmarks/B6-B7-execution-network.md)及[权威移动](../../benchmarks/M5-authoritative-movement.md)。用户策略、移动和持久确认由应用层装配；当前使用固定内容和有限范围，UDP、多通道仍待接入。
+端到端见[执行与网络记录](../../benchmarks/archive/network/B6-B7-execution-network.md)及[权威移动](../../benchmarks/archive/network/M5-authoritative-movement.md)。用户策略、移动和持久确认由应用层装配；当前使用固定内容和有限范围，UDP、多通道仍待接入。

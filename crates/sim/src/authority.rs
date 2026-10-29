@@ -188,7 +188,16 @@ impl WorldAuthority {
         load: bool,
         budget: torse_types::OutputBudget,
     ) -> Result<crate::streaming::PreparedSection, torse_types::Fault> {
-        crate::streaming::prepare(self, page, load, budget)
+        crate::streaming::prepare(self, page, load, false, budget)
+    }
+
+    /// Prepare trusted generated cells and consecutive new identities in one publication.
+    pub fn prepare_generated_section(
+        &self,
+        page: &Snapshot,
+        budget: torse_types::OutputBudget,
+    ) -> Result<crate::streaming::PreparedSection, torse_types::Fault> {
+        crate::streaming::prepare(self, page, true, true, budget)
     }
 
     pub fn publish_section(
@@ -526,6 +535,27 @@ impl<'a> Recovery<'a> {
         load: bool,
         budget: torse_types::OutputBudget,
     ) -> Result<(), torse_types::Fault> {
+        self.replay_section_impl(changes, page, load, false, budget)
+    }
+
+    /// Replay a generated page with the same allocator checks as its original publication.
+    pub fn replay_generated_section(
+        &mut self,
+        changes: &ChangeSet,
+        page: &Snapshot,
+        budget: torse_types::OutputBudget,
+    ) -> Result<(), torse_types::Fault> {
+        self.replay_section_impl(changes, page, true, true, budget)
+    }
+
+    fn replay_section_impl(
+        &mut self,
+        changes: &ChangeSet,
+        page: &Snapshot,
+        load: bool,
+        generated: bool,
+        budget: torse_types::OutputBudget,
+    ) -> Result<(), torse_types::Fault> {
         let invalid = || torse_types::Fault::invalid_data("illegal section recovery transition");
         if changes.meta.cursor.world != self.world
             || changes.meta.previous != self.seq
@@ -551,7 +581,11 @@ impl<'a> Recovery<'a> {
             entities: restored.entities,
             coordinator,
         };
-        let prepared = world.prepare_section(page, load, budget)?;
+        let prepared = if generated {
+            world.prepare_generated_section(page, budget)?
+        } else {
+            world.prepare_section(page, load, budget)?
+        };
         if prepared.meta() != changes.meta {
             return Err(invalid());
         }

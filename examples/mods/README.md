@@ -75,7 +75,7 @@ cargo test -p torse-mod-host --features package --all-targets --locked
 cargo test -p torse-server --features mods --all-targets --locked
 ```
 
-包格式、跨包依赖、Merkle锁与工具验证见[包工具记录](../../benchmarks/M4-mod-package.md)；持久唤醒与恢复见[持久Mod执行](../../benchmarks/M4-mod-durable.md)，跨模块共同提交见[Mod原子执行](../../benchmarks/M4-mod-atomic.md)。这些记录描述各次验证时的范围，当前实现以代码和本说明为准。
+包格式、跨包依赖、Merkle锁与工具验证见[包工具记录](../../benchmarks/archive/mods/M4-mod-package.md)；持久唤醒与恢复见[持久Mod执行](../../benchmarks/archive/mods/M4-mod-durable.md)，跨模块共同提交见[Mod原子执行](../../benchmarks/archive/mods/M4-mod-atomic.md)。这些记录描述各次验证时的范围，当前实现以代码和本说明为准。
 
 包API、WIT与内容格式仍在演进，没有通用兼容承诺。依赖包需要一同提供给装载器，尚无远程包发现或注册表。SDK通过仓库路径引用，模板暂不能直接作为独立安装包使用。
 

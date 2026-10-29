@@ -1,5 +1,6 @@
 //! Incremental derived lighting. The scene thread alone validates and publishes.
 use super::*;
+use std::cell::RefCell;
 use torse_types::{Binding, EvictionRank, MemoryClass, MemoryLease, MemoryPool};
 use torse_world_services::lighting::{LightJob, LightLimits, LightSection};
 mod preview;
@@ -13,6 +14,96 @@ const LIMITS: LightLimits = LightLimits {
     frontier: 1_000_000,
     bytes: WORK_BYTES,
 };
+
+pub(super) struct Inputs {
+    binding: Binding,
+    content: torse_types::Digest,
+    side: u32,
+    bounds: WorldBounds,
+    wanted: Vec<SectionPos>,
+    observations: Vec<(SectionPos, Option<torse_types::Revision>, bool, Option<u64>)>,
+}
+impl Inputs {
+    pub fn changed_sections(&self, next: &Self) -> Option<Vec<SectionPos>> {
+        if self.binding != next.binding
+            || self.content != next.content
+            || self.side != next.side
+            || self.bounds != next.bounds
+        {
+            return None;
+        }
+        let mut changed = Vec::new();
+        let (mut a, mut b) = (0, 0);
+        while a < self.observations.len() || b < next.observations.len() {
+            match (self.observations.get(a), next.observations.get(b)) {
+                (Some(old), Some(new)) if old.0 == new.0 => {
+                    if old != new {
+                        changed.push(old.0);
+                    }
+                    a += 1;
+                    b += 1;
+                }
+                (Some(old), Some(new)) if old.0 < new.0 => {
+                    changed.push(old.0);
+                    a += 1;
+                }
+                (Some(_), Some(new)) | (None, Some(new)) => {
+                    changed.push(new.0);
+                    b += 1;
+                }
+                (Some(old), None) => {
+                    changed.push(old.0);
+                    a += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        Some(changed)
+    }
+    fn observation(
+        scene: &Scene,
+        pos: SectionPos,
+    ) -> (SectionPos, Option<torse_types::Revision>, bool, Option<u64>) {
+        let store = scene.authority.store();
+        (
+            pos,
+            store.revision(pos),
+            matches!(
+                store.phase(pos),
+                Some(torse_world::SectionPhase::Ready | torse_world::SectionPhase::Active)
+            ),
+            scene.load_generations.get(&pos).copied(),
+        )
+    }
+    pub fn capture(binding: Binding, scene: &Scene) -> Self {
+        Self {
+            binding,
+            content: scene.authority.registry().authority_digest(),
+            side: scene.side,
+            bounds: scene.authority.store().bounds(),
+            wanted: scene.sections.clone(),
+            observations: scene
+                .authority
+                .store()
+                .positions()
+                .map(|pos| Self::observation(scene, pos))
+                .collect(),
+        }
+    }
+    pub fn matches(&self, binding: Binding, scene: &Scene) -> bool {
+        self.binding == binding
+            && self.content == scene.authority.registry().authority_digest()
+            && self.side == scene.side
+            && self.bounds == scene.authority.store().bounds()
+            && self.wanted == scene.sections
+            && self.observations.len() == scene.authority.store().len()
+            && self
+                .observations
+                .iter()
+                .zip(scene.authority.store().positions())
+                .all(|(old, pos)| *old == Self::observation(scene, pos))
+    }
+}
 
 struct Pending {
     target: SectionPos,
@@ -41,17 +132,28 @@ pub(super) struct Lighting {
     entries: [BTreeMap<SectionPos, Cached>; 2],
     cache_bytes: [usize; 2],
     pending: Option<Pending>,
+    urgent: [Option<SectionPos>; 27],
     memory: Option<MemoryPool>,
+    inputs: Option<Inputs>,
     pub generation: u64,
 }
 impl Lighting {
+    pub fn changed_sections(&self, since: u64) -> impl Iterator<Item = SectionPos> + '_ {
+        self.entries.iter().flat_map(move |entries| {
+            entries
+                .iter()
+                .filter_map(move |(pos, entry)| (entry.generation > since).then_some(*pos))
+        })
+    }
     pub fn new(binding: Binding, memory: Option<MemoryPool>) -> Result<Self, String> {
         Ok(Self {
             binding,
             entries: [BTreeMap::new(), BTreeMap::new()],
             cache_bytes: [0; 2],
             pending: None,
+            urgent: [None; 27],
             memory,
+            inputs: None,
             generation: 0,
         })
     }
@@ -65,26 +167,51 @@ impl Lighting {
     pub fn step(&mut self, scene: &Scene, work: usize) -> Result<(), String> {
         let store = scene.authority.store();
         let registry = scene.authority.registry();
-        for kind in 0..2 {
-            let removed: Vec<_> = self.entries[kind]
-                .iter()
-                .filter_map(|(pos, entry)| {
-                    (!scene.sections.contains(pos)
-                        || entry.load != scene.load_generations.get(pos).copied())
-                    .then_some(*pos)
-                })
-                .collect();
-            for pos in removed {
-                self.advance_generation()?;
-                if let Some(old) = self.entries[kind].remove(&pos) {
-                    self.cache_bytes[kind] -= old.bytes();
+        if !self
+            .inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.matches(self.binding, scene))
+        {
+            let next = Inputs::capture(self.binding, scene);
+            let changed = self
+                .inputs
+                .as_ref()
+                .and_then(|old| old.changed_sections(&next));
+            let halo = u64::from(torse_world_services::lighting::MAX_LIGHT)
+                .div_ceil(u64::from(scene.side));
+            let wanted: std::collections::BTreeSet<_> = scene.sections.iter().copied().collect();
+            for kind in 0..2 {
+                let removed: Vec<_> = self.entries[kind]
+                    .iter()
+                    .filter_map(|(pos, entry)| {
+                        (!wanted.contains(pos)
+                            || entry.load != scene.load_generations.get(pos).copied())
+                        .then_some(*pos)
+                    })
+                    .collect();
+                for pos in removed {
+                    self.advance_generation()?;
+                    if let Some(old) = self.entries[kind].remove(&pos) {
+                        self.cache_bytes[kind] -= old.bytes();
+                    }
+                }
+                // Every source lies in this conservative transport footprint.
+                // Invalidate by the changed source set; unchanged caches need
+                // no repeated traversal of their overlapping dependency lists.
+                // Reloads invalidate even if a source reuses its old revision.
+                for (target, entry) in &mut self.entries[kind] {
+                    if changed.as_ref().is_none_or(|changed| {
+                        changed.iter().any(|pos| {
+                            pos.x.abs_diff(target.x) <= halo
+                                && pos.z.abs_diff(target.z) <= halo
+                                && (kind == 1 || pos.y.abs_diff(target.y) <= halo)
+                        })
+                    }) {
+                        entry.current = false;
+                    }
                 }
             }
-            // Validate each dependency set once per update, rather than once
-            // for every neighboring mesh stamp captured in the frame.
-            for entry in self.entries[kind].values_mut() {
-                entry.current = entry.data.validate(self.binding, store, registry);
-            }
+            self.inputs = Some(next);
         }
         if let Some(pending) = self.pending.as_mut() {
             if !scene.sections.contains(&pending.target) {
@@ -136,10 +263,11 @@ impl Lighting {
             };
             let changed = self.entries[pending.kind].get(&pending.target).map_or_else(
                 || {
-                    result
-                        .levels()
-                        .iter()
-                        .any(|v| *v != if pending.kind == 1 { 15 } else { 0 })
+                    pending.kind == 1
+                        || result
+                            .levels()
+                            .iter()
+                            .any(|v| *v != if pending.kind == 1 { 15 } else { 0 })
                 },
                 |old| old.levels.as_ref() != result.levels(),
             );
@@ -171,7 +299,13 @@ impl Lighting {
             );
             return Ok(());
         }
-        for target in &scene.sections {
+        for target in self
+            .urgent
+            .iter()
+            .flatten()
+            .filter(|target| scene.sections.contains(target))
+            .chain(scene.sections.iter())
+        {
             if store.revision(*target).is_none()
                 || !matches!(
                     store.phase(*target),
@@ -234,6 +368,7 @@ impl Lighting {
             grids: [&self.entries[0], &self.entries[1]],
             side: scene.side,
             bounds: scene.authority.store().bounds(),
+            direct_sky: RefCell::new(BTreeMap::new()),
         }
     }
     pub fn stamp(&self, target: SectionPos) -> [u64; 2] {
@@ -248,8 +383,62 @@ pub(super) struct View<'a> {
     grids: [&'a BTreeMap<SectionPos, Cached>; 2],
     side: u32,
     bounds: WorldBounds,
+    // One immutable mesh snapshot shares bounded fallback column samples.
+    direct_sky: RefCell<BTreeMap<(i64, i64), Vec<u8>>>,
 }
 impl View<'_> {
+    fn sky(&self, scene: &Scene, pos: BlockPos) -> u8 {
+        if let Some(level) = self.light(1, pos) {
+            return level;
+        }
+        // Missing derived data must not imply daylight underground. This
+        // presentation fallback only admits direct sky through known cells;
+        // exact jobs remain responsible for lateral propagation and queries.
+        let Ok(height) =
+            usize::try_from(i128::from(self.bounds.max_y) - i128::from(self.bounds.min_y))
+        else {
+            return 0;
+        };
+        if height > 256 {
+            return 0;
+        }
+        let mut columns = self.direct_sky.borrow_mut();
+        let column = (pos.x, pos.z);
+        if !columns.contains_key(&column) {
+            if columns.len() == 512 {
+                return 0;
+            }
+            let mut levels = vec![0; height];
+            let mut level = 15u8;
+            for index in (0..height).rev() {
+                let y = self.bounds.min_y + index as i64;
+                let absorption = match scene
+                    .authority
+                    .store()
+                    .query(BlockPos::new(pos.x, y, pos.z))
+                {
+                    TerrainQuery::Ready(state) if state.is_empty() => 0,
+                    TerrainQuery::Ready(state) => scene
+                        .authority
+                        .registry()
+                        .definition(state)
+                        .map_or(15, |definition| {
+                            (definition.light_transport.absorption * 15.0)
+                                .ceil()
+                                .clamp(0.0, 15.0) as u8
+                        }),
+                    _ => 15,
+                };
+                level = level.saturating_sub(absorption);
+                levels[index] = level;
+                if level == 0 {
+                    break;
+                }
+            }
+            columns.insert(column, levels);
+        }
+        columns[&column][(pos.y - self.bounds.min_y) as usize]
+    }
     fn light(&self, kind: usize, pos: BlockPos) -> Option<u8> {
         if !self.bounds.contains_y(pos.y) {
             return Some(if kind == 1 && pos.y >= self.bounds.max_y {
@@ -266,6 +455,15 @@ impl View<'_> {
             .map(|entry| entry.levels[torse_world::linear_index(self.side, local)])
     }
     pub fn shade(&self, scene: &Scene, pos: BlockPos, block: &mut RenderBlock) {
+        if block.cross {
+            // Both sides of thin foliage share the open cell's illumination.
+            // Opaque neighboring cells do not describe either diagonal plane.
+            let light = (f32::from(self.light(0, pos).unwrap_or(0)) / 15.0)
+                .max(f32::from(self.sky(scene, pos)) / 15.0)
+                .max(0.08);
+            block.face_shades = Some([[(light * 255.0).round() as u8; 4]; 6]);
+            return;
+        }
         let mut faces = [[255; 4]; 6];
         for face in torse_render::Face::ALL {
             let normal = face.normal();
@@ -302,10 +500,7 @@ impl View<'_> {
                 .light(0, pos)
                 .unwrap_or(0)
                 .max(self.light(0, outside).unwrap_or(0));
-            // Uncomputed presentation uses the original directional shading.
-            // A real, resolved zero still represents darkness. Missing terrain
-            // remains opaque to the light solver and to collision queries.
-            let sky = self.light(1, outside).unwrap_or(15);
+            let sky = self.sky(scene, outside);
             let directional = match face {
                 torse_render::Face::PosY => 1.0,
                 torse_render::Face::NegY => 0.5,
@@ -364,7 +559,35 @@ impl Scene {
     // propagation is disposable presentation; exact jobs still validate the
     // committed terrain and replace it with a complete result.
     pub(super) fn preview_lighting(&mut self, positions: &[BlockPos]) -> Result<(), String> {
+        if positions.is_empty() {
+            return Ok(());
+        }
         if let Some(mut lighting) = self.lighting.take() {
+            // Local edits get exact relighting before unrelated streaming work.
+            // The fixed neighborhood cannot grow with edit count or view range.
+            lighting.urgent.fill(None);
+            if let Some(center) = positions
+                .first()
+                .and_then(|p| p.to_section(self.side).ok())
+                .map(|p| p.0)
+            {
+                let mut index = 0;
+                for y in -1..=1 {
+                    for z in -1..=1 {
+                        for x in -1..=1 {
+                            lighting.urgent[index] = center
+                                .x
+                                .checked_add(x)
+                                .zip(center.y.checked_add(y))
+                                .zip(center.z.checked_add(z))
+                                .map(|((x, y), z)| SectionPos::new(x, y, z));
+                            index += 1;
+                        }
+                    }
+                }
+                lighting.urgent.swap(0, 13);
+            }
+            lighting.pending = None;
             let result = lighting.preview_opened(self, positions);
             self.lighting = Some(lighting);
             result?;
@@ -475,6 +698,191 @@ mod tests {
             }
         }
         panic!("derived light did not finish");
+    }
+    #[test]
+    fn first_full_sky_grid_invalidates_a_previously_conservative_preview() {
+        let mut scene = Scene::new(0).unwrap();
+        scene.generator = None;
+        scene
+            .authority
+            .store_mut()
+            .unload(SectionPos::ZERO)
+            .unwrap();
+        scene
+            .install_generated(SectionPos::ZERO, Section::empty(16).unwrap())
+            .unwrap();
+        let plant = scene
+            .authority
+            .registry()
+            .default_state(&key("base:plant"))
+            .unwrap();
+        scene
+            .authority
+            .store_mut()
+            .edit(BlockPos::new(8, 8, 8), plant)
+            .unwrap();
+        scene.enable_lighting().unwrap();
+        scene.refresh_meshes();
+        assert!(
+            scene.meshes[&SectionPos::ZERO]
+                .1
+                .shades
+                .iter()
+                .all(|v| *v < 0.2)
+        );
+        for y in 1..4 {
+            scene
+                .install_generated(SectionPos::new(0, y, 0), Section::empty(16).unwrap())
+                .unwrap();
+        }
+        resolve(&mut scene);
+        assert!(scene.lighting.as_ref().unwrap().stamp(SectionPos::ZERO)[1] > 0);
+        assert_eq!(scene.refresh_meshes(), [SectionPos::ZERO]);
+        assert!(
+            scene.meshes[&SectionPos::ZERO]
+                .1
+                .shades
+                .iter()
+                .all(|v| *v > 0.8)
+        );
+    }
+    #[test]
+    fn uncomputed_neighbor_does_not_turn_a_sealed_tunnel_into_daylight() {
+        let mut scene = scene();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        for x in -16..48 {
+            for z in -16..32 {
+                scene
+                    .authority
+                    .store_mut()
+                    .edit(BlockPos::new(x, 12, z), stone)
+                    .unwrap();
+            }
+        }
+        for x in [15, 16] {
+            for y in [1, 13] {
+                scene
+                    .authority
+                    .store_mut()
+                    .edit(BlockPos::new(x, y, 8), stone)
+                    .unwrap();
+            }
+        }
+        scene.enable_lighting().unwrap();
+        resolve(&mut scene);
+        // A newly visible neighboring section has terrain before its light job finishes.
+        scene.lighting.as_mut().unwrap().entries[1].remove(&SectionPos::new(1, 0, 0));
+        for x in [15, 16] {
+            let underground = block(&scene, BlockPos::new(x, 1, 8)).face_shades.unwrap()[4];
+            assert!(
+                underground.iter().all(|value| *value < 40),
+                "x={x}: {underground:?}"
+            );
+            let outdoors = block(&scene, BlockPos::new(x, 13, 8)).face_shades.unwrap()[4];
+            assert!(
+                outdoors.iter().all(|value| *value > 100),
+                "x={x}: {outdoors:?}"
+            );
+        }
+    }
+    #[test]
+    fn crossed_foliage_samples_its_open_cell_equally_for_both_planes() {
+        let mut scene = scene();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        let plant = scene
+            .authority
+            .registry()
+            .default_state(&key("base:plant"))
+            .unwrap();
+        for x in [15, 16] {
+            scene
+                .authority
+                .store_mut()
+                .edit(BlockPos::new(x, 8, 8), plant)
+                .unwrap();
+            scene
+                .authority
+                .store_mut()
+                .edit(BlockPos::new(x - 1, 8, 8), stone)
+                .unwrap();
+        }
+        // Restore the first plant overwritten by the second plant's neighbor.
+        scene
+            .authority
+            .store_mut()
+            .edit(BlockPos::new(15, 8, 8), plant)
+            .unwrap();
+        scene
+            .authority
+            .store_mut()
+            .edit(BlockPos::new(17, 8, 8), stone)
+            .unwrap();
+        scene.enable_lighting().unwrap();
+        resolve(&mut scene);
+        for x in [15, 16] {
+            let sample = block(&scene, BlockPos::new(x, 8, 8));
+            let shades = sample.face_shades.unwrap();
+            assert_eq!(shades[0], shades[1]);
+            assert!(
+                shades[0].iter().all(|value| *value > 200),
+                "x={x}: {shades:?}"
+            );
+        }
+    }
+    #[test]
+    fn reloaded_external_halo_invalidates_reused_lighting_validation() {
+        let mut scene = scene();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        let glass = scene
+            .authority
+            .registry()
+            .default_state(&key("base:glass"))
+            .unwrap();
+        for x in -16..48 {
+            for z in -16..32 {
+                scene
+                    .authority
+                    .store_mut()
+                    .edit(BlockPos::new(x, 12, z), stone)
+                    .unwrap();
+            }
+        }
+        let wall = BlockPos::new(30, 8, 8);
+        scene.authority.store_mut().edit(wall, stone).unwrap();
+        scene.enable_lighting().unwrap();
+        resolve(&mut scene);
+        assert!(
+            block(&scene, wall).face_shades.unwrap()[1]
+                .iter()
+                .all(|value| *value < 40)
+        );
+        for _ in 0..4 {
+            assert!(scene.refresh_lighting(1).unwrap());
+        }
+        let external = SectionPos::new(2, 0, 0);
+        scene.authority.store_mut().unload(external).unwrap();
+        scene.load_generations.remove(&external);
+        let mut section = Section::empty(16).unwrap();
+        section.set(LocalPos { x: 0, y: 8, z: 8 }, glass).unwrap();
+        scene.install_generated(external, section).unwrap();
+        resolve(&mut scene);
+        assert!(
+            block(&scene, wall).face_shades.unwrap()[1]
+                .iter()
+                .all(|value| *value > 200)
+        );
     }
     fn block(scene: &Scene, pos: BlockPos) -> RenderBlock {
         let view = scene.lighting.as_ref().unwrap().view(scene);
@@ -805,6 +1213,162 @@ mod tests {
             block(&scene, BlockPos::new(9, 8, 8)).face_shades.unwrap()[0]
                 .iter()
                 .all(|v| *v < 40)
+        );
+    }
+
+    #[test]
+    fn sealing_the_only_opening_darkens_immediately_and_reopening_restores_light() {
+        for start_x in [6, 14] {
+            let mut scene = scene();
+            let stone = scene
+                .authority
+                .registry()
+                .default_state(&key("base:stone"))
+                .unwrap();
+            for x in start_x..=start_x + 4 {
+                for y in 5..=10 {
+                    for z in 5..=9 {
+                        if x == start_x || x == start_x + 4 || y == 5 || y == 10 || z == 5 || z == 9
+                        {
+                            scene
+                                .authority
+                                .store_mut()
+                                .edit(BlockPos::new(x, y, z), stone)
+                                .unwrap();
+                        }
+                    }
+                }
+            }
+            let hole = BlockPos::new(start_x + 2, 10, 7);
+            let inside = BlockPos::new(start_x + 2, 8, 7);
+            scene
+                .authority
+                .store_mut()
+                .edit(hole, BlockStateId::EMPTY)
+                .unwrap();
+            scene.enable_lighting().unwrap();
+            resolve(&mut scene);
+            assert!(
+                scene
+                    .lighting
+                    .as_ref()
+                    .unwrap()
+                    .view(&scene)
+                    .light(1, inside)
+                    .unwrap()
+                    > 0
+            );
+            scene.apply_edit(true, &key("base:stone"), hole, 0).unwrap();
+            assert_eq!(
+                scene
+                    .lighting
+                    .as_ref()
+                    .unwrap()
+                    .view(&scene)
+                    .light(1, inside),
+                Some(0)
+            );
+            resolve(&mut scene);
+            assert_eq!(
+                scene
+                    .lighting
+                    .as_ref()
+                    .unwrap()
+                    .view(&scene)
+                    .light(1, inside),
+                Some(0)
+            );
+            scene
+                .apply_edit(false, &key("base:stone"), hole, 0)
+                .unwrap();
+            assert!(
+                scene
+                    .lighting
+                    .as_ref()
+                    .unwrap()
+                    .view(&scene)
+                    .light(1, inside)
+                    .unwrap()
+                    > 0
+            );
+            let second = BlockPos::new(start_x + 1, 10, 7);
+            scene
+                .apply_edit(false, &key("base:stone"), second, 0)
+                .unwrap();
+            scene.apply_edit(true, &key("base:stone"), hole, 0).unwrap();
+            assert!(
+                scene
+                    .lighting
+                    .as_ref()
+                    .unwrap()
+                    .view(&scene)
+                    .light(1, inside)
+                    .unwrap()
+                    > 0
+            );
+            scene
+                .apply_edit(true, &key("base:stone"), second, 0)
+                .unwrap();
+            assert_eq!(
+                scene
+                    .lighting
+                    .as_ref()
+                    .unwrap()
+                    .view(&scene)
+                    .light(1, inside),
+                Some(0)
+            );
+        }
+    }
+
+    #[test]
+    fn reloaded_emitter_invalidates_cached_emission() {
+        let mut scene = scene();
+        let external = SectionPos::new(2, 0, 0);
+        let sample = BlockPos::new(31, 8, 8);
+        let glass = scene
+            .authority
+            .registry()
+            .default_state(&key("base:glass"))
+            .unwrap();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        scene
+            .authority
+            .store_mut()
+            .edit(BlockPos::new(47, 0, 15), stone)
+            .unwrap();
+        scene.enable_lighting().unwrap();
+        resolve(&mut scene);
+        assert_eq!(
+            scene
+                .lighting
+                .as_ref()
+                .unwrap()
+                .view(&scene)
+                .light(0, sample),
+            Some(0)
+        );
+        let revision = scene.authority.store().revision(external);
+        scene.authority.store_mut().unload(external).unwrap();
+        scene.load_generations.remove(&external);
+        scene
+            .install_generated(external, Section::new(16, glass).unwrap())
+            .unwrap();
+        assert_ne!(scene.authority.store().revision(external), revision);
+        resolve(&mut scene);
+        assert!(
+            scene
+                .lighting
+                .as_ref()
+                .unwrap()
+                .view(&scene)
+                .light(0, sample)
+                .unwrap()
+                > 0
         );
     }
 

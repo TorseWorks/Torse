@@ -31,6 +31,8 @@ use torse_render::{FrameBudget, FrameLimits, SectionUploadQueue};
 use torse_sim::PresentationClock;
 use torse_types::{BlockPos, ContentKey, SectionPos};
 use torse_world::Position;
+mod items;
+mod settings;
 
 /// How far the pick ray reaches, in blocks.
 const PICK_RANGE: f32 = 64.0;
@@ -57,6 +59,8 @@ const WALKER_EYE_OFFSET: f64 = 0.7;
 /// Startup parameters for the windowed run.
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
+    pub preferences: crate::settings::Settings,
+    pub settings_tab: crate::settings::Tab,
     /// Explicit section interest; absent keeps the local demonstration scope.
     pub sections: Option<Vec<torse_types::SectionPos>>,
     pub tls: Option<crate::net::TlsClient>,
@@ -75,6 +79,9 @@ pub struct WindowConfig {
     pub screenshot: Option<String>,
     /// Fly forward automatically instead of waiting for keys.
     pub autoplay: bool,
+    /// Ignore interactive input and leave the cursor free during finite measurement.
+    pub benchmark: bool,
+    pub benchmark_motion: Option<crate::camera::BenchmarkMotion>,
     /// Start in walk mode with a player entity on the ground.
     pub walk: bool,
     /// Connect to a standalone server and mirror its authorized projection.
@@ -82,6 +89,7 @@ pub struct WindowConfig {
     /// Captured-look sensitivity multiplier; scroll steps multiply it in
     /// walk mode.
     pub sensitivity: f64,
+    pub fps_limit: Option<u16>,
     /// Send one edit request far outside the approved scope, for acceptance
     /// evidence that the server rejects out-of-scope targets.
     pub probe_outside: bool,
@@ -151,10 +159,17 @@ pub struct WindowSummary {
     pub stream_frame_us: u64,
     /// Mean frame time containing mesh rebuilds.
     pub rebuild_frame_us: u64,
+    /// Mean main-thread streaming and mesh admission time.
+    pub cpu_us: u64,
+    /// Mean terrain-buffer upload time.
+    pub upload_us: u64,
+    /// Mean render encoding and presentation time.
+    pub present_us: u64,
     pub cpu: crate::scene::BackgroundStats,
 }
 
 struct Gpu {
+    present_modes: Vec<wgpu::PresentMode>,
     ui: crate::ui::Layer,
     context: GpuContext,
     surface: Surface<'static>,
@@ -167,10 +182,14 @@ struct Gpu {
 }
 
 struct WindowApp {
+    preferences_dirty: Option<Instant>,
+    debug_lines: Vec<String>,
+    current_fps: u32,
     work_budget: FrameBudget,
     pending_uploads: SectionUploadQueue,
     ui: crate::ui::State,
     config: WindowConfig,
+    frame_pacer: crate::frame_pacing::FramePacer,
     scene: Option<Scene>,
     camera: Option<FlyCamera>,
     input: InputState,
@@ -215,6 +234,8 @@ struct WindowApp {
     fps_origin: Instant,
     fps_frames: u32,
     frame_total_us: u128,
+    benchmark_mark_us: u128,
+    benchmark_stages: [u128; 4],
     frame_max_us: u128,
     frame_count: u32,
     streams_mark: usize,
@@ -223,6 +244,12 @@ struct WindowApp {
     rebuilds_mark: usize,
     rebuild_total_us: u128,
     rebuild_count: u32,
+    cpu_total_us: u128,
+    cpu_samples: u32,
+    upload_total_us: u128,
+    upload_samples: u32,
+    present_total_us: u128,
+    present_samples: u32,
     pending_shot: Option<String>,
     /// Palette waiting for the next frame to be uploaded, set when a scene is
     /// installed before the GPU context exists or from a network baseline.
@@ -231,6 +258,14 @@ struct WindowApp {
     failure: Option<String>,
     rebuild_network: bool,
     memory: torse_types::MemoryPool,
+}
+
+fn mean_us(total: u128, samples: u32) -> u64 {
+    if samples == 0 {
+        0
+    } else {
+        u64::try_from(total / u128::from(samples)).unwrap_or(0)
+    }
 }
 
 impl WindowApp {
@@ -243,14 +278,24 @@ impl WindowApp {
             .map(|name| ContentKey::parse(name).expect("static material key"))
             .collect();
         Self {
+            preferences_dirty: None,
+            debug_lines: Vec::new(),
+            current_fps: 0,
             work_budget: FrameBudget::new(FRAME_LIMITS, 16_666),
             pending_uploads: SectionUploadQueue::default(),
             ui: {
                 let mut state = crate::ui::State::default();
                 state.set_mode(config.ui_mode);
+                state.settings = config.preferences.clone();
+                state.tab = config.settings_tab;
+                if let Some(fps) = config.fps_limit {
+                    state.settings.frame_limit =
+                        crate::frame_pacing::FrameLimit { enabled: true, fps };
+                }
                 state
             },
             config,
+            frame_pacer: crate::frame_pacing::FramePacer::default(),
             scene: None,
             camera: None,
             input: InputState::new(),
@@ -292,6 +337,8 @@ impl WindowApp {
             fps_origin: Instant::now(),
             fps_frames: 0,
             frame_total_us: 0,
+            benchmark_mark_us: 0,
+            benchmark_stages: [0; 4],
             frame_max_us: 0,
             frame_count: 0,
             streams_mark: 0,
@@ -300,6 +347,12 @@ impl WindowApp {
             rebuilds_mark: 0,
             rebuild_total_us: 0,
             rebuild_count: 0,
+            cpu_total_us: 0,
+            cpu_samples: 0,
+            upload_total_us: 0,
+            upload_samples: 0,
+            present_total_us: 0,
+            present_samples: 0,
             pending_shot: None,
             pending_palette: None,
             summary: None,
@@ -340,8 +393,11 @@ impl WindowApp {
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
         // The HUD needs the pack labels before the GPU borrow starts.
+        self.sync_inventory();
         let names = self.hotbar_names();
         let frame_started = Instant::now();
+        self.frame_pacer
+            .started(frame_started, self.ui.settings.frame_limit);
         if !self.poll_network(event_loop) {
             return;
         }
@@ -349,6 +405,21 @@ impl WindowApp {
         if self.camera.is_none() {
             return;
         }
+        // Protect presentation headroom before world jobs can fill the pool.
+        // Release it only at draw time, so menus and diagnostics still repaint.
+        let presentation_memory = match self.scene.as_mut() {
+            Some(scene) => scene.reserve_frame_memory(4 * 1024 * 1024),
+            None => self
+                .memory
+                .reserve(
+                    torse_types::MemoryClass::Codec,
+                    4 * 1024 * 1024,
+                    torse_types::EvictionRank::Pinned,
+                )
+                .map(Some),
+        }
+        .ok()
+        .flatten();
         let frame_bytes = self.gpu.as_ref().map_or(0, |gpu| {
             u64::from(gpu.config.width) * u64::from(gpu.config.height) * 16 + 64 * 1024 * 1024
         });
@@ -368,8 +439,9 @@ impl WindowApp {
             Err(_) => {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.ui.clear_caches();
-                    gpu.window.request_redraw();
                 }
+                self.last_result = "memory pressure: world work deferred".to_owned();
+                self.draw(event_loop, &names, frame_started, presentation_memory);
                 return;
             }
         };
@@ -401,6 +473,11 @@ impl WindowApp {
                                 result: &self.last_result,
                                 names: names.clone(),
                                 sensitivity: self.look_sensitivity,
+                                debug_lines: &self.debug_lines,
+                                inventory: self
+                                    .scene
+                                    .as_ref()
+                                    .map_or_else(Vec::new, Scene::inventory_slots),
                             },
                         );
                         gpu.ui.draw(&mut encoder, &view);
@@ -417,6 +494,10 @@ impl WindowApp {
         let speed_now = self.camera.as_ref().expect("camera").speed;
         let (mut motion, speed) = self.input.take_input(speed_now);
         self.camera.as_mut().expect("camera").speed = speed;
+        if (speed - speed_now).abs() > f32::EPSILON {
+            self.ui.settings.fly_speed = speed.round().clamp(1.0, 300.0) as u16;
+            self.save_preferences();
+        }
         if self.config.autoplay && !self.ui.modal() {
             motion.forward = 1.0;
         }
@@ -426,6 +507,14 @@ impl WindowApp {
             return;
         }
 
+        if let Some(motion) = self.config.benchmark_motion {
+            let eye = motion.eye(self.frames);
+            if let Some(camera) = self.camera.as_mut() {
+                camera.eye = eye;
+            }
+            self.present_prev = eye;
+            self.present_next = eye;
+        }
         let center = self
             .scene
             .as_ref()
@@ -434,15 +523,18 @@ impl WindowApp {
         // Local scenes stream continuously with a per-frame generation
         // budget: a crossing no longer stalls one frame with a whole ring of
         // fresh sections. Network scenes keep the subscribed sections.
+        let mut cpu_us = 0u128;
         if self.scene.as_ref().is_some_and(|scene| !scene.is_network()) {
             let Some(scene) = self.scene.as_mut() else {
                 return;
             };
+            let started = Instant::now();
             if let Err(error) = scene.stream_around(center, self.work_budget.limits().generation) {
                 self.failure = Some(format!("streaming failed: {error}"));
                 event_loop.exit();
                 return;
             }
+            cpu_us += started.elapsed().as_micros();
             if self.center != Some(center) {
                 self.center = Some(center);
                 self.streams += 1;
@@ -451,6 +543,7 @@ impl WindowApp {
             self.center = None;
         }
 
+        let streamed_at = Instant::now();
         // Resolve the aim from the fresh camera, translate clicks and the
         // autoplay demo into place or break intents, and commit them before
         // this frame's meshes are captured.
@@ -520,7 +613,7 @@ impl WindowApp {
                 &self.materials[self.material],
             ) {
                 let material = &self.materials[self.material];
-                let call = crate::net::edit_call(place, material, target, half);
+                let call = self.edit_call(place, material, target, half);
                 if let Some(Ok(seq)) = self.net.as_mut().map(|net| net.request(call)) {
                     self.requests_sent += 1;
                     self.last_result = format!("seq {} sent", seq.0);
@@ -553,7 +646,7 @@ impl WindowApp {
                 // session has no edit grants, so the admission reply carries
                 // the rejection; the mirror never forks.
                 let material = &self.materials[self.material];
-                let call = crate::net::edit_call(place, material, target, half);
+                let call = self.edit_call(place, material, target, half);
                 match self.net.as_mut().map(|net| net.request(call)) {
                     Some(Ok(seq)) => self.last_result = format!("seq {} sent", seq.0),
                     Some(Err(error)) => self.last_result = format!("send failed: {error}"),
@@ -561,7 +654,9 @@ impl WindowApp {
                 }
             } else {
                 let material = &self.materials[self.material];
+                let call = self.edit_call(place, material, target, half);
                 let result = match self.scene.as_mut() {
+                    Some(scene) if scene.item_owner().is_some() => scene.apply_item_call(call),
                     Some(scene) => scene.apply_edit(place, material, target, half),
                     None => return,
                 };
@@ -580,7 +675,9 @@ impl WindowApp {
 
         // Stage the selection outline from the post-edit aim so it matches
         // what the next frame will show.
-        let outline = {
+        let outline = if !self.ui.settings.outline {
+            Vec::new()
+        } else {
             let Some(scene) = self.scene.as_ref() else {
                 return;
             };
@@ -594,8 +691,20 @@ impl WindowApp {
         };
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.context.write_lines(&outline);
+            let borders = if self.ui.settings.section_borders {
+                self.scene
+                    .as_ref()
+                    .zip(self.camera.as_ref())
+                    .map_or_else(Vec::new, |(scene, camera)| {
+                        scene.section_border_bytes(camera.eye)
+                    })
+            } else {
+                Vec::new()
+            };
+            gpu.context.write_borders(&borders);
         }
 
+        let meshing_at = Instant::now();
         let rebuilt = match self
             .scene
             .as_mut()
@@ -609,7 +718,9 @@ impl WindowApp {
                 return;
             }
         };
+        cpu_us += meshing_at.elapsed().as_micros();
         self.rebuilds += rebuilt.len();
+        let meshed_at = Instant::now();
         self.pending_uploads.extend(rebuilt);
         let scene = self.scene.as_ref().expect("camera implies scene");
         if let Some(gpu) = self.gpu.as_mut() {
@@ -633,18 +744,40 @@ impl WindowApp {
                 self.entity_sequence = None;
             }
         }
-        self.pending_uploads
-            .retain(|p| scene.sections().contains(&p));
+        let surfaces_ready = if let Some(scene) = self.scene.as_mut() {
+            scene.prune_surfaces();
+            if scene.surfaces_dirty() {
+                let (vertices, indices) = scene.surface_geometry();
+                let bytes = Scene::vertex_bytes(&vertices);
+                let ready = self.gpu.as_mut().is_some_and(|gpu| {
+                    gpu.context
+                        .upload_section(crate::renderer::SURFACE_SLOT, &bytes, &indices)
+                });
+                if ready {
+                    scene.surfaces_uploaded();
+                }
+                ready
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        let scene = self.scene.as_ref().expect("active scene");
+        let interest: std::collections::BTreeSet<_> = scene.sections().iter().copied().collect();
+        self.pending_uploads.retain(|p| interest.contains(&p));
+        let upload_started = Instant::now();
         let uploads = match self.pending_uploads.select_where(
             center,
             self.work_budget.limits(),
             |p| {
-                self.gpu.as_ref().is_some_and(|gpu| {
-                    scene.section_geometry_bytes(p).is_none_or(|bytes| {
-                        gpu.context
-                            .should_upload(p, scene.authority().store().side(), bytes)
+                surfaces_ready
+                    && self.gpu.as_ref().is_some_and(|gpu| {
+                        scene.section_geometry_bytes(p).is_none_or(|bytes| {
+                            gpu.context
+                                .should_upload(p, scene.authority().store().side(), bytes)
+                        })
                     })
-                })
             },
             |p| scene.section_geometry_bytes(p),
         ) {
@@ -662,6 +795,7 @@ impl WindowApp {
             .authority()
             .seq()
             .0;
+        let mut presented = Vec::new();
         if !uploads.is_empty() || !self.uploaded || self.entity_sequence != Some(sequence) {
             let scene = self.scene.as_ref().expect("camera implies scene");
             if let Some(gpu) = self.gpu.as_mut() {
@@ -675,13 +809,18 @@ impl WindowApp {
                             self.pending_uploads.extend([*pos]);
                         } else {
                             self.uploads += 1;
+                            presented.push(*pos);
                         }
                     }
                 }
                 // Entity bodies change without mesh rebuilds; refresh them
                 // alongside any terrain upload.
                 if self.entity_sequence != Some(sequence) {
-                    let (entity_vertices, entity_indices) = scene.entity_geometry();
+                    let (entity_vertices, entity_indices) = if self.ui.settings.entities {
+                        scene.entity_geometry()
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
                     let entity_bytes = Scene::vertex_bytes(&entity_vertices);
                     if gpu.context.upload_section(
                         crate::renderer::ENTITY_SLOT,
@@ -694,13 +833,16 @@ impl WindowApp {
             }
             self.uploaded = true;
         }
-        // Unloaded sections must stop drawing even when nothing rebuilt this
-        // frame; retention is cheap and the entity slot survives it.
-        if let Some(gpu) = self.gpu.as_mut()
-            && let Some(scene) = self.scene.as_ref()
-        {
-            gpu.context.retain_sections(scene.sections());
+        if let Some(scene) = self.scene.as_mut() {
+            for pos in presented {
+                scene.surface_section_uploaded(pos);
+            }
         }
+        self.cpu_total_us += cpu_us;
+        self.cpu_samples += 1;
+        self.upload_total_us += upload_started.elapsed().as_micros();
+        self.upload_samples += 1;
+        let uploaded_at = Instant::now();
         // Belt and braces: some focus transitions skip the Focused event, and
         // a captured look with no focus moves the camera from outside.
         if self.grabbed
@@ -716,11 +858,28 @@ impl WindowApp {
             self.pending_shot = Some(format!("torse-shot-{}.png", self.screenshots + 1));
         }
 
-        self.draw(event_loop, &names, frame_started);
+        if self.config.benchmark {
+            for (sum, elapsed) in self.benchmark_stages.iter_mut().zip([
+                streamed_at.duration_since(frame_started),
+                meshed_at.duration_since(meshing_at),
+                uploaded_at.duration_since(meshed_at),
+            ]) {
+                *sum += elapsed.as_micros();
+            }
+        }
+        self.draw(event_loop, &names, frame_started, presentation_memory);
     }
 
     /// Present one frame. This does not pump logic steps.
-    fn draw(&mut self, event_loop: &ActiveEventLoop, names: &[String], frame_started: Instant) {
+    fn draw(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        names: &[String],
+        frame_started: Instant,
+        presentation_memory: Option<torse_types::MemoryLease>,
+    ) {
+        drop(presentation_memory);
+        let draw_started = Instant::now();
         let frame = match self.gpu.as_mut() {
             Some(gpu) => match gpu.surface.get_current_texture() {
                 CurrentSurfaceTexture::Success(frame)
@@ -767,8 +926,25 @@ impl WindowApp {
             .context
             .encode_draw(&mut encoder, &view, &gpu.depth_view)
         {
-            gpu.window.request_redraw();
-            return;
+            // A rejected terrain sort must not hide the interactive UI.
+            let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("client pressure fallback"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.12,
+                            b: 0.15,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
         }
         gpu.ui.prepare(
             device,
@@ -782,6 +958,11 @@ impl WindowApp {
                 result: &self.last_result,
                 names: names.to_vec(),
                 sensitivity: self.look_sensitivity,
+                debug_lines: &self.debug_lines,
+                inventory: self
+                    .scene
+                    .as_ref()
+                    .map_or_else(Vec::new, Scene::inventory_slots),
             },
         );
         gpu.ui.draw(&mut encoder, &view);
@@ -806,7 +987,13 @@ impl WindowApp {
         }
         queue.present(frame);
 
+        self.present_total_us += draw_started.elapsed().as_micros();
+        self.present_samples += 1;
+
         let frame_us = frame_started.elapsed().as_micros();
+        if self.config.benchmark {
+            self.benchmark_stages[3] += draw_started.elapsed().as_micros();
+        }
         self.work_budget
             .observe(frame_us.min(u128::from(u64::MAX)) as u64);
         self.frame_total_us += frame_us;
@@ -824,6 +1011,28 @@ impl WindowApp {
         }
 
         self.frames += 1;
+        if self.config.benchmark && self.frames.is_multiple_of(300) {
+            eprintln!(
+                "benchmark_frame={} sample_frames=300 mean_frame_us={}",
+                self.frames,
+                (self.frame_total_us - self.benchmark_mark_us) / 300
+            );
+            self.benchmark_mark_us = self.frame_total_us;
+            let usage = self.memory.usage();
+            eprintln!(
+                "benchmark_memory total_bytes={} world_bytes={}",
+                usage.total,
+                usage.current[torse_types::MemoryClass::World.index()]
+            );
+            eprintln!(
+                "benchmark_stages_us stream={} mesh={} upload={} draw={}",
+                self.benchmark_stages[0] / 300,
+                self.benchmark_stages[1] / 300,
+                self.benchmark_stages[2] / 300,
+                self.benchmark_stages[3] / 300
+            );
+            self.benchmark_stages.fill(0);
+        }
         self.fps_frames += 1;
         let title_span = self.fps_origin.elapsed().as_secs_f32();
         if title_span >= 0.5 {
@@ -835,11 +1044,56 @@ impl WindowApp {
                 } else {
                     self.last_result.clone()
                 };
-                gpu.window.set_title(&format!(
-                    "Torse client | {fps:.0} fps | sections {} | meshes {} | {material} | {status}",
-                    scene.sections().len(),
-                    scene.mesh_count(),
-                ));
+                self.current_fps = fps.round() as u32;
+                self.debug_lines = vec![
+                    format!(
+                        "FPS: {} | frame: {:.2} ms",
+                        self.current_fps,
+                        f64::from(title_span) * 1000.0 / f64::from(self.fps_frames.max(1))
+                    ),
+                    format!(
+                        "sections: {} | meshes: {}",
+                        scene.sections().len(),
+                        scene.mesh_count()
+                    ),
+                    format!(
+                        "CPU memory: {:.1} MiB",
+                        self.memory.usage().total as f64 / (1024.0 * 1024.0)
+                    ),
+                    format!(
+                        "GPU geometry: {:.1} MiB",
+                        gpu.context.geometry_usage().bytes as f64 / (1024.0 * 1024.0)
+                    ),
+                    format!(
+                        "GPU sections: {} | visible: {} | evictions: {}",
+                        gpu.context.geometry_usage().sections,
+                        gpu.context.draw_stats().visible_sections,
+                        gpu.context.geometry_usage().evictions
+                    ),
+                    format!("position: {:.1}, {:.1}, {:.1}", eye[0], eye[1], eye[2]),
+                    scene
+                        .section_location(eye)
+                        .map_or_else(String::new, |(section, local)| {
+                            format!(
+                                "section: {}, {}, {} | local: {}, {}, {}",
+                                section.x, section.y, section.z, local.x, local.y, local.z
+                            )
+                        }),
+                    format!(
+                        "mode: {} | material: {material}",
+                        if self.walk { "walk" } else { "fly" }
+                    ),
+                    format!(
+                        "edits: {} ok / {} rejected",
+                        self.actions_ok, self.actions_rejected
+                    ),
+                    format!(
+                        "network: {} | requests: {}",
+                        self.net.is_some(),
+                        self.requests_sent
+                    ),
+                    format!("status: {status}"),
+                ];
             }
             self.fps_origin = Instant::now();
             self.fps_frames = 0;
@@ -955,7 +1209,8 @@ impl WindowApp {
         }
         let step = LOGIC_STEP_SECONDS as f32;
         for _ in 0..steps {
-            let jump = self.input.jump_held() || (self.config.autoplay && self.walk_blocked);
+            let jump = self.input.jump_held()
+                || ((self.config.autoplay || self.ui.settings.auto_jump) && self.walk_blocked);
             let before = (
                 f64::from(self.present_next[0]),
                 f64::from(self.present_next[2]),
@@ -1161,13 +1416,24 @@ impl WindowApp {
     }
     /// Capture or release the mouse.
     ///
-    /// Captured means hidden and re-centred after every motion event: the
-    /// deltas drive the camera directly, and any modal needs the real cursor
-    /// back. winit's own grab is deliberately not used on Windows because
-    /// both of its modes clip the cursor to a one-pixel rect there, which
-    /// freezes the reported positions and with them the camera.
     /// Hotbar labels for a pack scene; an empty list keeps the packaged icons.
     fn hotbar_names(&self) -> Vec<String> {
+        if let Some(scene) = self
+            .scene
+            .as_ref()
+            .filter(|scene| scene.item_owner().is_some())
+        {
+            return scene
+                .inventory_slots()
+                .iter()
+                .take(9)
+                .map(|stack| {
+                    stack
+                        .as_ref()
+                        .map_or_else(String::new, |stack| stack.item.path().to_owned())
+                })
+                .collect();
+        }
         if !self.pack {
             return Vec::new();
         }
@@ -1181,7 +1447,7 @@ impl WindowApp {
     fn set_grab(&mut self, grab: bool) {
         // Never capture while the window is unfocused; the next focus event
         // or the per-frame check re-arms capture.
-        let grab = grab && self.focused;
+        let grab = grab && self.focused && !self.config.benchmark;
         if let Some(gpu) = self.gpu.as_ref() {
             self.grabbed = if grab && gpu.window.has_focus() && !self.ui.modal() {
                 // On Windows Locked pins the current desktop position, even
@@ -1222,11 +1488,8 @@ impl WindowApp {
 
     /// Switch to walk mode by spawning the player entity under the camera.
     ///
-    /// `Scene::eye` sits 1.4 blocks above the surface cell's top, and the
-    /// walker's centre must stand 0.9 above that top for the collider to
-    /// clear the ground, hence the 0.5 drop. Movement preparation rejects any
-    /// entity that already overlaps terrain, so a low spawn point freezes the
-    /// walker until it is toggled again from higher up.
+    /// Preserve eye height when clear. The scene can raise a near-floor
+    /// candidate within a bounded search before creating any entity.
     fn enter_walk(&mut self, eye: [f32; 3]) {
         if let Some((connection, scene)) = self.net.as_ref().zip(self.scene.as_mut()) {
             if let Some(position) = connection.player_position(scene.authority()) {
@@ -1247,18 +1510,19 @@ impl WindowApp {
         }
         let under = Position::new(
             f64::from(eye[0]),
-            f64::from(eye[1]) - 0.5,
+            f64::from(eye[1]) - WALKER_EYE_OFFSET,
             f64::from(eye[2]),
         );
-        match self.scene.as_mut() {
-            Some(scene) => {
-                if let Err(reason) = scene.spawn_walker(under) {
+        let under = match self.scene.as_mut() {
+            Some(scene) => match scene.spawn_walker(under) {
+                Ok(position) => position,
+                Err(reason) => {
                     self.last_result = reason;
                     return;
                 }
-            }
+            },
             None => return,
-        }
+        };
         self.walk = true;
         self.config.walk = false;
         // Seed the interpolation endpoints with the spawn position so the
@@ -1271,9 +1535,14 @@ impl WindowApp {
         self.reset_presentation_pose(start);
     }
 
-    /// F5 flips between fly and walk; the walker entity stays in the world.
+    /// F5 flips modes; only the server retains a body while flying.
     fn toggle_walk(&mut self) {
         if self.walk {
+            if let Some(scene) = self.scene.as_mut()
+                && let Err(error) = scene.stop_walker()
+            {
+                self.last_result = error;
+            }
             self.walk = false;
             if let Some(eye) = self.camera.as_ref().map(|camera| camera.eye) {
                 self.reset_presentation_pose(eye);
@@ -1285,7 +1554,45 @@ impl WindowApp {
         }
     }
 
+    fn ui_action(&mut self, action: crate::ui::Action, event_loop: &ActiveEventLoop) {
+        if self.settings_action(action) {
+            self.apply_preferences();
+            self.save_preferences();
+            return;
+        }
+        match action {
+            crate::ui::Action::Slot(slot) => {
+                self.inventory_slot_clicked(slot);
+                return;
+            }
+            crate::ui::Action::ToggleFrameLimit => {
+                self.ui.settings.frame_limit.enabled = !self.ui.settings.frame_limit.enabled;
+                self.frame_pacer.reset();
+            }
+            crate::ui::Action::FrameRate(fps) => {
+                self.ui.settings.frame_limit.fps = fps;
+                self.frame_pacer.reset();
+            }
+            crate::ui::Action::Quit => self.finish(event_loop),
+            crate::ui::Action::Resume => self.set_ui_mode(crate::ui::Mode::Game),
+            crate::ui::Action::Preview => self.set_ui_mode(crate::ui::Mode::MachinePreview),
+            crate::ui::Action::SensDown => {
+                self.look_sensitivity = (self.look_sensitivity - 0.1).clamp(0.2, 5.0);
+                self.last_result = format!("sens {:.2}", self.look_sensitivity);
+                self.ui.settings.sensitivity = (self.look_sensitivity * 100.0).round() as u16;
+            }
+            crate::ui::Action::SensUp => {
+                self.look_sensitivity = (self.look_sensitivity + 0.1).clamp(0.2, 5.0);
+                self.last_result = format!("sens {:.2}", self.look_sensitivity);
+                self.ui.settings.sensitivity = (self.look_sensitivity * 100.0).round() as u16;
+            }
+            _ => {}
+        }
+        self.save_preferences();
+    }
+
     fn finish(&mut self, event_loop: &ActiveEventLoop) {
+        self.flush_preferences(true);
         if let Some((scene, gpu)) = self.scene.as_ref().zip(self.gpu.as_ref()) {
             let (vertices, faces) = scene.geometry_counts();
             self.summary = Some(WindowSummary {
@@ -1343,6 +1650,9 @@ impl WindowApp {
                     u64::try_from(self.rebuild_total_us / u128::from(self.rebuild_count))
                         .unwrap_or(0)
                 },
+                cpu_us: mean_us(self.cpu_total_us, self.cpu_samples),
+                upload_us: mean_us(self.upload_total_us, self.upload_samples),
+                present_us: mean_us(self.present_total_us, self.present_samples),
             });
         }
         event_loop.exit();
@@ -1414,6 +1724,22 @@ impl ApplicationHandler for WindowApp {
                     return;
                 }
             };
+        let present = if self.ui.settings.vsync
+            && capabilities
+                .present_modes
+                .contains(&wgpu::PresentMode::Fifo)
+        {
+            config.present_mode = wgpu::PresentMode::Fifo;
+            wgpu::PresentMode::Fifo
+        } else if capabilities
+            .present_modes
+            .contains(&wgpu::PresentMode::Immediate)
+        {
+            config.present_mode = wgpu::PresentMode::Immediate;
+            wgpu::PresentMode::Immediate
+        } else {
+            present
+        };
         surface.configure(&session.device, &config);
         let depth = create_depth(&session.device, config.width, config.height);
         let depth_view = depth.create_view(&TextureViewDescriptor::default());
@@ -1548,6 +1874,7 @@ impl ApplicationHandler for WindowApp {
             }
         };
         self.gpu = Some(Gpu {
+            present_modes: capabilities.present_modes.clone(),
             ui,
             backend_name: format!("{:?}", info.backend),
             present_mode: format!("{present:?}"),
@@ -1559,6 +1886,13 @@ impl ApplicationHandler for WindowApp {
             window,
         });
         self.scene = scene;
+        if let Some(scene) = self.scene.as_mut().filter(|scene| !scene.is_network())
+            && let Err(error) = scene.enable_items(None)
+        {
+            self.failure = Some(error);
+            event_loop.exit();
+            return;
+        }
         if let Some(notice) = self.scene.as_ref().and_then(Scene::startup_notice) {
             self.last_result = notice.to_owned();
         }
@@ -1578,6 +1912,7 @@ impl ApplicationHandler for WindowApp {
             self.enter_walk(eye);
         }
         self.look_sensitivity = self.config.sensitivity;
+        self.apply_preferences();
         self.started = Some(Instant::now());
         self.fps_origin = Instant::now();
         // Capture the mouse right away; Esc opens the pause menu with the
@@ -1595,6 +1930,17 @@ impl ApplicationHandler for WindowApp {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self.config.benchmark
+            && matches!(
+                event,
+                WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::MouseWheel { .. }
+            )
+        {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.finish(event_loop);
@@ -1617,6 +1963,34 @@ impl ApplicationHandler for WindowApp {
                 if event.state == ElementState::Pressed
                     && let winit::keyboard::PhysicalKey::Code(code) = event.physical_key
                 {
+                    if !event.repeat && self.rebind_key(code) {
+                        return;
+                    }
+                    if code == self.ui.settings.bindings.inventory && !event.repeat {
+                        let mode = if self.ui.mode == crate::ui::Mode::Inventory {
+                            crate::ui::Mode::Game
+                        } else {
+                            crate::ui::Mode::Inventory
+                        };
+                        self.set_ui_mode(mode);
+                        self.input.reset();
+                        self.set_grab(!self.ui.modal());
+                        return;
+                    }
+                    if !self.ui.modal() && !event.repeat {
+                        if code == self.ui.settings.bindings.debug {
+                            self.toggle_debug();
+                            return;
+                        }
+                        if code == self.ui.settings.bindings.walk {
+                            self.toggle_walk();
+                            return;
+                        }
+                    }
+                    if code == self.ui.settings.bindings.screenshot && !event.repeat {
+                        self.input.key(event.physical_key, event.state);
+                        return;
+                    }
                     match code {
                         KeyCode::Escape if !event.repeat => {
                             let mode = if self.ui.modal() {
@@ -1640,15 +2014,16 @@ impl ApplicationHandler for WindowApp {
                             self.set_grab(!self.ui.modal());
                             return;
                         }
-                        KeyCode::F12 => {
-                            self.input.key(event.physical_key, event.state);
-                            return;
-                        }
                         _ if self.ui.modal() => return,
                         KeyCode::Digit1 => self.material = 0,
                         KeyCode::Digit2 => self.material = 1,
                         KeyCode::Digit3 => self.material = 2,
-                        KeyCode::F5 => self.toggle_walk(),
+                        KeyCode::Digit4 if self.materials.len() > 3 => self.material = 3,
+                        KeyCode::Digit5 if self.materials.len() > 4 => self.material = 4,
+                        KeyCode::Digit6 if self.materials.len() > 5 => self.material = 5,
+                        KeyCode::Digit7 if self.materials.len() > 6 => self.material = 6,
+                        KeyCode::Digit8 if self.materials.len() > 7 => self.material = 7,
+                        KeyCode::Digit9 if self.materials.len() > 8 => self.material = 8,
                         _ => {}
                     }
                 }
@@ -1665,25 +2040,7 @@ impl ApplicationHandler for WindowApp {
                             .map_or([960, 540], |g| [g.config.width, g.config.height]);
                         if let Some(action) = self.ui.pointer(state == ElementState::Pressed, size)
                         {
-                            match action {
-                                crate::ui::Action::Quit => self.finish(event_loop),
-                                crate::ui::Action::Resume => {
-                                    self.set_ui_mode(crate::ui::Mode::Game)
-                                }
-                                crate::ui::Action::Preview => {
-                                    self.set_ui_mode(crate::ui::Mode::MachinePreview)
-                                }
-                                crate::ui::Action::SensDown => {
-                                    self.look_sensitivity =
-                                        (self.look_sensitivity - 0.1).clamp(0.2, 5.0);
-                                    self.last_result = format!("sens {:.2}", self.look_sensitivity);
-                                }
-                                crate::ui::Action::SensUp => {
-                                    self.look_sensitivity =
-                                        (self.look_sensitivity + 0.1).clamp(0.2, 5.0);
-                                    self.last_result = format!("sens {:.2}", self.look_sensitivity);
-                                }
-                            }
+                            self.ui_action(action, event_loop);
                             self.input.reset();
                             self.set_grab(!self.ui.modal());
                         }
@@ -1698,7 +2055,13 @@ impl ApplicationHandler for WindowApp {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.ui.cursor = [position.x, position.y];
+                let size = self
+                    .gpu
+                    .as_ref()
+                    .map_or([960, 540], |gpu| [gpu.config.width, gpu.config.height]);
+                if let Some(action) = self.ui.motion([position.x, position.y], size) {
+                    self.ui_action(action, event_loop);
+                }
                 if !self.grabbed && !self.ui.modal() {
                     self.input.cursor(position);
                 }
@@ -1716,6 +2079,9 @@ impl ApplicationHandler for WindowApp {
                             * 1.08f64.powf(notches.clamp(-8.0, 8.0)))
                         .clamp(0.2, 5.0);
                         self.last_result = format!("sens {:.2}", self.look_sensitivity);
+                        self.ui.settings.sensitivity =
+                            (self.look_sensitivity * 100.0).round() as u16;
+                        self.save_preferences();
                     }
                 } else if !self.ui.modal() {
                     self.input.wheel(delta);
@@ -1723,6 +2089,7 @@ impl ApplicationHandler for WindowApp {
             }
             WindowEvent::Focused(false) => {
                 self.focused = false;
+                self.ui.set_mode(self.ui.mode);
                 self.input.reset();
                 self.set_grab(false);
             }
@@ -1733,7 +2100,10 @@ impl ApplicationHandler for WindowApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if self.gpu.is_some() && self.camera.is_some() {
+                if self.gpu.is_some()
+                    && self.camera.is_some()
+                    && self.frame_pacer.ready(Instant::now())
+                {
                     self.frame(event_loop);
                 }
             }
@@ -1747,17 +2117,31 @@ impl ApplicationHandler for WindowApp {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
+        if self.config.benchmark {
+            return;
+        }
         if let DeviceEvent::MouseMotion { delta } = event {
             self.captured_motion(delta);
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.flush_preferences(false);
         if !self.poll_network(event_loop) {
             return;
         }
         if let Some(gpu) = self.gpu.as_ref() {
-            gpu.window.request_redraw();
+            let now = Instant::now();
+            if self.ui.settings.frame_limit.enabled {
+                let deadline = self.frame_pacer.deadline(now);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                if now >= deadline {
+                    gpu.window.request_redraw();
+                }
+            } else {
+                event_loop.set_control_flow(ControlFlow::Poll);
+                gpu.window.request_redraw();
+            }
         }
     }
 }
@@ -2077,8 +2461,10 @@ mod tests {
         );
     }
 
-    fn app() -> WindowApp {
+    pub(super) fn app() -> WindowApp {
         let mut app = WindowApp::new(WindowConfig {
+            preferences: crate::settings::Settings::default(),
+            settings_tab: crate::settings::Tab::Graphics,
             sections: None,
             tls: None,
             memory_mib: 512,
@@ -2089,9 +2475,12 @@ mod tests {
             frames: None,
             screenshot: None,
             autoplay: false,
+            benchmark: false,
+            benchmark_motion: None,
             walk: false,
             connect: None,
             sensitivity: 1.0,
+            fps_limit: None,
             probe_outside: false,
             ui_mode: crate::ui::Mode::Game,
             content: None,
@@ -2261,6 +2650,45 @@ mod tests {
             assert_eq!(app.present_next, eye);
             assert_eq!(app.presentation_alpha(), 0.0);
         }
+    }
+
+    #[test]
+    fn local_mode_changes_release_bodies_and_keep_clear_viewpoints_stable() {
+        let mut app = app();
+        let mut scene = Scene::new(0).unwrap();
+        scene.enable_lighting().unwrap();
+        app.scene = Some(scene);
+        for _ in 0..12 {
+            let eye = [8.5, 66.7, 8.5];
+            app.reset_presentation_pose(eye);
+            app.toggle_walk();
+            assert!(app.walk);
+            assert_eq!(app.scene.as_ref().unwrap().authority().entities().len(), 1);
+            assert_eq!(app.present_next, eye);
+            app.pump_logic(0.05, MoveInput::default()).unwrap();
+            assert!(app.scene.as_ref().unwrap().walker_position().unwrap().y < 66.0);
+            app.toggle_walk();
+            assert!(!app.walk);
+            let scene = app.scene.as_ref().unwrap();
+            assert_eq!(scene.authority().entities().len(), 0);
+            assert!(scene.walker_position().is_none());
+            assert!(scene.entity_geometry().0.is_empty());
+        }
+        app.reset_presentation_pose([8.5, 14.7, 8.5]);
+        app.toggle_walk();
+        app.toggle_walk();
+        // The abandoned body must no longer veto placement at its old cell.
+        app.scene
+            .as_mut()
+            .unwrap()
+            .apply_edit(true, &key("base:stone"), BlockPos::new(8, 14, 8), 0)
+            .unwrap();
+        app.toggle_walk();
+        assert!(app.walk);
+        assert!(
+            app.present_next[1] > 15.5,
+            "near-floor entry raises the body clear"
+        );
     }
 
     #[test]
