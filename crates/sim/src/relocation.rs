@@ -128,6 +128,44 @@ fn acceptable(position: Position, side: u32) -> bool {
         && position.section(side).is_some()
 }
 
+/// Recheck the destination against all writes in the atomic publication.
+pub(crate) fn validate_final(
+    store: &SectionStore,
+    entities: &EntityStore,
+    registry: &BlockStateRegistry,
+    relocations: &[Relocation],
+    edits: &[torse_world::BlockEdit],
+    components: &[torse_world::ComponentEdit],
+) -> Result<Vec<(BlockPos, TerrainQuery)>, RejectCode> {
+    let mut reads = Vec::new();
+    for relocation in relocations {
+        let entity = entities
+            .handle_of(relocation.id)
+            .and_then(|h| entities.get(h))
+            .ok_or(RejectCode::MissingTarget)?;
+        let schema = torse_world::collider_schema();
+        let collider = components
+            .iter()
+            .find(|e| e.id == relocation.id && e.schema == schema)
+            .map_or_else(
+                || entity.components.component(&schema),
+                |e| e.fields.as_ref(),
+            )
+            .map(EntityCollider::from_fields)
+            .transpose()
+            .map_err(|_| RejectCode::InvalidData)?;
+        reads.extend(observe_with_edits(
+            store,
+            registry,
+            Position::from_bits(relocation.destination_bits),
+            collider,
+            relocation.policy,
+            edits,
+        )?);
+    }
+    Ok(reads)
+}
+
 fn observe(
     store: &SectionStore,
     registry: &BlockStateRegistry,
@@ -135,9 +173,20 @@ fn observe(
     collider: Option<EntityCollider>,
     policy: DestinationPolicy,
 ) -> Result<Vec<(BlockPos, TerrainQuery)>, RejectCode> {
+    observe_with_edits(store, registry, destination, collider, policy, &[])
+}
+
+fn observe_with_edits(
+    store: &SectionStore,
+    registry: &BlockStateRegistry,
+    destination: Position,
+    collider: Option<EntityCollider>,
+    policy: DestinationPolicy,
+    edits: &[torse_world::BlockEdit],
+) -> Result<Vec<(BlockPos, TerrainQuery)>, RejectCode> {
     let Some(half) = collider.and_then(EntityCollider::half) else {
         let cell = destination.checked_block().ok_or(RejectCode::InvalidData)?;
-        return one_cell(store, cell, policy);
+        return one_cell(store, cell, policy, edits);
     };
     if half
         .iter()
@@ -147,7 +196,7 @@ fn observe(
     }
     match policy {
         DestinationPolicy::Clear => {
-            crate::movement::observe_body(store, registry, destination, half)
+            crate::movement::observe_body_with_edits(store, registry, destination, half, edits)
         }
         DestinationPolicy::Resident => {
             let mut reads = Vec::new();
@@ -168,12 +217,21 @@ fn one_cell(
     store: &SectionStore,
     cell: BlockPos,
     policy: DestinationPolicy,
+    edits: &[torse_world::BlockEdit],
 ) -> Result<Vec<(BlockPos, TerrainQuery)>, RejectCode> {
     match store.query(cell) {
-        TerrainQuery::Ready(state) if policy == DestinationPolicy::Resident || state.is_empty() => {
-            Ok(vec![(cell, TerrainQuery::Ready(state))])
+        TerrainQuery::Ready(state) => {
+            let final_state = edits
+                .iter()
+                .rev()
+                .find(|e| e.pos == cell)
+                .map_or(state, |e| e.state);
+            if policy == DestinationPolicy::Resident || final_state.is_empty() {
+                Ok(vec![(cell, TerrainQuery::Ready(state))])
+            } else {
+                Err(RejectCode::Conflict)
+            }
         }
-        TerrainQuery::Ready(_) => Err(RejectCode::Conflict),
         TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => Err(RejectCode::NotLoaded),
     }
 }

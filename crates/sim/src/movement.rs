@@ -390,12 +390,22 @@ pub fn observe_body(
     position: Position,
     half: [f64; 3],
 ) -> Result<Vec<(BlockPos, TerrainQuery)>, RejectCode> {
+    observe_body_with_edits(store, registry, position, half, &[])
+}
+
+pub(crate) fn observe_body_with_edits(
+    store: &SectionStore,
+    registry: &BlockStateRegistry,
+    position: Position,
+    half: [f64; 3],
+    edits: &[BlockEdit],
+) -> Result<Vec<(BlockPos, TerrainQuery)>, RejectCode> {
     let center = bounded_center([position.x, position.y, position.z], half)
         .ok_or(RejectCode::InvalidData)?;
     let view = CollisionView {
         store,
         registry,
-        overlay: BTreeMap::new(),
+        overlay: edits.iter().map(|e| (e.pos, e.state)).collect(),
         reads: RefCell::new(BTreeMap::new()),
         unknown: RefCell::new(false),
     };

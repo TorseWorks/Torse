@@ -493,6 +493,7 @@ impl CommitCoordinator {
         transaction: &Transaction,
     ) -> Result<PreparedChange, PrepareError> {
         if !transaction.movements.is_empty()
+            || !transaction.relocations.is_empty()
             || !transaction.clearance.is_empty()
             || !transaction.components.is_empty()
             || !transaction.spawns.is_empty()
@@ -734,6 +735,7 @@ impl CommitCoordinator {
                 &member.relocations,
                 &mut entity_moves,
                 &mut movement_reads,
+                &mut movement_handles,
             )?;
             movement_handles.extend(member.movements.iter().map(|request| {
                 (
@@ -804,6 +806,19 @@ impl CommitCoordinator {
         {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
         }
+        for member in &group.members {
+            movement_reads.extend(
+                crate::relocation::validate_final(
+                    store,
+                    entities,
+                    registry,
+                    &member.relocations,
+                    &edits,
+                    &component_edits,
+                )
+                .map_err(PrepareError::Rejected)?,
+            );
+        }
         movement_reads.extend(
             crate::movement::validate_bodies(
                 store,
@@ -873,14 +888,6 @@ impl CommitCoordinator {
         .map_err(PrepareError::Rejected)?;
         prepared.entity_moves = resolved.moves;
         prepared.movement_reads = resolved.reads;
-        take_relocations(
-            store,
-            entities,
-            registry,
-            &transaction.relocations,
-            &mut prepared.entity_moves,
-            &mut prepared.movement_reads,
-        )?;
         prepared.movement_handles = transaction
             .movements
             .iter()
@@ -895,6 +902,26 @@ impl CommitCoordinator {
                 )
             })
             .collect();
+        take_relocations(
+            store,
+            entities,
+            registry,
+            &transaction.relocations,
+            &mut prepared.entity_moves,
+            &mut prepared.movement_reads,
+            &mut prepared.movement_handles,
+        )?;
+        prepared.movement_reads.extend(
+            crate::relocation::validate_final(
+                store,
+                entities,
+                registry,
+                &transaction.relocations,
+                &prepared.edits,
+                &transaction.components,
+            )
+            .map_err(PrepareError::Rejected)?,
+        );
         prepared.clearance =
             crate::placement::prepare(registry, &transaction.mutations, &transaction.clearance)
                 .map_err(PrepareError::Rejected)?;
@@ -1349,6 +1376,7 @@ fn take_relocations(
     relocations: &[crate::transaction::Relocation],
     moves: &mut Vec<torse_world::EntityMove>,
     reads: &mut Vec<(torse_types::BlockPos, TerrainQuery)>,
+    handles: &mut Vec<(EntityHandle, EntityId, Option<torse_world::EntityCollider>)>,
 ) -> Result<(), PrepareError> {
     let resolved = crate::relocation::resolve(store, entities, registry, relocations)
         .map_err(PrepareError::Rejected)?;
@@ -1358,6 +1386,14 @@ fn take_relocations(
         .any(|relocation| moves.iter().any(|movement| movement.id == relocation.id))
     {
         return Err(PrepareError::Rejected(RejectCode::Conflict));
+    }
+    for movement in &resolved.moves {
+        let handle = entities
+            .handle_of(movement.id)
+            .expect("validated relocation identity");
+        let body = torse_world::EntityCollider::of(entities.get(handle).expect("validated handle"))
+            .expect("validated body");
+        handles.push((handle, movement.id, body));
     }
     moves.extend(resolved.moves);
     reads.extend(resolved.reads);

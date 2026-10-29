@@ -452,6 +452,168 @@ fn a_group_can_relocate_and_edit_another_owners_component() {
 }
 
 #[test]
+fn clear_destination_checks_final_terrain_in_single_transactions_and_groups() {
+    for grouped in [false, true] {
+        for policy in [DestinationPolicy::Clear, DestinationPolicy::Resident] {
+            for body in [
+                EntityCollider::Disabled,
+                EntityCollider::Box { half: [200_000; 3] },
+            ] {
+                let mut world = world();
+                load(&mut world, SectionPos::ZERO);
+                let origin = Position::new(0.5, 2.5, 0.5);
+                let (id, expected) = place(&mut world, body, origin);
+                let mut relocation = grant(id)
+                    .view(&world)
+                    .plan_relocation(
+                        id,
+                        expected,
+                        Position::new(2.5, 2.5, 0.5),
+                        policy,
+                        TransactionId(1),
+                        ordering(),
+                    )
+                    .unwrap();
+                let cell = BlockPos::new(2, 2, 0);
+                let stone = world.registry().default_state(&key("base:stone")).unwrap();
+                let mut terrain =
+                    Transaction::new(TransactionId(2), key("test:terrain"), ordering());
+                terrain.write_block(cell, stone);
+                let result = if grouped {
+                    world
+                        .commit_group(
+                            &TransactionGroup::new(
+                                TransactionId(3),
+                                ordering(),
+                                vec![relocation, terrain],
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap()
+                } else {
+                    relocation.mutations.extend(terrain.mutations);
+                    world.commit(&relocation).unwrap()
+                };
+                if policy == DestinationPolicy::Clear {
+                    assert_eq!(rejection(result), RejectCode::Conflict);
+                    assert_eq!(position(&world, id), origin);
+                    assert_eq!(
+                        world.store().query(cell),
+                        TerrainQuery::Ready(BlockStateId::EMPTY)
+                    );
+                    assert_eq!(world.seq(), CommitSeq::INITIAL);
+                } else {
+                    assert!(matches!(
+                        result.outcome,
+                        TransactionOutcome::Committed { .. }
+                    ));
+                    assert_eq!(position(&world, id), Position::new(2.5, 2.5, 0.5));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn relocation_checks_the_final_group_collider_and_rejects_terrain_only_preparation() {
+    let mut world = world();
+    load(&mut world, SectionPos::ZERO);
+    let origin = Position::new(0.5, 2.5, 0.5);
+    let (id, expected) = place(&mut world, EntityCollider::Disabled, origin);
+    let stone = world.registry().default_state(&key("base:stone")).unwrap();
+    world
+        .store_mut()
+        .edit(BlockPos::new(3, 2, 2), stone)
+        .unwrap();
+    let mut relocation = grant(id)
+        .view(&world)
+        .plan_relocation(
+            id,
+            expected,
+            Position::new(2.5, 2.5, 2.5),
+            DestinationPolicy::Clear,
+            TransactionId(1),
+            ordering(),
+        )
+        .unwrap();
+    relocation.write_block(BlockPos::new(7, 2, 2), stone);
+    let coordinator = torse_sim::CommitCoordinator::new(WorldId(1));
+    assert!(matches!(
+        coordinator.prepare(world.store(), &relocation),
+        Err(torse_sim::PrepareError::Rejected(RejectCode::InvalidData))
+    ));
+    let mut resize = Transaction::new(TransactionId(2), collider_owner(), ordering());
+    resize.components.push(ComponentEdit {
+        id,
+        schema: collider_schema(),
+        previous: Some(EntityCollider::Disabled.fields()),
+        fields: Some(EntityCollider::Box { half: [900_000; 3] }.fields()),
+    });
+    let group =
+        TransactionGroup::new(TransactionId(3), ordering(), vec![relocation, resize]).unwrap();
+    assert_eq!(
+        rejection(world.commit_group(&group).unwrap()),
+        RejectCode::Conflict
+    );
+    assert_eq!(position(&world, id), origin);
+    assert_eq!(world.seq(), CommitSeq::INITIAL);
+    assert_eq!(
+        world.store().query(BlockPos::new(7, 2, 2)),
+        TerrainQuery::Ready(BlockStateId::EMPTY)
+    );
+}
+
+#[test]
+fn prepared_relocation_rejects_a_changed_collider_without_publishing() {
+    for grouped in [false, true] {
+        let mut world = world();
+        load(&mut world, SectionPos::ZERO);
+        let origin = Position::new(0.5, 2.5, 0.5);
+        let (id, expected) = place(&mut world, EntityCollider::Disabled, origin);
+        let stone = world.registry().default_state(&key("base:stone")).unwrap();
+        world
+            .store_mut()
+            .edit(BlockPos::new(3, 2, 2), stone)
+            .unwrap();
+        let relocation = grant(id)
+            .view(&world)
+            .plan_relocation(
+                id,
+                expected,
+                Position::new(2.5, 2.5, 2.5),
+                DestinationPolicy::Clear,
+                TransactionId(1),
+                ordering(),
+            )
+            .unwrap();
+        let prepared = if grouped {
+            world
+                .prepare_group(
+                    &TransactionGroup::new(TransactionId(2), ordering(), vec![relocation]).unwrap(),
+                )
+                .unwrap()
+        } else {
+            world.prepare(&relocation).unwrap()
+        };
+        let handle = world.entities().handle_of(id).unwrap();
+        let schemas = world.schemas().clone();
+        world
+            .entities_mut()
+            .components_mut(handle)
+            .unwrap()
+            .insert(
+                &schemas,
+                &collider_schema(),
+                EntityCollider::Box { half: [900_000; 3] }.fields(),
+            )
+            .unwrap();
+        assert!(world.publish(prepared).is_err());
+        assert_eq!(position(&world, id), origin);
+        assert_eq!(world.seq(), CommitSeq::INITIAL);
+    }
+}
+
+#[test]
 fn ordinary_movement_still_rejects_a_delta_past_the_limit() {
     let mut world = world();
     load(&mut world, SectionPos::ZERO);
