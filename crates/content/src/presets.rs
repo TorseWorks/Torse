@@ -2,6 +2,18 @@
 use crate::{AlphaMode, BlockDefinition, BoxBounds, FiniteField, Shape, StateProfile, StateSchema};
 use torse_types::ContentKey;
 
+/// Six halves: lower, upper, west, east, north and south.
+pub fn slab_schema(id: ContentKey) -> StateSchema {
+    let mut schema = vertical_slab_schema(id);
+    schema.finite_fields[0].values = (0..6).collect();
+    schema
+}
+
+/// One reusable slab block whose states cover all three placement axes.
+pub fn slab(block: &mut BlockDefinition, schema: ContentKey) {
+    apply_slab(block, schema, "world:tag/slab", &[1, 0, 2]);
+}
+
 /// Four vertical half volumes: west, east, north and south.
 pub fn vertical_slab_schema(id: ContentKey) -> StateSchema {
     StateSchema {
@@ -18,28 +30,45 @@ pub fn vertical_slab_schema(id: ContentKey) -> StateSchema {
 
 /// Configure caller-owned material and identity as a completable vertical slab.
 pub fn vertical_slab(block: &mut BlockDefinition, schema: ContentKey) {
+    apply_slab(block, schema, "world:tag/vertical_slab", &[0, 2]);
+}
+
+fn apply_slab(block: &mut BlockDefinition, schema: ContentKey, tag: &str, axes: &[usize]) {
     block.state_schema = schema;
-    let tag = ContentKey::parse("world:tag/vertical_slab").expect("static tag");
+    let tag = ContentKey::parse(tag).expect("static slab tag");
+    block.tags.retain(|tag| {
+        !matches!(
+            tag.to_string().as_str(),
+            "world:tag/slab" | "world:tag/vertical_slab"
+        )
+    });
     if !block.tags.contains(&tag) {
         block.tags.push(tag);
     }
-    block.state_overrides = (0..4)
-        .map(|side| {
+    block.state_overrides = axes
+        .iter()
+        .flat_map(|axis| [(*axis, 0), (*axis, 1)])
+        .enumerate()
+        .map(|(value, (axis, side))| {
             let mut bounds = BoxBounds {
                 min: [0.0; 3],
                 max: [1.0; 3],
             };
-            let axis = if side < 2 { 0 } else { 2 };
-            if side % 2 == 0 {
+            if side == 0 {
                 bounds.max[axis] = 0.5;
             } else {
                 bounds.min[axis] = 0.5;
             }
+            let shape = if axis == 1 && side == 0 {
+                Shape::LowerSlab
+            } else {
+                Shape::Box(bounds)
+            };
             StateProfile {
-                values: vec![side],
-                render_shape: Some(Shape::Box(bounds)),
-                collision_shape: Some(Shape::Box(bounds)),
-                selection_shape: Some(Shape::Box(bounds)),
+                values: vec![value as u16],
+                render_shape: Some(shape.clone()),
+                collision_shape: Some(shape.clone()),
+                selection_shape: Some(shape),
                 occlusion: Some(0),
             }
         })
@@ -81,14 +110,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vertical_template_keeps_the_material_and_exposes_four_distinct_half_volumes() {
+    fn unified_template_has_six_matching_half_volume_profiles() {
         let pack = crate::m0_fixture_pack();
+        assert!(
+            !pack
+                .blocks
+                .iter()
+                .any(|b| b.value.id.path() == "vertical_glass_slab")
+        );
         let block = &pack
             .blocks
             .iter()
-            .find(|b| b.value.id.path() == "vertical_glass_slab")
+            .find(|b| b.value.id.path() == "glass_slab")
             .unwrap()
             .value;
+        assert_eq!(block.state_overrides.len(), 6);
+        for (value, profile) in block.state_overrides.iter().enumerate() {
+            let bounds = match profile.render_shape.as_ref().unwrap() {
+                Shape::LowerSlab => BoxBounds {
+                    min: [0.; 3],
+                    max: [1., 0.5, 1.],
+                },
+                Shape::Box(bounds) => *bounds,
+                _ => panic!("half volume"),
+            };
+            let axis = [1, 0, 2][value / 2];
+            assert_eq!(bounds.max[axis] - bounds.min[axis], 0.5);
+            assert_eq!(bounds.min[axis], if value % 2 == 0 { 0. } else { 0.5 });
+            assert_eq!(profile.render_shape, profile.collision_shape);
+            assert_eq!(profile.render_shape, profile.selection_shape);
+        }
+        assert!(crate::compile(pack).is_ok());
+    }
+
+    #[test]
+    fn vertical_template_keeps_the_material_and_exposes_four_distinct_half_volumes() {
+        let mut pack = crate::m0_fixture_pack();
+        let mut block = pack
+            .blocks
+            .iter()
+            .find(|b| b.value.id.path() == "glass_slab")
+            .unwrap()
+            .value
+            .clone();
+        let schema = ContentKey::parse("test:state/vertical").unwrap();
+        vertical_slab(&mut block, schema.clone());
+        block.id = ContentKey::parse("test:vertical_slab").unwrap();
+        pack.state_schemas.push(crate::Sourced {
+            source: pack.state_schemas[0].source.clone(),
+            value: vertical_slab_schema(schema),
+        });
+        pack.blocks.push(crate::Sourced {
+            source: pack.blocks[0].source.clone(),
+            value: block.clone(),
+        });
         assert_eq!(
             block.render_profile.material.to_string(),
             "base:material/glass"

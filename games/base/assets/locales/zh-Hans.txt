@@ -65,7 +65,6 @@ inventory_hotbar=底部为快捷栏；Tab关闭；1-9选择槽位
 bind_hint=点击后按键，Esc取消；菜单和数字键保留
 
 settings_infinite_supply=无限供应
-item_vertical_glass=竖玻璃半砖
 inventory_supply=无限供应
 inventory_storage=背包
 inventory_bar=快捷栏

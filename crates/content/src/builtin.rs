@@ -9,11 +9,11 @@
 use torse_types::{ContentKey, ReplicationDeclaration};
 
 use crate::{
-    AlphaMode, BlockDefinition, BoxBounds, CapabilityBinding, CapabilityDescriptor,
-    CollisionProfile, ComponentSchema, ContentPack, ExecutionContract, FaceMaterials, FaceOverlays,
-    FiniteField, InteractionProfile, LightTransport, MethodDescriptor, ModuleDescriptor,
-    ModuleSide, OcclusionProfile, PersistencePolicy, RenderProfile, RequestedPermission,
-    SelectionProfile, ServiceDescriptor, Shape, SourceRef, Sourced, StateProfile, StateSchema,
+    AlphaMode, BlockDefinition, CapabilityBinding, CapabilityDescriptor, CollisionProfile,
+    ComponentSchema, ContentPack, ExecutionContract, FaceMaterials, FaceOverlays, FiniteField,
+    InteractionProfile, LightTransport, MethodDescriptor, ModuleDescriptor, ModuleSide,
+    OcclusionProfile, PersistencePolicy, RenderProfile, RequestedPermission, SelectionProfile,
+    ServiceDescriptor, Shape, SourceRef, Sourced, StateSchema,
 };
 
 /// Build the deterministic content pack used by M0 tests and tooling.
@@ -21,14 +21,14 @@ pub fn m0_fixture_pack() -> ContentPack {
     let simple_state = key("base:state/simple");
     let slab_state = key("base:state/slab");
     let plant_state = key("base:state/plant_growth");
-    // The inventory schema is declared but not attached to one of the three
+    // The inventory schema is declared but not attached to any of the
     // blocks. This keeps the built-in block models visually realistic while
     // still exercising component and capability reference resolution.
     let inventory_schema = key("base:schema/inventory_content");
     let inventory_capability = key("base:capability/item_port");
     let inspect_action = key("base:action/inspect");
 
-    let mut pack = ContentPack {
+    ContentPack {
         state_schemas: vec![
             sourced(
                 "fixtures/m0/state_simple.json",
@@ -41,16 +41,7 @@ pub fn m0_fixture_pack() -> ContentPack {
             ),
             sourced(
                 "fixtures/m0/state_slab.json",
-                StateSchema {
-                    id: slab_state.clone(),
-                    schema_version: 1,
-                    finite_fields: vec![FiniteField {
-                        id: key("base:field/half"),
-                        default_value: 0,
-                        values: vec![0, 1],
-                    }],
-                    component_schemas: Vec::new(),
-                },
+                crate::presets::slab_schema(slab_state.clone()),
             ),
             sourced(
                 "fixtures/m0/state_plant.json",
@@ -162,33 +153,8 @@ pub fn m0_fixture_pack() -> ContentPack {
                 );
                 // The slab and the full glass block share one material.
                 slab.render_profile.material = key("base:material/glass");
-                // One block, two halves: the half field selects which part of
-                // the cell the slab occupies.
-                slab.state_overrides = vec![
-                    StateProfile {
-                        values: vec![0],
-                        render_shape: None,
-                        collision_shape: None,
-                        selection_shape: None,
-                        occlusion: None,
-                    },
-                    StateProfile {
-                        values: vec![1],
-                        render_shape: Some(Shape::Box(BoxBounds {
-                            min: [0.0, 0.5, 0.0],
-                            max: [1.0, 1.0, 1.0],
-                        })),
-                        collision_shape: Some(Shape::Box(BoxBounds {
-                            min: [0.0, 0.5, 0.0],
-                            max: [1.0, 1.0, 1.0],
-                        })),
-                        selection_shape: Some(Shape::Box(BoxBounds {
-                            min: [0.0, 0.5, 0.0],
-                            max: [1.0, 1.0, 1.0],
-                        })),
-                        occlusion: None,
-                    },
-                ];
+                crate::presets::slab(&mut slab, slab_state.clone());
+                slab.definition_version = 2;
                 slab
             }),
             sourced("fixtures/m0/plant.json", {
@@ -227,24 +193,7 @@ pub fn m0_fixture_pack() -> ContentPack {
                 ),
             ),
         ],
-    };
-    let schema = key("base:state/vertical_slab");
-    pack.state_schemas.push(sourced(
-        "fixtures/m0/state_vertical_slab.json",
-        crate::presets::vertical_slab_schema(schema.clone()),
-    ));
-    let mut vertical = pack
-        .blocks
-        .iter()
-        .find(|block| block.value.id == key("base:glass_slab"))
-        .expect("glass slab fixture")
-        .value
-        .clone();
-    vertical.id = key("base:vertical_glass_slab");
-    crate::presets::vertical_slab(&mut vertical, schema);
-    pack.blocks
-        .push(sourced("fixtures/m0/vertical_glass_slab.json", vertical));
-    pack
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -65,7 +65,6 @@ inventory_hotbar=Bottom row: hotbar. Tab closes; 1-9 select.
 bind_hint=Click then press a key; Esc cancels. Menu and digits are reserved.
 
 settings_infinite_supply=Infinite supply
-item_vertical_glass=Vertical glass slab
 inventory_supply=Infinite supply
 inventory_storage=Backpack
 inventory_bar=Hotbar

@@ -295,15 +295,12 @@ mod tests {
         app.scene = Some(scene);
         app.sync_inventory();
         app.material = 7;
-        app.inventory_slot_clicked(3);
-        assert_eq!(
-            app.materials[7],
-            torse_items::key("base:vertical_glass_slab")
-        );
+        app.inventory_slot_clicked(0);
+        assert_eq!(app.materials[7], torse_items::key("base:glass_slab"));
         assert_eq!(app.scene.as_ref().unwrap().inventory_slots(), before);
         assert_eq!(
             app.displayed_bar()[7].as_ref().unwrap().item,
-            torse_items::key("base:vertical_glass_slab")
+            torse_items::key("base:glass_slab")
         );
         app.scene
             .as_mut()

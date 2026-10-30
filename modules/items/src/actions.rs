@@ -222,7 +222,7 @@ impl ActionHandler for Handler {
                 };
                 let block = self.catalog.block(item).ok_or(RejectCode::MissingTarget)?;
                 let half = number(&request.parameters, "half")?;
-                if half > 3 {
+                if half > 5 {
                     return Err(RejectCode::InvalidData);
                 }
                 parameters.insert(
@@ -302,7 +302,7 @@ impl ActionHandler for Handler {
                 ComponentValue::Content(block.clone()),
             );
             let half = number(&request.parameters, "half")?;
-            if half > 3 {
+            if half > 5 {
                 return Err(RejectCode::InvalidData);
             }
             parameters.insert(key("world:field/half"), ComponentValue::U32(half as u32));

@@ -160,6 +160,45 @@ fn physical_harvest_falls_and_persists_without_automatic_pickup() {
 }
 
 #[test]
+fn all_slab_orientations_share_one_stack_and_preserve_physical_drop_counts() {
+    for half in 0..6 {
+        let (mut world, service, catalog, id) = setup_policy(true);
+        assert_eq!(catalog.definitions().count(), 3);
+        let before = inventory(&world, &catalog, id).slots()[0]
+            .as_ref()
+            .unwrap()
+            .count;
+        let mut place = request(id, true, 0, 1);
+        place
+            .parameters
+            .insert(key("items:field/half"), ComponentValue::U32(half));
+        commit(&mut world, &service, id, &place);
+        let stock = inventory(&world, &catalog, id);
+        let mut bad = request(id, true, 0, 2);
+        bad.parameters
+            .insert(key("items:field/half"), ComponentValue::U32((half + 2) % 6));
+        assert!(
+            service
+                .plan(&world, &actor(id), Phase::Interaction, &bad)
+                .is_err()
+        );
+        assert_eq!(inventory(&world, &catalog, id), stock);
+        commit(&mut world, &service, id, &request(id, false, 0, 3));
+        let drop = world
+            .entities()
+            .iter()
+            .find_map(|(_, e)| torse_items::drops::DropState::read(e, &catalog).ok())
+            .unwrap();
+        assert_eq!(drop.stack.item, key("base:glass_slab"));
+        assert_eq!(drop.stack.count, 1);
+        assert_eq!(
+            stock.slots()[0].as_ref().unwrap().count + drop.stack.count,
+            before
+        );
+    }
+}
+
+#[test]
 fn initial_drop_escapes_refilled_terrain_but_waits_when_enclosed_or_unloaded() {
     for case in 0..3 {
         let (mut world, _, catalog, _) = setup_policy(true);
@@ -557,7 +596,11 @@ fn placing_completion_and_harvest_conserve_half_blocks() {
             .count,
         before - 1
     );
-    commit(&mut world, &service, id, &request(id, true, 0, 2));
+    let mut complement = request(id, true, 0, 2);
+    complement
+        .parameters
+        .insert(key("items:field/half"), ComponentValue::U32(1));
+    commit(&mut world, &service, id, &complement);
     assert_eq!(
         world
             .registry()

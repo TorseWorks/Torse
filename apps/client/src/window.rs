@@ -566,12 +566,17 @@ impl WindowApp {
             };
             scene.pick(camera.eye, camera.forward(), PICK_RANGE)
         };
+        let placement_direction = self
+            .camera
+            .as_ref()
+            .map_or([0., -1., 0.], FlyCamera::forward);
         let mut intent = self.input.take_click().and_then(|button| {
             action_for(
                 self.scene.as_ref(),
                 &aim,
                 button,
                 &self.materials[self.material],
+                placement_direction,
             )
         });
         // The walk demo is about walking; firing place or break at the aim
@@ -621,6 +626,7 @@ impl WindowApp {
                 &aim,
                 MouseButton::Left,
                 &self.materials[self.material],
+                placement_direction,
             ) {
                 let material = &self.materials[self.material];
                 let call = self.edit_call(place, material, target, half);
@@ -647,6 +653,7 @@ impl WindowApp {
                 &aim,
                 button,
                 &self.materials[self.material],
+                placement_direction,
             );
             self.autoplay_break = !self.autoplay_break;
         }
@@ -2205,6 +2212,7 @@ fn action_for(
     outcome: &PickOutcome,
     button: MouseButton,
     material: &ContentKey,
+    direction: [f32; 3],
 ) -> Option<(bool, BlockPos, u32)> {
     let PickOutcome::Hit(hit) = outcome else {
         return None;
@@ -2212,7 +2220,7 @@ fn action_for(
     match button {
         MouseButton::Left => Some((false, hit.block, 0)),
         MouseButton::Right => {
-            let placement = scene?.placement_at(hit, material)?;
+            let placement = scene?.placement_at(hit, material, direction)?;
             Some((true, placement.target, placement.half))
         }
         _ => None,
@@ -2368,7 +2376,7 @@ mod tests {
                 [1.0, 0.0, 0.0],
                 &slab,
                 BlockPos::new(7, 14, 8),
-                0,
+                3,
             ),
             (
                 1,
@@ -2376,8 +2384,12 @@ mod tests {
                 [1.0, 0.0, 0.0],
                 &slab,
                 BlockPos::new(7, 14, 8),
-                1,
+                3,
             ),
+            (2, [9.8, 14.5, 8.5], [-1., 0., 0.], &slab, pos, 3),
+            (3, [6.5, 14.5, 8.5], [1., 0., 0.], &slab, pos, 2),
+            (4, [8.5, 14.5, 9.8], [0., 0., -1.], &slab, pos, 5),
+            (5, [8.5, 14.5, 6.5], [0., 0., 1.], &slab, pos, 4),
             (
                 0,
                 [8.5, 15.9, 8.5],
@@ -2404,7 +2416,8 @@ mod tests {
                 );
             };
             assert_eq!(hit.block, pos);
-            let intent = action_for(Some(&scene), &aim, MouseButton::Right, held).unwrap();
+            let intent =
+                action_for(Some(&scene), &aim, MouseButton::Right, held, direction).unwrap();
             assert_eq!(intent, (true, target, half));
             let call = crate::net::edit_call(intent.0, held, intent.1, intent.2);
             assert_eq!(call.target, torse_sim::action::ActionTarget::Block(target));
@@ -2443,7 +2456,8 @@ mod tests {
         scene.apply_edit(true, &stone, wall, 0).unwrap();
         scene.apply_edit(true, &slab, target, 0).unwrap();
         let aim = scene.pick([6.5, 14.75, 8.5], [1.0, 0.0, 0.0], PICK_RANGE);
-        let intent = action_for(Some(&scene), &aim, MouseButton::Right, &slab).unwrap();
+        let intent =
+            action_for(Some(&scene), &aim, MouseButton::Right, &slab, [0., -1., 0.]).unwrap();
         assert_eq!(intent, (true, target, 1));
         scene
             .apply_edit(intent.0, &slab, intent.1, intent.2)
@@ -2453,7 +2467,16 @@ mod tests {
             scene.authority().registry().definition_key(state),
             Some(&key("base:glass"))
         );
-        assert!(action_for(Some(&scene), &PickOutcome::Miss, MouseButton::Right, &slab).is_none());
+        assert!(
+            action_for(
+                Some(&scene),
+                &PickOutcome::Miss,
+                MouseButton::Right,
+                &slab,
+                [0., -1., 0.]
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2468,14 +2491,28 @@ mod tests {
         let eye = [8.5, max_y as f32 + 1.5, 8.5];
         scene.apply_edit(true, &stone, support, 0).unwrap();
         let aim = scene.pick(eye, [0.0, -1.0, 0.0], PICK_RANGE);
-        let intent = action_for(Some(&scene), &aim, MouseButton::Right, &stone).unwrap();
+        let intent = action_for(
+            Some(&scene),
+            &aim,
+            MouseButton::Right,
+            &stone,
+            [0., -1., 0.],
+        )
+        .unwrap();
         assert_eq!(intent, (true, top, 0));
         scene
             .apply_edit(intent.0, &stone, intent.1, intent.2)
             .unwrap();
 
         let aim = scene.pick(eye, [0.0, -1.0, 0.0], PICK_RANGE);
-        let intent = action_for(Some(&scene), &aim, MouseButton::Right, &stone).unwrap();
+        let intent = action_for(
+            Some(&scene),
+            &aim,
+            MouseButton::Right,
+            &stone,
+            [0., -1., 0.],
+        )
+        .unwrap();
         assert_eq!(intent.1.y, max_y);
         let seq = scene.authority().seq();
         assert!(
@@ -2484,14 +2521,16 @@ mod tests {
                 .is_err()
         );
         assert_eq!(scene.authority().seq(), seq);
-        let intent = action_for(Some(&scene), &aim, MouseButton::Left, &stone).unwrap();
+        let intent =
+            action_for(Some(&scene), &aim, MouseButton::Left, &stone, [0., -1., 0.]).unwrap();
         scene
             .apply_edit(intent.0, &stone, intent.1, intent.2)
             .unwrap();
 
         scene.apply_edit(true, &slab, top, 0).unwrap();
         let aim = scene.pick(eye, [0.0, -1.0, 0.0], PICK_RANGE);
-        let intent = action_for(Some(&scene), &aim, MouseButton::Right, &slab).unwrap();
+        let intent =
+            action_for(Some(&scene), &aim, MouseButton::Right, &slab, [0., -1., 0.]).unwrap();
         assert_eq!(intent, (true, top, 1));
         scene
             .apply_edit(intent.0, &slab, intent.1, intent.2)

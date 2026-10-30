@@ -478,7 +478,7 @@ impl ActionView<'_> {
         self.world.registry().default_state(target)
     }
 
-    /// A vertical slab only completes with the opposite half on the same axis.
+    /// Slabs only complete with the opposite half on the same axis.
     pub fn completion_state_for_side(
         &self,
         block: &ContentKey,
@@ -487,9 +487,13 @@ impl ActionView<'_> {
     ) -> Option<BlockStateId> {
         let registry = self.world.registry();
         let definition = registry.definition(current)?;
-        if definition
-            .tags
-            .contains(&ContentKey::parse("world:tag/vertical_slab").expect("static tag"))
+        if ["world:tag/slab", "world:tag/vertical_slab"]
+            .into_iter()
+            .any(|tag| {
+                definition
+                    .tags
+                    .contains(&ContentKey::parse(tag).expect("static tag"))
+            })
         {
             let index = registry
                 .fields_of(current)?

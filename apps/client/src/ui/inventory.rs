@@ -33,7 +33,6 @@ impl Layer {
             "base:stone" => Some("item_stone"),
             "base:glass_slab" => Some("item_glass"),
             "base:plant" => Some("item_plant"),
-            "base:vertical_glass_slab" => Some("item_vertical_glass"),
             _ => None,
         };
         label

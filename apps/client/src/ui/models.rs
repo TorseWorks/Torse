@@ -269,7 +269,7 @@ mod tests {
             Some(&pool),
             32,
         );
-        assert_eq!(models.sprites.len(), 4);
+        assert_eq!(models.sprites.len(), 3);
         let mut silhouettes = Vec::new();
         for sprite in models.sprites.values() {
             let mut canvas = Canvas::new(32, 32, 1);

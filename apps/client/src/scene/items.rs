@@ -464,14 +464,14 @@ mod tests {
         assert_eq!(scene.inventory_slots()[0], before[0]);
     }
     #[test]
-    fn vertical_glass_places_each_side_and_rejects_wrong_axis_completion() {
-        for side in 0..4 {
+    fn unified_glass_places_all_sides_and_rejects_wrong_axis_completion() {
+        for side in 0..6 {
             let mut scene = Scene::new(0).unwrap();
             scene.enable_items(None).unwrap();
             let owner = scene.item_owner().unwrap();
             let pos = BlockPos::new(8, 14, 8);
             scene
-                .apply_item_call(torse_items::edit_call(owner, true, 3, pos, side))
+                .apply_item_call(torse_items::edit_call(owner, true, 0, pos, side))
                 .unwrap();
             let state = scene.authority.store().query(pos).ready().unwrap();
             assert_eq!(
@@ -481,12 +481,12 @@ mod tests {
             let before = scene.inventory_slots();
             assert!(
                 scene
-                    .apply_item_call(torse_items::edit_call(owner, true, 3, pos, side ^ 2))
+                    .apply_item_call(torse_items::edit_call(owner, true, 0, pos, (side + 2) % 6))
                     .is_err()
             );
             assert_eq!(scene.inventory_slots(), before);
             scene
-                .apply_item_call(torse_items::edit_call(owner, true, 3, pos, side ^ 1))
+                .apply_item_call(torse_items::edit_call(owner, true, 0, pos, side ^ 1))
                 .unwrap();
             let state = scene.authority.store().query(pos).ready().unwrap();
             assert_eq!(

@@ -185,10 +185,16 @@ fn physical_drops_recover_and_pickup_is_scoped_and_durable() {
             .handle_of(drop_id)
             .is_none()
     );
-    assert_eq!(
-        stock(&server, player).slots()[4].as_ref().unwrap().item,
-        key("base:stone")
-    );
+    let quantity = |inventory: &Inventory| {
+        inventory
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|stack| stack.item == key("base:stone"))
+            .map(|stack| stack.count)
+            .sum::<u32>()
+    };
+    assert_eq!(quantity(&stock(&server, player)), quantity(&before) + 1);
     assert_eq!(
         server.submit(WorldRequest {
             id: pickup,

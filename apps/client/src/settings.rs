@@ -296,6 +296,11 @@ impl Settings {
                 }
             }
         }
+        for slot in &mut settings.supply_slots {
+            if slot == "base:vertical_glass_slab" {
+                *slot = "base:glass_slab".to_owned();
+            }
+        }
         settings.validate()?;
         Ok(settings)
     }
@@ -383,6 +388,22 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn former_vertical_supply_slots_resolve_to_the_unified_slab_item() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../.work/settings-slab-{}.toml",
+            std::process::id()
+        ));
+        let settings = Settings {
+            supply_slots: vec!["base:vertical_glass_slab".into(), "base:stone".into()],
+            ..Settings::default()
+        };
+        settings.save(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert_eq!(loaded.supply_slots, vec!["base:glass_slab", "base:stone"]);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn preferences_round_trip_reject_conflicts_and_out_of_range_values() {
         let mut settings = Settings::default();

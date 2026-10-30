@@ -634,9 +634,10 @@ impl Scene {
         &self,
         hit: &PickHit,
         held: &ContentKey,
+        direction: [f32; 3],
     ) -> Option<block_actions::placement::PlacementIntent> {
         let current = self.authority.store().query(hit.block).ready()?;
-        block_actions::placement::resolve_at(
+        block_actions::placement::resolve_view(
             self.authority.registry(),
             held,
             current,
@@ -651,6 +652,7 @@ impl Scene {
                 hit.entry[2] - hit.block.z as f32,
             ]
             .map(|v| v.clamp(0.0, 1.0)),
+            direction,
         )
     }
 
@@ -1919,7 +1921,7 @@ mod tests {
         // Placing the same slab into the occupied cell merges the pair into
         // one full glass block, exactly what the top-face aim sends.
         scene
-            .apply_edit(true, &slab, target, 0)
+            .apply_edit(true, &slab, target, 1)
             .expect("second slab merges");
         let state = scene
             .authority()

@@ -19,7 +19,7 @@ pub struct PlacementHit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlacementIntent {
     pub target: BlockPos,
-    /// Lower half is zero; upper half is one.
+    /// Declared half state; unified slabs use lower, upper, west, east, north, south.
     pub half: u32,
 }
 
@@ -149,6 +149,86 @@ pub fn resolve_at(
     })
 }
 
+/// Choose a unified slab axis from the view's dominant direction. Other block
+/// templates retain their face-based placement. Complementing an inner face
+/// takes precedence over view direction, so filling an existing half is stable.
+pub fn resolve_view(
+    registry: &BlockStateRegistry,
+    held: &ContentKey,
+    current: BlockStateId,
+    hit: PlacementHit,
+    local: [f32; 3],
+    direction: [f32; 3],
+) -> Option<PlacementIntent> {
+    let mut intent = resolve_at(registry, held, current, hit, local)?;
+    let unified = registry
+        .default_state(held)
+        .and_then(|s| registry.definition(s))
+        .is_some_and(|definition| {
+            definition
+                .tags
+                .iter()
+                .any(|tag| tag.to_string() == "world:tag/slab")
+        });
+    if !unified {
+        return Some(intent);
+    }
+    if direction.iter().any(|v| !v.is_finite()) || direction.iter().all(|v| v.abs() < 1e-6) {
+        return None;
+    }
+    if registry.definition(current).is_some_and(|d| &d.id == held) {
+        let bounds = match registry.selection_shape_ref(current)? {
+            Shape::LowerSlab => torse_content::BoxBounds {
+                min: [0.; 3],
+                max: [1., 0.5, 1.],
+            },
+            Shape::Box(bounds) => *bounds,
+            _ => return None,
+        };
+        let axis = (0..3).find(|axis| bounds.max[*axis] - bounds.min[*axis] == 0.5)?;
+        let side = u32::from(bounds.min[axis] == 0.5);
+        let inner = if side == 0 { 1 } else { -1 };
+        if hit.face[axis] == inner {
+            return Some(PlacementIntent {
+                target: hit.block,
+                half: pair(axis) + (side ^ 1),
+            });
+        }
+    }
+    // The legacy resolver may have suggested completing a horizontal half;
+    // only the actual exposed inner face completes a unified slab.
+    intent.target = BlockPos::new(
+        hit.block.x.checked_add(i64::from(hit.face[0]))?,
+        hit.block.y.checked_add(i64::from(hit.face[1]))?,
+        hit.block.z.checked_add(i64::from(hit.face[2]))?,
+    );
+    let magnitude = direction.map(f32::abs);
+    let axis = if magnitude[1] >= magnitude[0].hypot(magnitude[2]) {
+        1
+    } else if magnitude[0] >= magnitude[2] {
+        0
+    } else {
+        2
+    };
+    let side = if hit.face[axis] != 0 {
+        u32::from(hit.face[axis] < 0)
+    } else if (local[axis] - 0.5).abs() > 1e-5 {
+        u32::from(local[axis] > 0.5)
+    } else {
+        u32::from(direction[axis] > 0.0)
+    };
+    intent.half = pair(axis) + side;
+    Some(intent)
+}
+
+fn pair(axis: usize) -> u32 {
+    match axis {
+        1 => 0,
+        0 => 2,
+        _ => 4,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,15 +237,107 @@ mod tests {
         ContentKey::parse(text).unwrap()
     }
 
+    #[test]
+    fn one_slab_item_resolves_six_halves_and_completes_independently_of_view() {
+        let registry = registry();
+        let held = key("base:glass_slab");
+        let stone = registry.default_state(&key("base:stone")).unwrap();
+        for (face, local, direction, half) in [
+            ([0, 1, 0], [0.5, 1.0, 0.5], [0., -1., 0.], 0),
+            ([0, -1, 0], [0.5, 0.0, 0.5], [0., 1., 0.], 1),
+            ([1, 0, 0], [1., 0.5, 0.5], [-1., 0., 0.], 2),
+            ([-1, 0, 0], [0., 0.5, 0.5], [1., 0., 0.], 3),
+            ([0, 0, 1], [0.5, 0.5, 1.], [0., 0., -1.], 4),
+            ([0, 0, -1], [0.5, 0.5, 0.], [0., 0., 1.], 5),
+            ([0, 1, 0], [0.2, 1.0, 0.5], [1., -0.2, 0.], 2),
+            ([0, 1, 0], [0.5, 1.0, 0.8], [0., -0.2, -1.], 5),
+            // A diagonal yaw must not change the 45-degree pitch threshold.
+            ([0, 1, 0], [0.5, 1.0, 0.5], [0.6, -0.7, 0.6], 3),
+        ] {
+            let hit = PlacementHit {
+                block: BlockPos::new(-3, 4, -5),
+                face,
+                local_height: local[1],
+            };
+            let intent = resolve_view(&registry, &held, stone, hit, local, direction).unwrap();
+            assert_eq!(intent.half, half);
+            assert_ne!(intent.target, hit.block);
+        }
+        for half in 0..6u16 {
+            let current = registry.state_of(&held, &[half]).unwrap();
+            let axis = [1, 0, 2][usize::from(half / 2)];
+            let mut face = [0; 3];
+            face[axis] = if half % 2 == 0 { 1 } else { -1 };
+            let hit = PlacementHit {
+                block: BlockPos::ZERO,
+                face,
+                local_height: 0.5,
+            };
+            for direction in [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]] {
+                let intent =
+                    resolve_view(&registry, &held, current, hit, [0.5; 3], direction).unwrap();
+                assert_eq!(
+                    intent,
+                    PlacementIntent {
+                        target: BlockPos::ZERO,
+                        half: u32::from(half ^ 1)
+                    }
+                );
+                let outer = resolve_view(
+                    &registry,
+                    &held,
+                    current,
+                    PlacementHit {
+                        face: face.map(|v| -v),
+                        ..hit
+                    },
+                    [0.5; 3],
+                    direction,
+                )
+                .unwrap();
+                assert_ne!(outer.target, BlockPos::ZERO);
+            }
+        }
+        let hit = PlacementHit {
+            block: BlockPos::ZERO,
+            face: [0, 1, 0],
+            local_height: 1.,
+        };
+        for direction in [[0.; 3], [f32::NAN, 0., 1.], [0., f32::INFINITY, 0.]] {
+            assert!(
+                resolve_view(&registry, &held, stone, hit, [0.5, 1., 0.5], direction).is_none()
+            );
+        }
+    }
+
     fn registry() -> BlockStateRegistry {
-        let content = torse_content::compile(torse_content::m0_fixture_pack()).unwrap();
+        let mut pack = torse_content::m0_fixture_pack();
+        let schema = key("test:state/legacy_vertical");
+        let mut block = pack
+            .blocks
+            .iter()
+            .find(|b| b.value.id == key("base:glass_slab"))
+            .unwrap()
+            .value
+            .clone();
+        block.id = key("test:vertical_slab");
+        torse_content::presets::vertical_slab(&mut block, schema.clone());
+        pack.state_schemas.push(torse_content::Sourced {
+            source: pack.state_schemas[0].source.clone(),
+            value: torse_content::presets::vertical_slab_schema(schema),
+        });
+        pack.blocks.push(torse_content::Sourced {
+            source: pack.blocks[0].source.clone(),
+            value: block,
+        });
+        let content = torse_content::compile(pack).unwrap();
         BlockStateRegistry::build(&content).unwrap()
     }
 
     #[test]
     fn vertical_glass_uses_all_four_sides_and_only_completes_the_inner_face() {
         let registry = registry();
-        let held = key("base:vertical_glass_slab");
+        let held = key("test:vertical_slab");
         for (side, face) in [
             (0, [1, 0, 0]),
             (1, [-1, 0, 0]),
