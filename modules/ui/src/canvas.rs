@@ -214,6 +214,28 @@ impl Canvas {
         );
     }
 
+    /// Draw an image directly at physical resolution, retaining details within
+    /// a logical pixel. Skin sprites keep their separate pixel-aligned path.
+    pub fn image(&mut self, sprite: &Sprite, rect: Rect) {
+        let scale = i64::from(self.scale);
+        let left = i64::from(rect.x) * scale;
+        let top = i64::from(rect.y) * scale;
+        let width = i64::from(rect.w) * scale;
+        let height = i64::from(rect.h) * scale;
+        if width == 0 || height == 0 {
+            return;
+        }
+        let pixels = sprite.assets.get(sprite.handle).expect("resident image");
+        for y in top.max(0)..(top + height).min(i64::from(self.pixel_height())) {
+            let sy = ((y - top) * i64::from(sprite.height) / height) as usize;
+            for x in left.max(0)..(left + width).min(i64::from(self.pixel_width())) {
+                let sx = ((x - left) * i64::from(sprite.width) / width) as usize;
+                let i = (sy * sprite.width as usize + sx) * 4;
+                self.blend_px(x as i32, y as i32, pixels[i..i + 4].try_into().unwrap());
+            }
+        }
+    }
+
     /// Nine-slice one validated atlas region, clipping work to the canvas.
     pub fn sprite_region(&mut self, sprite: &Sprite, source: Rect, rect: Rect, border: u32) {
         if source.x < 0
@@ -481,6 +503,21 @@ impl Text {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_images_preserve_detail_inside_scaled_logical_pixels() {
+        let rgba = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let sprite = Sprite::from_pixels(2, 2, rgba.clone(), AssetGuid(7)).unwrap();
+        let mut canvas = Canvas::new(1, 1, 2);
+        canvas.image(&sprite, Rect::new(0, 0, 1, 1));
+        assert_eq!(canvas.as_pixels(), rgba);
+        let before = canvas.as_pixels().to_vec();
+        canvas.image(&sprite, Rect::new(i32::MIN, i32::MIN, 1, 1));
+        canvas.image(&sprite, Rect::new(0, 0, 0, 1));
+        assert_eq!(canvas.as_pixels(), before);
+    }
     #[test]
     fn nine_slice_preserves_corners_and_transparency() {
         let sprite = Sprite::from_pixels(

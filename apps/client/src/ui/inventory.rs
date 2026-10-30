@@ -52,7 +52,7 @@ impl Layer {
             return;
         };
         if let Some(sprite) = self.models.get(&stack.item) {
-            c.sprite(
+            c.image(
                 sprite,
                 Rect::new(
                     rect.x + 1,
@@ -60,7 +60,6 @@ impl Layer {
                     rect.w.saturating_sub(2),
                     rect.h.saturating_sub(2),
                 ),
-                0,
             );
         } else {
             self.text.draw(
@@ -173,11 +172,10 @@ impl Layer {
             .and_then(|slot| v.inventory.get(slot).and_then(Option::as_ref))
             .or_else(|| v.bar.get(v.material).and_then(Option::as_ref));
         if let Some(stack) = stack {
-            if let Some(sprite) = self.models.get(&stack.item) {
-                c.sprite(
+            if let Some(sprite) = self.models.detail(&stack.item) {
+                c.image(
                     sprite,
                     Rect::new(side.x + (side.w as i32 - 72) / 2, side.y + 12, 72, 72),
-                    0,
                 );
             }
             let name = self.item_name(stack);

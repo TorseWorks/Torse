@@ -387,6 +387,7 @@ impl Layer {
         state: &State,
         hud: Hud<'_>,
     ) {
+        let layout = Layout::new(size);
         if let Some(scene) = hud.scene {
             let keys = hud
                 .inventory
@@ -394,11 +395,38 @@ impl Layer {
                 .chain(hud.bar.iter())
                 .filter_map(|s| s.as_ref().map(|s| s.item.clone()))
                 .chain(["base:stone", "base:glass_slab", "base:plant"].map(torse_items::key));
-            if self.models.prepare(scene, keys, self.memory.as_ref()) {
+            if self
+                .models
+                .prepare(scene, keys, self.memory.as_ref(), 32 * layout.scale)
+            {
                 self.last = None;
             }
         }
-        let layout = Layout::new(size);
+        if let Some(scene) = hud.scene {
+            let selected = match layout.hit(
+                state.mode,
+                state.cursor,
+                state.tab,
+                state.settings.infinite_supply,
+            ) {
+                Some(Action::Slot(slot)) => Some(slot),
+                _ => state.inventory_source,
+            };
+            let detail = if state.mode == Mode::Inventory {
+                selected
+                    .and_then(|slot| hud.inventory.get(slot).and_then(Option::as_ref))
+                    .or_else(|| hud.bar.get(hud.material).and_then(Option::as_ref))
+                    .map(|stack| stack.item.clone())
+            } else {
+                None
+            };
+            if self
+                .models
+                .prepare_detail(scene, detail, 72 * layout.scale, self.memory.as_ref())
+            {
+                self.last = None;
+            }
+        }
         let names = if hud.bar.is_empty() {
             hud.names.into_iter().take(3).collect()
         } else {
@@ -660,7 +688,7 @@ impl Layer {
                 } else if packaged {
                     let item = torse_items::key(["base:stone", "base:glass_slab", "base:plant"][i]);
                     if let Some(sprite) = self.models.get(&item) {
-                        c.sprite(sprite, Rect::new(x + 1, slot_y + 1, 30, 30), 0);
+                        c.image(sprite, Rect::new(x + 1, slot_y + 1, 30, 30));
                     }
                 }
                 self.text.draw(
@@ -838,7 +866,7 @@ impl Layer {
             if let Some(index) = icon {
                 let item = torse_items::key(["base:stone", "base:glass_slab", "base:plant"][index]);
                 if let Some(sprite) = self.models.get(&item) {
-                    c.sprite(sprite, Rect::new(gx + 37, p.y + 59, 22, 22), 0);
+                    c.image(sprite, Rect::new(gx + 37, p.y + 59, 22, 22));
                 }
                 self.text
                     .draw(c, "1", Rect::new(gx + 37, p.y + 60, 8, 9), 8, MUTED);
