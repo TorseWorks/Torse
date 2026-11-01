@@ -153,7 +153,7 @@ fn compile_content() -> Result<(BlockStateRegistry, ComponentSchemas, Compatibil
         compile(content_pack()).map_err(|errors| format!("content failed: {errors:?}"))?;
     let registry =
         BlockStateRegistry::build(&content).map_err(|error| format!("registry failed: {error}"))?;
-    let schemas = ComponentSchemas::build(&content);
+    let mut schemas = ComponentSchemas::build(&content);
     let catalog = torse_items::fixture_catalog(&registry)
         .map_err(|error| format!("item rules: {error:?}"))?
         .with_world_drops();
@@ -162,6 +162,12 @@ fn compile_content() -> Result<(BlockStateRegistry, ComponentSchemas, Compatibil
         rules_digest: content.authority_digest,
         content_digest: content.presentation_digest,
     });
+    catalog
+        .bind_schemas(&mut schemas)
+        .map_err(|error| format!("item validation: {error}"))?;
+    let (schemas, compatibility) = schemas
+        .bind_compatibility(compatibility)
+        .map_err(|error| format!("item compatibility: {error}"))?;
     Ok((registry, schemas, compatibility))
 }
 

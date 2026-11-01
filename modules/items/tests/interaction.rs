@@ -24,7 +24,8 @@ fn setup_policy(physical: bool) -> (WorldAuthority, ActionService, Catalog, Enti
     } else {
         catalog
     };
-    let schemas = ComponentSchemas::build(&content);
+    let mut schemas = ComponentSchemas::build(&content);
+    catalog.bind_schemas(&mut schemas).unwrap();
     let mut descriptors = block_actions::descriptors();
     descriptors.extend(torse_items::descriptors());
     let mut handlers = torse_items::block_handlers();
@@ -215,6 +216,7 @@ fn initial_drop_escapes_refilled_terrain_but_waits_when_enclosed_or_unloaded() {
                 &torse_items::drops::schema(),
                 torse_items::drops::DropState {
                     stack: ItemStack {
+                        data: Default::default(),
                         item: key("base:stone"),
                         count: 7,
                     },
@@ -291,11 +293,26 @@ fn pickup_is_atomic_partial_and_rejects_forged_child_actions() {
     let (mut world, service, catalog, id) = setup_policy(true);
     let handle = world.entities().handle_of(id).unwrap();
     let schemas = world.schemas().clone();
+    let data: ComponentFields = [
+        (key("test:durability"), ComponentValue::U32(19)),
+        (
+            key("extension:unknown"),
+            ComponentValue::Record(
+                [(
+                    key("extension:label"),
+                    ComponentValue::Text("preserve exactly".into()),
+                )]
+                .into(),
+            ),
+        ),
+    ]
+    .into();
     let mut stock = Inventory::new(1).unwrap();
     stock
         .set(
             0,
             Some(ItemStack {
+                data: data.clone(),
                 item: key("base:stone"),
                 count: 63,
             }),
@@ -315,6 +332,7 @@ fn pickup_is_atomic_partial_and_rejects_forged_child_actions() {
     let drop = world.entities().get(drop_handle).unwrap().id;
     let fields = torse_items::drops::DropState {
         stack: ItemStack {
+            data: data.clone(),
             item: key("base:stone"),
             count: 2,
         },
@@ -377,6 +395,20 @@ fn pickup_is_atomic_partial_and_rejects_forged_child_actions() {
         Err(RejectCode::PermissionDenied)
     );
     assert_eq!(world.seq(), seq);
+    assert_eq!(
+        inventory(&world, &catalog, id).slots()[0]
+            .as_ref()
+            .unwrap()
+            .data,
+        data
+    );
+    assert_eq!(
+        torse_items::drops::DropState::read(world.entities().get(drop_handle).unwrap(), &catalog)
+            .unwrap()
+            .stack
+            .data,
+        data
+    );
 }
 
 #[test]
@@ -391,6 +423,7 @@ fn nearby_equal_items_merge_without_overflow_or_crossing_a_wall() {
         let h = world.entities_mut().spawn(position).unwrap();
         let state = torse_items::drops::DropState {
             stack: ItemStack {
+                data: Default::default(),
                 item: key(item),
                 count,
             },
@@ -641,6 +674,7 @@ fn blocked_placement_full_inventory_and_stale_plan_change_neither_side() {
         full.set(
             slot,
             Some(ItemStack {
+                data: Default::default(),
                 item: key("base:plant"),
                 count: 64,
             }),
@@ -740,6 +774,7 @@ fn catalog_rules_are_canonical_and_reject_invalid_external_definitions() {
     let drops = vec![(
         key("base:stone"),
         ItemStack {
+            data: Default::default(),
             item: definition.id.clone(),
             count: 1,
         },
@@ -760,6 +795,16 @@ fn catalog_rules_are_canonical_and_reject_invalid_external_definitions() {
         a.bind_compatibility(base).rules_digest,
         c.bind_compatibility(base).rules_digest
     );
+    let mut changed = drops.clone();
+    changed[0]
+        .1
+        .data
+        .insert(key("extension:rule"), ComponentValue::U32(1));
+    let c = Catalog::new(a.definitions().cloned(), changed, world.registry()).unwrap();
+    assert_ne!(
+        a.bind_compatibility(base).rules_digest,
+        c.bind_compatibility(base).rules_digest
+    );
     assert!(
         Catalog::new(
             [definition.clone(), definition.clone()],
@@ -771,4 +816,194 @@ fn catalog_rules_are_canonical_and_reject_invalid_external_definitions() {
     let mut invalid = definition;
     invalid.block = Some(key("missing:block"));
     assert!(Catalog::new([invalid], drops, world.registry()).is_err());
+}
+
+#[test]
+fn throwing_roundtrips_instance_data_and_rejects_unsupported_drop_formats() {
+    let (mut world, service, catalog, id) = setup_policy(true);
+    let data: ComponentFields = [(
+        key("extension:custom"),
+        ComponentValue::List(vec![
+            ComponentValue::Text("exact value".into()),
+            ComponentValue::U32(7),
+        ]),
+    )]
+    .into();
+    let stack = ItemStack {
+        item: key("base:stone"),
+        count: 3,
+        data: data.clone(),
+    };
+    let mut stock = Inventory::new(2).unwrap();
+    stock.set(0, Some(stack), catalog.stack_rules()).unwrap();
+    let schemas = world.schemas().clone();
+    let handle = world.entities().handle_of(id).unwrap();
+    world
+        .entities_mut()
+        .components_mut(handle)
+        .unwrap()
+        .insert(&schemas, &torse_inventory::schema(), stock.fields())
+        .unwrap();
+    let call = torse_items::throw_call(id, 0);
+    let mut req = request(id, false, 0, 11);
+    req.action = call.action;
+    req.target = call.target;
+    req.parameters = call.parameters;
+    let ActionOutput::Atomic(group) = service
+        .plan(&world, &actor(id), Phase::Interaction, &req)
+        .unwrap()
+    else {
+        panic!("atomic throw");
+    };
+    world.publish(world.prepare_group(&group).unwrap()).unwrap();
+    let (_, drop) = world
+        .entities()
+        .iter()
+        .find(|(_, entity)| {
+            entity
+                .components
+                .component(&torse_items::drops::schema())
+                .is_some()
+        })
+        .unwrap();
+    let dropped = torse_items::drops::DropState::read(drop, &catalog).unwrap();
+    assert_eq!(dropped.stack.count, 1);
+    assert_eq!(dropped.stack.data, data);
+    let left = inventory(&world, &catalog, id);
+    assert_eq!(left.slots()[0].as_ref().unwrap().count, 2);
+    assert_eq!(left.slots()[0].as_ref().unwrap().data, data);
+    let fields = dropped.fields();
+    let mut unsupported = fields.clone();
+    unsupported.insert(key("items:drop/data_format"), ComponentValue::U32(99));
+    assert!(torse_items::drops::DropState::from_fields(&unsupported, &catalog).is_err());
+    assert!(ComponentSet::validate(&schemas, &torse_items::drops::schema(), &unsupported).is_err());
+    let mut oversized = fields.clone();
+    oversized.insert(
+        key("items:drop/data"),
+        ComponentValue::Record(
+            [(
+                key("extension:large"),
+                ComponentValue::Text("x".repeat(1025)),
+            )]
+            .into(),
+        ),
+    );
+    assert!(ComponentSet::validate(&schemas, &torse_items::drops::schema(), &oversized).is_err());
+    let mut legacy = fields;
+    legacy.remove(&key("items:drop/data"));
+    legacy.remove(&key("items:drop/data_format"));
+    assert!(
+        torse_items::drops::DropState::from_fields(&legacy, &catalog)
+            .unwrap()
+            .stack
+            .data
+            .is_empty()
+    );
+    let snapshot = world
+        .capture_snapshot(SnapshotMeta {
+            cursor: CommitCursor {
+                world: world.world(),
+                seq: world.seq(),
+            },
+            compatibility: world.coordinator().compatibility(),
+            resume_at: world.coordinator().resume_point(),
+        })
+        .unwrap();
+    let mut recovery = torse_sim::Recovery::new(world.world(), world.registry(), world.schemas());
+    recovery.restore_snapshot(&snapshot).unwrap();
+    let recovered = recovery.finish().unwrap();
+    let entity = recovered
+        .entities()
+        .get(recovered.entities().handle_of(drop.id).unwrap())
+        .unwrap();
+    assert_eq!(
+        torse_items::drops::DropState::read(entity, &catalog).unwrap(),
+        dropped
+    );
+}
+
+#[test]
+fn distinct_instance_drops_do_not_merge_or_fill_an_incompatible_inventory() {
+    let (mut world, service, catalog, id) = setup_policy(true);
+    let schemas = world.schemas().clone();
+    let mut stock = Inventory::new(1).unwrap();
+    stock
+        .set(
+            0,
+            Some(ItemStack::new(key("base:stone"), 1)),
+            catalog.stack_rules(),
+        )
+        .unwrap();
+    let handle = world.entities().handle_of(id).unwrap();
+    world
+        .entities_mut()
+        .components_mut(handle)
+        .unwrap()
+        .insert(&schemas, &torse_inventory::schema(), stock.fields())
+        .unwrap();
+    let mut drop_ids = vec![];
+    for durability in [10, 11] {
+        let handle = world
+            .entities_mut()
+            .spawn(Position::new(1.2, 2.0, 1.0))
+            .unwrap();
+        let state = torse_items::drops::DropState {
+            stack: ItemStack {
+                item: key("base:stone"),
+                count: 1,
+                data: [(key("test:durability"), ComponentValue::U32(durability))].into(),
+            },
+            velocity: [0; 3],
+        };
+        drop_ids.push(world.entities().get(handle).unwrap().id);
+        world
+            .entities_mut()
+            .components_mut(handle)
+            .unwrap()
+            .insert(&schemas, &torse_items::drops::schema(), state.fields())
+            .unwrap();
+        world
+            .entities_mut()
+            .components_mut(handle)
+            .unwrap()
+            .insert(
+                &schemas,
+                &collider_schema(),
+                EntityCollider::Disabled.fields(),
+            )
+            .unwrap();
+    }
+    let call = torse_items::pickup_call(id, drop_ids[0]);
+    let mut req = request(id, false, 0, 12);
+    req.action = call.action;
+    req.target = call.target;
+    req.parameters = call.parameters;
+    assert!(
+        service
+            .plan(
+                &world,
+                &actor(id).target(req.target),
+                Phase::Interaction,
+                &req
+            )
+            .is_err()
+    );
+    assert_eq!(inventory(&world, &catalog, id), stock);
+    for group in torse_items::drops::plans(&world, &catalog, Tick(1)) {
+        assert!(group.members.iter().all(|tx| tx.despawns.is_empty()));
+        world.publish(world.prepare_group(&group).unwrap()).unwrap();
+    }
+    for id in drop_ids {
+        let drop = world
+            .entities()
+            .get(world.entities().handle_of(id).unwrap())
+            .unwrap();
+        assert_eq!(
+            torse_items::drops::DropState::read(drop, &catalog)
+                .unwrap()
+                .stack
+                .count,
+            1
+        );
+    }
 }

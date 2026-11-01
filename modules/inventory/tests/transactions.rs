@@ -1,5 +1,7 @@
 //! Conservation, concurrency, recovery, and generic protected-component checks.
 mod actions;
+#[path = "transactions/instance_persistence.rs"]
+mod instance_persistence;
 mod replica;
 mod support;
 use support::*;
@@ -101,6 +103,7 @@ fn invalid_amount_slot_capacity_and_item_mismatch_never_publish() {
                                 "base:glass_slab"
                             }),
                             count: 64,
+                            data: Default::default(),
                         }),
                         &catalog,
                     )
@@ -432,7 +435,8 @@ fn harvest_task_breaks_the_block_and_moves_the_item_atomically() {
         inventory_of(ids[1]).slots()[0],
         Some(ItemStack {
             item: key("base:stone"),
-            count: 1
+            count: 1,
+            data: Default::default(),
         })
     );
 

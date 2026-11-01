@@ -144,6 +144,7 @@ impl Scene {
             .definitions()
             .find(|entry| &entry.id == id)?;
         Some(ItemStack {
+            data: Default::default(),
             item: entry.id.clone(),
             count: entry.limit,
         })
@@ -158,6 +159,7 @@ impl Scene {
                     .skip(page.saturating_mul(36))
                     .take(36)
                     .map(|entry| ItemStack {
+                        data: Default::default(),
                         item: entry.id.clone(),
                         count: entry.limit,
                     })
@@ -174,6 +176,7 @@ impl Scene {
                     .catalog
                     .definitions()
                     .map(|entry| ItemStack {
+                        data: Default::default(),
                         item: entry.id.clone(),
                         count: entry.limit,
                     })

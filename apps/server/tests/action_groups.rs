@@ -119,6 +119,7 @@ impl ActionHandler for Lifecycle {
                         target,
                         slot: 0,
                         stack: ItemStack {
+                            data: Default::default(),
                             item: item.clone(),
                             count: *count,
                         },
@@ -171,7 +172,7 @@ impl ActionHandler for Compose {
         };
         let consume = ActionInvocation {
             action: key("inventory:action/consume"),
-            api_version: 1,
+            api_version: 2,
             target: ActionTarget::Entity(EntityId(1)),
             parameters: ComponentFields::new(),
         };
@@ -214,6 +215,7 @@ impl ActionHandler for Consume {
                 target,
                 slot: 0,
                 stack: ItemStack {
+                    data: Default::default(),
                     item: key("base:stone"),
                     count: 1,
                 },
@@ -413,6 +415,7 @@ fn world(mode: Mode) -> (WorldAuthority, ActionService) {
         .set(
             0,
             Some(ItemStack {
+                data: Default::default(),
                 item: key("base:stone"),
                 count: 1,
             }),
@@ -474,6 +477,7 @@ fn create_lifecycle(dir: &Directory, full: bool) -> base::Files {
             .set(
                 0,
                 Some(ItemStack {
+                    data: Default::default(),
                     item: key("base:stone"),
                     count: 64,
                 }),

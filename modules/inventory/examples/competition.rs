@@ -37,7 +37,7 @@ fn meta(world: &WorldAuthority) -> SnapshotMeta {
 fn request(source: EntityId, destination: EntityId, id: u128) -> ActionRequest {
     ActionRequest {
         action: key("inventory:action/transfer"),
-        api_version: 1,
+        api_version: 2,
         origin: ActionOrigin::Network,
         target: ActionTarget::Entity(source),
         transaction: TransactionId(id),
@@ -95,9 +95,10 @@ fn run() -> Result<()> {
     block_actions::register_content(&mut pack);
     torse_inventory::register_content(&mut pack);
     let content = compile(pack).map_err(|e| format!("content: {e:?}"))?;
-    let schemas = ComponentSchemas::build(&content);
+    let mut schemas = ComponentSchemas::build(&content);
     let catalog =
         ItemCatalog::new([(key("base:stone"), 64)]).map_err(|e| format!("catalog: {e:?}"))?;
+    catalog.bind_schemas(&mut schemas)?;
     let mut descriptors = block_actions::descriptors();
     descriptors.extend(torse_inventory::descriptors());
     let mut handlers = block_actions::handlers();
@@ -129,14 +130,7 @@ fn run() -> Result<()> {
         let mut inventory = Inventory::new(2).map_err(|e| format!("capacity: {e:?}"))?;
         if index == 0 {
             inventory
-                .set(
-                    0,
-                    Some(ItemStack {
-                        item: key("base:stone"),
-                        count: 1,
-                    }),
-                    &catalog,
-                )
+                .set(0, Some(ItemStack::new(key("base:stone"), 1)), &catalog)
                 .map_err(|e| format!("initial stack: {e:?}"))?;
         }
         world
@@ -218,6 +212,7 @@ fn run() -> Result<()> {
     )?;
     let mut block = request(ids[0], ids[1], 3);
     block.action = key("world:action/place");
+    block.api_version = 1;
     block.target = ActionTarget::Block(pos);
     block.parameters = [(
         key("world:field/block"),

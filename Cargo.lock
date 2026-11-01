@@ -3114,6 +3114,7 @@ version = "0.1.0"
 dependencies = [
  "sha2",
  "torse-actions",
+ "torse-codec",
  "torse-content",
  "torse-sim",
  "torse-types",

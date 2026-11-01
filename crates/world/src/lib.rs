@@ -44,9 +44,9 @@ pub use collider::{
     collider_schema,
 };
 pub use component::{
-    ComponentError, ComponentFields, ComponentSchemas, ComponentSet, ComponentValue,
-    MAX_COMPONENT_BYTES, MAX_COMPONENT_INSTANCES, MAX_COMPONENT_NODES, MAX_VALUE_DEPTH,
-    component_memory_bytes, component_size,
+    ComponentError, ComponentFields, ComponentSchemas, ComponentSet, ComponentValidator,
+    ComponentValue, MAX_COMPONENT_BYTES, MAX_COMPONENT_INSTANCES, MAX_COMPONENT_NODES,
+    MAX_VALUE_DEPTH, component_memory_bytes, component_size,
 };
 pub use configuration::{BlockDefault, ComponentConfiguration, PersistenceSelection};
 pub use entity::{

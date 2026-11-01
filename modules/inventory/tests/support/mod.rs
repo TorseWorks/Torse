@@ -26,7 +26,10 @@ pub fn setup() -> (WorldAuthority, ActionService, ItemCatalog, [EntityId; 3]) {
     let content = compile(pack).expect("module content compiles");
     let catalog =
         ItemCatalog::new([(key("base:stone"), 64), (key("base:glass_slab"), 64)]).expect("catalog");
-    let schemas = ComponentSchemas::build(&content);
+    let mut schemas = ComponentSchemas::build(&content);
+    catalog
+        .bind_schemas(&mut schemas)
+        .expect("inventory validation");
     let mut handlers = block_actions::handlers();
     handlers.extend(torse_inventory::handlers(catalog.clone()));
     let mut descriptors = block_actions::descriptors();
@@ -38,11 +41,11 @@ pub fn setup() -> (WorldAuthority, ActionService, ItemCatalog, [EntityId; 3]) {
         schemas.clone(),
         16,
         WorldBounds::new(0, 32).expect("bounds"),
-        Compatibility {
+        catalog.bind_compatibility(Compatibility {
             authority_schema: 3,
             rules_digest: content.authority_digest,
             content_digest: content.presentation_digest,
-        },
+        }),
     )
     .expect("world");
     world
@@ -72,6 +75,7 @@ pub fn setup() -> (WorldAuthority, ActionService, ItemCatalog, [EntityId; 3]) {
                     Some(ItemStack {
                         item: key("base:stone"),
                         count: 1,
+                        data: ComponentFields::new(),
                     }),
                     &catalog,
                 )
@@ -101,7 +105,7 @@ pub fn actor(ids: &[EntityId]) -> ActorContext {
 pub fn request(source: EntityId, destination: EntityId, id: u128) -> ActionRequest {
     ActionRequest {
         action: key("inventory:action/transfer"),
-        api_version: 1,
+        api_version: 2,
         origin: ActionOrigin::Network,
         target: ActionTarget::Entity(source),
         transaction: TransactionId(id),
@@ -177,4 +181,69 @@ pub fn meta(world: &WorldAuthority) -> SnapshotMeta {
         compatibility: world.coordinator().compatibility(),
         resume_at: world.coordinator().resume_point(),
     }
+}
+
+/// An unrecognized nested extension must survive every transport unchanged.
+pub fn instance_data() -> ComponentFields {
+    [
+        (key("base:durability"), ComponentValue::U32(73)),
+        (
+            key("extension:opaque"),
+            ComponentValue::Record(
+                [(
+                    key("extension:values"),
+                    ComponentValue::List(vec![
+                        ComponentValue::Text("custom label".to_owned()),
+                        ComponentValue::I64(-19),
+                        ComponentValue::Bool(false),
+                        ComponentValue::Content(key("extension:unknown_content")),
+                    ]),
+                )]
+                .into(),
+            ),
+        ),
+    ]
+    .into()
+}
+
+pub fn install_instance(world: &mut WorldAuthority, catalog: &ItemCatalog, id: EntityId) {
+    let mut inventory = Inventory::new(2).expect("inventory");
+    inventory
+        .set(
+            0,
+            Some(ItemStack {
+                item: key("base:stone"),
+                count: 1,
+                data: instance_data(),
+            }),
+            catalog,
+        )
+        .expect("instance");
+    let schemas = world.schemas().clone();
+    let handle = world.entities().handle_of(id).expect("entity");
+    world
+        .entities_mut()
+        .components_mut(handle)
+        .expect("components")
+        .insert(&schemas, &torse_inventory::schema(), inventory.fields())
+        .expect("install instance");
+}
+
+pub fn codec_roundtrip<T: torse_codec::wire::Wire>(value: &T) -> T {
+    let budget = torse_types::OutputBudget {
+        max_items: 10_000,
+        max_bytes: 4_000_000,
+    };
+    let limits = torse_codec::CodecLimits {
+        max_frame_bytes: 1_000_000,
+        max_field_bytes: 65_536,
+        max_depth: torse_codec::MIN_WORLD_DEPTH,
+    };
+    let mut bytes = Vec::new();
+    torse_codec::wire::encode(value, &mut bytes, budget, limits).expect("encode");
+    let decoded = torse_codec::wire::decode(&bytes, budget, limits).expect("decode");
+    let mut encoded_again = Vec::new();
+    torse_codec::wire::encode(&decoded, &mut encoded_again, budget, limits).expect("re-encode");
+    assert_eq!(encoded_again, bytes);
+    decoded
 }

@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod content;
+mod instance;
 mod operations;
 mod transfer;
 
@@ -16,7 +17,15 @@ use torse_types::{Compatibility, ContentKey, Digest, RejectCode};
 use torse_world::{ComponentFields, ComponentValue};
 
 pub use content::{descriptors, owner, register_content, schema};
-pub use operations::{InventoryOperation, InventoryPlan, MAX_OPERATIONS, plan_inventory};
+pub use instance::validate_data as validate_instance_data;
+pub use instance::{
+    DATA_FORMAT_VERSION, ItemPolicy, MAX_INSTANCE_BYTES, MAX_INSTANCE_COLLECTION,
+    MAX_INSTANCE_DEPTH, MAX_INSTANCE_KEY_BYTES, MAX_INSTANCE_NODES, MAX_INSTANCE_TEXT_BYTES,
+    U32Rule,
+};
+pub use operations::{
+    InventoryOperation, InventoryPlan, MAX_OPERATIONS, MAX_PLAN_BYTES, plan_inventory,
+};
 pub use transfer::{Transfer, handlers, plan_transfer, plan_transfers};
 
 /// Bounded slot count of the first native container implementation.
@@ -30,6 +39,7 @@ fn key(value: &str) -> ContentKey {
 #[derive(Clone, Debug)]
 pub struct ItemCatalog {
     limits: BTreeMap<ContentKey, u32>,
+    policies: BTreeMap<ContentKey, ItemPolicy>,
 }
 
 impl ItemCatalog {
@@ -37,13 +47,15 @@ impl ItemCatalog {
     pub fn rules_digest(&self) -> Digest {
         use sha2::{Digest as _, Sha256};
         let mut digest = Sha256::new();
-        digest.update(b"torse:inventory/item-rules/v1\0");
+        digest.update(b"torse:inventory/item-rules/v2\0");
+        instance::digest_contract(&mut digest);
         digest.update((self.limits.len() as u64).to_le_bytes());
         for (item, limit) in &self.limits {
             let key = item.to_string();
             digest.update((key.len() as u64).to_le_bytes());
             digest.update(key.as_bytes());
             digest.update(limit.to_le_bytes());
+            self.policies[item].digest(&mut digest);
         }
         Digest(digest.finalize().into())
     }
@@ -66,7 +78,12 @@ impl ItemCatalog {
                 return Err(RejectCode::InvalidData);
             }
         }
-        Ok(Self { limits })
+        let policies = limits
+            .keys()
+            .cloned()
+            .map(|item| (item, ItemPolicy::default()))
+            .collect();
+        Ok(Self { limits, policies })
     }
     fn limit(&self, item: &ContentKey) -> Result<u32, RejectCode> {
         self.limits
@@ -81,6 +98,24 @@ impl ItemCatalog {
 pub struct ItemStack {
     pub item: ContentKey,
     pub count: u32,
+    pub data: ComponentFields,
+}
+
+impl ItemStack {
+    pub fn new(item: ContentKey, count: u32) -> Self {
+        Self {
+            item,
+            count,
+            data: ComponentFields::new(),
+        }
+    }
+    pub fn with_count(&self, count: u32) -> Self {
+        Self {
+            item: self.item.clone(),
+            count,
+            data: self.data.clone(),
+        }
+    }
 }
 
 /// Typed module view of a protected inventory component.
@@ -110,12 +145,18 @@ impl Inventory {
         stack: Option<ItemStack>,
         catalog: &ItemCatalog,
     ) -> Result<(), RejectCode> {
-        if let Some(stack) = &stack
-            && (stack.count == 0 || stack.count > catalog.limit(&stack.item)?)
-        {
-            return Err(RejectCode::InvalidData);
+        if let Some(stack) = &stack {
+            catalog.validate_stack(stack)?;
         }
-        *self.slots.get_mut(slot).ok_or(RejectCode::InvalidData)? = stack;
+        self.slots.get(slot).ok_or(RejectCode::InvalidData)?;
+        instance::validate_container(self.slots.iter().enumerate().map(|(index, old)| {
+            if index == slot {
+                stack.as_ref()
+            } else {
+                old.as_ref()
+            }
+        }))?;
+        self.slots[slot] = stack;
         Ok(())
     }
     /// Convert to stable, schema-compatible component fields.
@@ -137,6 +178,14 @@ impl Inventory {
                                     key("inventory:field/count"),
                                     ComponentValue::U32(stack.count),
                                 ),
+                                (
+                                    key("inventory:field/data_format"),
+                                    ComponentValue::U32(DATA_FORMAT_VERSION),
+                                ),
+                                (
+                                    key("inventory:field/data"),
+                                    ComponentValue::Record(stack.data.clone()),
+                                ),
                             ]
                             .into_iter()
                             .collect(),
@@ -154,6 +203,7 @@ impl Inventory {
         fields: &ComponentFields,
         catalog: &ItemCatalog,
     ) -> Result<Self, RejectCode> {
+        torse_world::component_size(fields).map_err(|_| RejectCode::QuotaExceeded)?;
         if fields.len() != 1 {
             return Err(RejectCode::InvalidData);
         }
@@ -168,7 +218,7 @@ impl Inventory {
             if fields.is_empty() {
                 continue;
             }
-            if fields.len() != 2 {
+            if fields.len() != 2 && fields.len() != 4 {
                 return Err(RejectCode::InvalidData);
             }
             let Some(ComponentValue::Content(item)) = fields.get(&key("inventory:field/item"))
@@ -178,15 +228,29 @@ impl Inventory {
             let Some(ComponentValue::U32(count)) = fields.get(&key("inventory:field/count")) else {
                 return Err(RejectCode::InvalidData);
             };
-            inventory.set(
-                index,
-                Some(ItemStack {
-                    item: item.clone(),
-                    count: *count,
-                }),
-                catalog,
-            )?;
+            let empty = ComponentFields::new();
+            let data = if fields.len() == 2 {
+                &empty
+            } else {
+                if fields.get(&key("inventory:field/data_format"))
+                    != Some(&ComponentValue::U32(DATA_FORMAT_VERSION))
+                {
+                    return Err(RejectCode::InvalidData);
+                }
+                let Some(ComponentValue::Record(data)) = fields.get(&key("inventory:field/data"))
+                else {
+                    return Err(RejectCode::InvalidData);
+                };
+                data
+            };
+            catalog.validate_parts(item, *count, data)?;
+            inventory.slots[index] = Some(ItemStack {
+                item: item.clone(),
+                count: *count,
+                data: data.clone(),
+            });
         }
+        instance::validate_container(inventory.slots.iter().map(Option::as_ref))?;
         Ok(inventory)
     }
 }

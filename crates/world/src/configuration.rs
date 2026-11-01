@@ -73,17 +73,24 @@ impl ComponentSchemas {
                 default.fields,
             )?;
         }
+        schemas.validate_block_defaults()?;
+        schemas.bind_compatibility(base)
+    }
+
+    /// Check all selected block components, including omitted defaults, after
+    /// registering owner validators and before admitting a playable world.
+    pub fn validate_block_defaults(&self) -> Result<(), ComponentError> {
         let empty = ComponentFields::new();
-        for (block, declared) in &schemas.blocks {
+        for (block, declared) in &self.blocks {
             for schema in declared {
                 ComponentSet::validate(
-                    &schemas,
+                    self,
                     schema,
-                    schemas.block_default(block, schema).unwrap_or(&empty),
+                    self.block_default(block, schema).unwrap_or(&empty),
                 )?;
             }
         }
-        schemas.bind_compatibility(base)
+        Ok(())
     }
 
     /// Freeze startup state and derive the compatibility used by authority,
@@ -101,21 +108,26 @@ impl ComponentSchemas {
             }
             return Ok((self, base));
         }
-        let entries = self.persistence.len().saturating_add(
-            self.block_defaults
-                .values()
-                .map(|entries| entries.len())
-                .sum::<usize>(),
-        );
+        let entries = self
+            .validators
+            .len()
+            .saturating_add(self.persistence.len())
+            .saturating_add(
+                self.block_defaults
+                    .values()
+                    .map(|entries| entries.len())
+                    .sum::<usize>(),
+            );
         if entries > 4096 {
             return Err(ComponentError::BudgetExceeded);
         }
         let mut bytes = 0u64;
-        for fields in self
+        for (schema, fields) in self
             .block_defaults
             .values()
-            .flat_map(|entries| entries.values())
+            .flat_map(|entries| entries.iter())
         {
+            ComponentSet::validate(&self, schema, fields)?;
             bytes += component_size(fields)?;
             if bytes > 8_388_608 {
                 return Err(ComponentError::BudgetExceeded);
@@ -138,7 +150,7 @@ impl ComponentSchemas {
             .collect();
         let mut compatibility = base;
         // Preserve old worlds when every effective choice is the legacy default.
-        if !persistence.is_empty() || !defaults.is_empty() {
+        if !persistence.is_empty() || !defaults.is_empty() || !self.validators.is_empty() {
             let mut hash = Sha256::new();
             hash.update(b"torse/component-configuration/v1\0");
             hash.update(base.rules_digest.0);
@@ -151,6 +163,14 @@ impl ComponentSchemas {
                 key(&mut hash, block);
                 key(&mut hash, schema);
                 record(&mut hash, fields);
+            }
+            if !self.validators.is_empty() {
+                hash.update(b"owner-validators/v1\0");
+                count(&mut hash, self.validators.len());
+                for (id, validator) in &self.validators {
+                    key(&mut hash, id);
+                    hash.update(validator.rules_digest().0);
+                }
             }
             compatibility.rules_digest = Digest(hash.finalize().into());
         }
@@ -166,7 +186,12 @@ impl ComponentSchemas {
     ) -> Result<(), ComponentError> {
         match self.compatibility {
             Some(expected) if expected == compatibility => Ok(()),
-            None if self.persistence.is_empty() && self.block_defaults.is_empty() => Ok(()),
+            None if self.persistence.is_empty()
+                && self.block_defaults.is_empty()
+                && self.validators.is_empty() =>
+            {
+                Ok(())
+            }
             _ => Err(ComponentError::ConfigurationMismatch),
         }
     }

@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .set(
                 0,
                 Some(torse_inventory::ItemStack {
+                    data: Default::default(),
                     item: base::key("base:stone"),
                     count: 64,
                 }),

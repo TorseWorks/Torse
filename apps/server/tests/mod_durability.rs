@@ -189,10 +189,36 @@ fn slot0(world: &WorldAuthority, entity: EntityId) -> Option<ItemStack> {
 #[test]
 fn machine_survives_restart_and_keeps_counts_correct() {
     let dir = Directory::new();
-    let (world, _stats) = assemble(&[machine_dir()], true, &[]);
+    let (mut world, _stats) = assemble(&[machine_dir()], true, &[]);
     let machine = world.machines[0].1;
     let input = world.input;
     let output = world.output;
+    let stack = ItemStack {
+        item: base::key("base:stone"),
+        count: 1,
+        data: [
+            (base::key("test:durability"), ComponentValue::U32(23)),
+            (
+                base::key("extension:unknown"),
+                ComponentValue::List(vec![
+                    ComponentValue::Text("retained after reopen".into()),
+                    ComponentValue::U32(7),
+                ]),
+            ),
+        ]
+        .into(),
+    };
+    let mut stock = Inventory::new(2).unwrap();
+    stock.set(0, Some(stack.clone()), &catalog()).unwrap();
+    let schemas = world.world.schemas().clone();
+    let handle = world.world.entities().handle_of(input).unwrap();
+    world
+        .world
+        .entities_mut()
+        .components_mut(handle)
+        .unwrap()
+        .insert(&schemas, &torse_inventory::schema(), stock.fields())
+        .unwrap();
     let mut server = create(&dir, world);
 
     // Stop with progress three. Completion must reset progress, transfer the
@@ -206,10 +232,7 @@ fn machine_survives_restart_and_keeps_counts_correct() {
     );
     assert_eq!(
         slot0(world_of(&server), input),
-        Some(ItemStack {
-            item: base::key("base:stone"),
-            count: 1,
-        }),
+        Some(stack.clone()),
         "input stays intact until the completion task"
     );
     assert_eq!(slot0(world_of(&server), output), None);
@@ -225,10 +248,7 @@ fn machine_survives_restart_and_keeps_counts_correct() {
     );
     assert_eq!(
         slot0(world_of(&server), output),
-        Some(ItemStack {
-            item: base::key("base:stone"),
-            count: 1,
-        }),
+        Some(stack.clone()),
         "output received the resumed transfer"
     );
     assert_eq!(
@@ -243,10 +263,7 @@ fn machine_survives_restart_and_keeps_counts_correct() {
     }
     assert_eq!(
         slot0(world_of(&server), output),
-        Some(ItemStack {
-            item: base::key("base:stone"),
-            count: 1,
-        }),
+        Some(stack.clone()),
         "no duplication across restart and two cycles"
     );
     assert_eq!(slot0(world_of(&server), input), None);
@@ -254,6 +271,10 @@ fn machine_survives_restart_and_keeps_counts_correct() {
         progress(world_of(&server), machine, "machine:schema/state") == 3,
         "a rejected transfer preserves progress and schedules no new wakeup"
     );
+    drop(server);
+    let (server, _) = reopen(&dir, &[machine_dir()], true);
+    assert_eq!(slot0(world_of(&server), output), Some(stack));
+    assert_eq!(slot0(world_of(&server), input), None);
 }
 
 #[test]
@@ -351,6 +372,7 @@ fn trapped_guest_parks_bounded_without_side_effects() {
     assert_eq!(
         slot0(world_of(&server), input),
         Some(ItemStack {
+            data: Default::default(),
             item: base::key("base:stone"),
             count: 1,
         }),
@@ -398,6 +420,7 @@ fn failing_package_does_not_stop_the_others() {
     assert_eq!(
         slot0(world_of(&server), output),
         Some(ItemStack {
+            data: Default::default(),
             item: base::key("base:stone"),
             count: 1,
         })
@@ -453,6 +476,7 @@ fn task_budget_shortfall_commits_nothing_and_recovers() {
     assert_eq!(
         slot0(world_of(&server), input),
         Some(ItemStack {
+            data: Default::default(),
             item: base::key("base:stone"),
             count: 1,
         }),
@@ -466,6 +490,7 @@ fn task_budget_shortfall_commits_nothing_and_recovers() {
     assert_eq!(
         slot0(world_of(&server), output),
         Some(ItemStack {
+            data: Default::default(),
             item: base::key("base:stone"),
             count: 1,
         }),

@@ -1227,8 +1227,11 @@ pub fn machine_scenario(config: &ScenarioConfig) -> Result<MachineWorld, String>
     let content = compile(pack).map_err(|errors| format!("content compile failed: {errors:?}"))?;
     let registry = torse_world::BlockStateRegistry::build(&content)
         .map_err(|error| format!("registry build failed: {error:?}"))?;
-    let schemas = ComponentSchemas::build(&content);
+    let mut schemas = ComponentSchemas::build(&content);
     let catalog = ItemCatalog::new([(key("base:stone"), 64)]).map_err(|e| format!("{e:?}"))?;
+    catalog
+        .bind_schemas(&mut schemas)
+        .map_err(|error| format!("item validation: {error}"))?;
 
     let mut authority = WorldAuthority::new(
         WorldId(41),
@@ -1290,6 +1293,7 @@ pub fn machine_scenario(config: &ScenarioConfig) -> Result<MachineWorld, String>
             .set(
                 0,
                 Some(ItemStack {
+                    data: Default::default(),
                     item: key("base:stone"),
                     count: 1,
                 }),

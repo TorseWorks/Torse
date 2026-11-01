@@ -55,6 +55,7 @@ impl Load {
                 .set(
                     0,
                     Some(ItemStack {
+                        data: Default::default(),
                         item: base::key("base:stone"),
                         count: 64,
                     }),

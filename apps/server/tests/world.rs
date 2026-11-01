@@ -86,6 +86,7 @@ fn world() -> WorldAuthority {
                 .set(
                     0,
                     Some(ItemStack {
+                        data: Default::default(),
                         item: key("base:stone"),
                         count: 1,
                     }),
@@ -736,7 +737,7 @@ fn bounded_snapshot_rejects_dense_cells_and_nested_inventory_before_capture() {
     let before = capture(&world);
     for budget in [
         OutputBudget::new(1, u64::MAX),
-        OutputBudget::new(17, u64::MAX),
+        OutputBudget::new(19, u64::MAX),
         OutputBudget::new(u32::MAX, 8192),
     ] {
         let error = world
@@ -747,7 +748,7 @@ fn bounded_snapshot_rejects_dense_cells_and_nested_inventory_before_capture() {
     }
     assert_eq!(
         world
-            .capture_snapshot_with_budget(before.meta, OutputBudget::new(18, 1_048_576))
+            .capture_snapshot_with_budget(before.meta, OutputBudget::new(20, 1_048_576))
             .unwrap(),
         before
     );
