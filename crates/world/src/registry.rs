@@ -249,6 +249,22 @@ impl BlockStateRegistry {
         self.entry_of(state).map(|entry| &entry.definition)
     }
 
+    /// Borrow effective support predicates for an exact finite state.
+    ///
+    /// Empty occupancy denies all support. An unknown state returns `None`.
+    /// This metadata lookup grants no access to any world cell.
+    pub fn face_support(&self, state: BlockStateId) -> Option<&torse_content::FaceSupport> {
+        if state.is_empty() {
+            return Some(&torse_content::FaceSupport::NONE);
+        }
+        let definition = self.definition(state)?;
+        Some(
+            self.state_override(state)
+                .and_then(|profile| profile.face_support.as_ref())
+                .unwrap_or(&definition.face_support),
+        )
+    }
+
     /// Compiled authority identity, including light transport declarations.
     pub const fn authority_digest(&self) -> torse_types::Digest {
         self.authority_digest

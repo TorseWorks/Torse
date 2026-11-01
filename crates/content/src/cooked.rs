@@ -13,10 +13,10 @@ use sha2::{Digest as ShaDigest, Sha256};
 use torse_types::{AssetGuid, ContentKey, Digest, valid_asset_path};
 
 use crate::compiler::{CompiledContent, MAX_FINITE_STATES};
-use crate::descriptor::{AlphaMode, BoxBounds, Face, Shape, StateProfile};
+use crate::descriptor::{AlphaMode, BoxBounds, Face, FaceSupport, Shape, StateProfile};
 
-const MAGIC: &[u8; 8] = b"TCOOK002";
-const VERSION: u32 = 2;
+const MAGIC: &[u8; 8] = b"TCOOK003";
+const VERSION: u32 = 3;
 
 /// Limits checked before allocating tables or accepting a count from a file.
 #[derive(Clone, Copy, Debug)]
@@ -78,6 +78,8 @@ pub struct CookedState {
     pub values: Vec<u16>,
     /// Six-bit occlusion mask.
     pub occlusion: u8,
+    /// Effective independent support predicates for this state.
+    pub face_support: FaceSupport,
     /// Authoritative collision shape, if any.
     pub collision: Option<Shape>,
     /// Dense material slot for each face, in `-x, +x, -y, +y, -z, +z` order.
@@ -265,6 +267,9 @@ pub fn cook(
             let occlusion = profile
                 .and_then(|item| item.occlusion)
                 .unwrap_or(block.occlusion_profile.face_mask);
+            let face_support = profile
+                .and_then(|item| item.face_support)
+                .unwrap_or(block.face_support);
             let materials = core::array::from_fn(|slot| {
                 let face = Face::ALL[slot];
                 let key = block
@@ -294,6 +299,7 @@ pub fn cook(
                 index: index as u16,
                 values,
                 occlusion,
+                face_support,
                 collision,
                 materials,
                 overlays,
@@ -414,6 +420,7 @@ fn validate_tables(tables: &CookedTables, limits: CookLimits) -> Result<usize, C
         if state.occlusion & !0x3f != 0 {
             return Err(invalid("occlusion mask exceeds six faces"));
         }
+        state.face_support.validate().map_err(&invalid)?;
         if let Some(shape) = &state.collision {
             if matches!(shape, Shape::Model(_)) {
                 return Err(CookError::VisualCollision(state.block.clone()));
@@ -442,6 +449,7 @@ fn validate_tables(tables: &CookedTables, limits: CookLimits) -> Result<usize, C
         let row_bytes = 2usize
             + 4
             + 1
+            + 2
             + 24
             + 6
             + state.overlays.iter().filter(|slot| slot.is_some()).count() * 4;
@@ -568,6 +576,8 @@ fn encode_unchecked(tables: &CookedTables) -> Vec<u8> {
             out.extend_from_slice(&value.to_le_bytes());
         }
         out.push(state.occlusion);
+        out.push(state.face_support.attachment);
+        out.push(state.face_support.structural);
         push_shape(&mut out, state.collision.as_ref());
         for material in &state.materials {
             push_u32(&mut out, *material);
@@ -636,7 +646,7 @@ pub fn read_cooked_with_limits(
     presentation.copy_from_slice(cursor.bytes_exact(32)?);
     let content_authority_digest = Digest(cursor.array()?);
     let content_presentation_digest = Digest(cursor.array()?);
-    let state_count = cursor.count(43, std::mem::size_of::<CookedState>())?;
+    let state_count = cursor.count(45, std::mem::size_of::<CookedState>())?;
     if state_count > usize::from(u16::MAX) {
         return Err(CookError::Limit);
     }
@@ -650,6 +660,13 @@ pub fn read_cooked_with_limits(
             values.push(cursor.u16()?);
         }
         let occlusion = cursor.byte()?;
+        let face_support = FaceSupport {
+            attachment: cursor.byte()?,
+            structural: cursor.byte()?,
+        };
+        face_support
+            .validate()
+            .map_err(|message| CookError::Invalid(message.into()))?;
         let collision = cursor.shape()?;
         let mut materials = [0; 6];
         for slot in &mut materials {
@@ -668,6 +685,7 @@ pub fn read_cooked_with_limits(
             index,
             values,
             occlusion,
+            face_support,
             collision,
             materials,
             overlays,
@@ -780,7 +798,7 @@ fn matching_profile<'a>(profiles: &'a [StateProfile], values: &[u16]) -> Option<
 
 fn digest_authority(tables: &CookedTables) -> Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"torse-cooked-authority-v2");
+    hasher.update(b"torse-cooked-authority-v3");
     hasher.update(tables.content_authority_digest.0);
     hasher.update((tables.states.len() as u64).to_le_bytes());
     for state in &tables.states {
@@ -791,6 +809,7 @@ fn digest_authority(tables: &CookedTables) -> Digest {
             hasher.update(value.to_le_bytes());
         }
         hasher.update([state.occlusion]);
+        hasher.update([state.face_support.attachment, state.face_support.structural]);
         let mut encoded = Vec::new();
         push_shape(&mut encoded, state.collision.as_ref());
         hasher.update(encoded);
@@ -1006,11 +1025,11 @@ mod tests {
     use crate::{compile, m0_fixture_pack};
 
     #[test]
-    fn empty_v2_file_has_fixed_bytes_and_v1_is_rejected() {
+    fn empty_v3_file_has_fixed_bytes_and_older_versions_are_rejected() {
         // Fixed vector independent of the encoder and digest helpers.
-        let authority = "8a790945b359f99baaee5aa369be7c9c8bd802c890629c9278f5d6267fc37ab7";
+        let authority = "083573c550968d2c75612d105439827ae0b482349c5d7ae80ca81bc4f97ca8b0";
         let presentation = "c26506fcffa61995ba5577d7d97ab9776149f0e9d7a342122102c63000d2b372";
-        let mut bytes = b"TCOOK002\x02\x00\x00\x00".to_vec();
+        let mut bytes = b"TCOOK003\x03\x00\x00\x00".to_vec();
         for hex in [authority, presentation] {
             bytes.extend(
                 (0..hex.len())
@@ -1023,9 +1042,11 @@ mod tests {
         let tables = read_cooked(&bytes).unwrap();
         assert!(tables.states.is_empty());
         assert_eq!(write_cooked(&tables).unwrap(), bytes);
-        bytes[7] = b'1';
-        bytes[8] = 1;
-        assert_eq!(read_cooked(&bytes), Err(CookError::Header));
+        for version in [1, 2] {
+            bytes[7] = b'0' + version;
+            bytes[8] = version;
+            assert_eq!(read_cooked(&bytes), Err(CookError::Header));
+        }
     }
 
     fn image() -> CookImage {
@@ -1097,6 +1118,59 @@ mod tests {
         extra.push(0);
         assert_eq!(read_cooked(&extra), Err(CookError::Trailing));
         assert!(parse_locale("a=1\na=2").is_err());
+    }
+
+    #[test]
+    fn support_roundtrips_in_expanded_rows_and_preserves_presentation_identity() {
+        let mut pack = m0_fixture_pack();
+        let before = cook(&compile(pack.clone()).unwrap(), &[], &[]).unwrap();
+        let block = pack
+            .blocks
+            .iter_mut()
+            .find(|block| !block.value.state_overrides.is_empty())
+            .unwrap();
+        let id = block.value.id.clone();
+        block.value.face_support = FaceSupport {
+            attachment: 8,
+            structural: 1,
+        };
+        block.value.state_overrides[0].face_support = Some(FaceSupport::NONE);
+        let tables = cook(&compile(pack).unwrap(), &[], &[]).unwrap();
+        let rows: Vec<_> = tables.states.iter().filter(|row| row.block == id).collect();
+        assert_eq!(rows[0].face_support, FaceSupport::NONE);
+        assert_eq!(
+            rows[1].face_support,
+            FaceSupport {
+                attachment: 8,
+                structural: 1
+            }
+        );
+        assert_ne!(before.authority_digest, tables.authority_digest);
+        assert_eq!(before.presentation_digest, tables.presentation_digest);
+        assert_eq!(
+            read_cooked(&write_cooked(&tables).unwrap()).unwrap(),
+            tables
+        );
+    }
+
+    #[test]
+    fn support_bits_are_validated_on_read_and_write_and_protected_by_the_digest() {
+        let content = compile(m0_fixture_pack()).unwrap();
+        let tables = cook(&content, &[], &[]).unwrap();
+        let mut bad = tables.clone();
+        bad.states[0].face_support.structural = 0x80;
+        assert!(matches!(write_cooked(&bad), Err(CookError::Invalid(_))));
+        // Deliberately bypass the writer to check untrusted decoding as well.
+        assert!(matches!(
+            read_cooked(&encode_unchecked(&bad)),
+            Err(CookError::Invalid(_))
+        ));
+        bad.states[0].face_support.structural = 8;
+        assert_eq!(write_cooked(&bad), Err(CookError::DigestMismatch));
+        assert_eq!(
+            read_cooked(&encode_unchecked(&bad)),
+            Err(CookError::DigestMismatch)
+        );
     }
 
     #[test]

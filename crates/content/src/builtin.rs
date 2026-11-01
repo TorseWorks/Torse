@@ -233,6 +233,7 @@ fn block(
             shape: selection_shape,
         },
         occlusion_profile: OcclusionProfile { face_mask },
+        face_support: crate::FaceSupport::NONE,
         light_transport: LightTransport {
             absorption: if face_mask == 0x3f { 1.0 } else { 0.0 },
             emission: 0.0,

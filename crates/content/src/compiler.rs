@@ -615,6 +615,14 @@ fn validate_block(
             "definition version must be greater than zero",
         ));
     }
+    if let Err(message) = block.face_support.validate() {
+        diagnostics.push(diagnostic(
+            source.clone(),
+            block.id.clone(),
+            "face_support",
+            message,
+        ));
+    }
     if !schemas.contains_key(&block.state_schema) {
         diagnostics.push(diagnostic(
             source.clone(),
@@ -628,6 +636,16 @@ fn validate_block(
         fields.sort_by(|left, right| left.id.cmp(&right.id));
         let mut seen = BTreeSet::new();
         for profile in &block.state_overrides {
+            if let Some(support) = profile.face_support
+                && let Err(message) = support.validate()
+            {
+                diagnostics.push(diagnostic(
+                    source.clone(),
+                    block.id.clone(),
+                    "state_overrides.face_support",
+                    message,
+                ));
+            }
             if profile.values.len() != fields.len()
                 || profile
                     .values
@@ -1113,7 +1131,48 @@ fn authority_digest(
         }
     }
     hash_state_profiles(&mut writer, blocks, false);
+    hash_face_support(&mut writer, blocks);
     writer.finish()
+}
+
+/// A versioned authority-only extension. Packs without support declarations keep
+/// their previous identity; presentation streams never include this extension.
+fn hash_face_support(writer: &mut CanonicalWriter, blocks: &BTreeMap<ContentKey, BlockDefinition>) {
+    let selected: Vec<_> = blocks
+        .values()
+        .filter(|block| {
+            block.face_support != crate::FaceSupport::NONE
+                || block
+                    .state_overrides
+                    .iter()
+                    .any(|profile| profile.face_support.is_some())
+        })
+        .collect();
+    if selected.is_empty() {
+        return;
+    }
+    writer.u8(0xf2);
+    writer.u32(1);
+    writer.u32(selected.len() as u32);
+    for block in selected {
+        writer.key(&block.id);
+        writer.u8(block.face_support.attachment);
+        writer.u8(block.face_support.structural);
+        let profiles: Vec<_> = block
+            .state_overrides
+            .iter()
+            .filter_map(|profile| profile.face_support.map(|support| (profile, support)))
+            .collect();
+        writer.u32(profiles.len() as u32);
+        for (profile, support) in profiles {
+            writer.u32(profile.values.len() as u32);
+            for value in &profile.values {
+                writer.u32(u32::from(*value));
+            }
+            writer.u8(support.attachment);
+            writer.u8(support.structural);
+        }
+    }
 }
 
 /// Hash visual material, alpha, render geometry, and presentation-only tags.

@@ -467,6 +467,56 @@ pub struct OcclusionProfile {
     pub face_mask: u8,
 }
 
+/// Built-in predicates that rules may require of a block face.
+///
+/// These categories have no implication for geometry, strength, or permission.
+/// Applications explicitly author the data and decide which predicate a rule uses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupportCategory {
+    /// A rule may attach an object to this face.
+    Attachment,
+    /// A rule may use this face as a structural support.
+    Structural,
+}
+
+/// Independent static support declarations in `-x, +x, -y, +y, -z, +z` order.
+///
+/// Each category has exactly six bits. Missing declarations deny all support;
+/// neither collision nor visual coverage supplies an implicit default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FaceSupport {
+    pub attachment: u8,
+    pub structural: u8,
+}
+
+impl FaceSupport {
+    pub const NONE: Self = Self {
+        attachment: 0,
+        structural: 0,
+    };
+
+    /// Return the face mask for one typed category.
+    pub const fn mask(self, category: SupportCategory) -> u8 {
+        match category {
+            SupportCategory::Attachment => self.attachment,
+            SupportCategory::Structural => self.structural,
+        }
+    }
+
+    /// Whether the selected face explicitly declares this predicate.
+    pub const fn supports(self, face: Face, category: SupportCategory) -> bool {
+        self.mask(category) & (1 << face.index()) != 0
+    }
+
+    /// Reject bits outside the fixed six-face vocabulary.
+    pub fn validate(self) -> Result<(), &'static str> {
+        if (self.attachment | self.structural) & !0x3f != 0 {
+            return Err("support masks may only contain six face bits");
+        }
+        Ok(())
+    }
+}
+
 /// Per-state profile overrides for blocks whose shape varies by state
 /// values, such as slabs with an upper and a lower half.
 ///
@@ -486,6 +536,9 @@ pub struct StateProfile {
     pub selection_shape: Option<Shape>,
     /// Occlusion mask override.
     pub occlusion: Option<u8>,
+    /// Exact replacement of both support masks. `None` inherits the definition;
+    /// `Some(FaceSupport::NONE)` explicitly denies every category on every face.
+    pub face_support: Option<FaceSupport>,
 }
 
 /// Light absorption and emission values for the content definition.
@@ -634,6 +687,8 @@ pub struct BlockDefinition {
     pub selection_profile: SelectionProfile,
     /// Face coverage used by conservative mesh culling.
     pub occlusion_profile: OcclusionProfile,
+    /// Rule predicates, independent of collision, rendering and occlusion.
+    pub face_support: FaceSupport,
     /// Light behavior independent of rendering alpha.
     pub light_transport: LightTransport,
     /// Interaction action binding.

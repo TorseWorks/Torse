@@ -293,6 +293,29 @@ pub struct ActionView<'a> {
     caller: Option<&'a ContentKey>,
 }
 
+/// Result of a granted support read. Unavailable terrain and the two kinds of
+/// exterior remain distinct; none of them can provide positive support.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaceSupportQuery<'a> {
+    Loaded(&'a torse_content::FaceSupport),
+    NotLoaded,
+    OutOfBounds,
+    Exterior,
+}
+
+impl FaceSupportQuery<'_> {
+    pub fn supports(
+        self,
+        face: torse_content::Face,
+        category: torse_content::SupportCategory,
+    ) -> bool {
+        match self {
+            Self::Loaded(support) => support.supports(face, category),
+            Self::NotLoaded | Self::OutOfBounds | Self::Exterior => false,
+        }
+    }
+}
+
 impl ActionView<'_> {
     /// Immediate parent established by dispatch, absent for an external request
     /// or a scheduled native view. A child that produces external resources
@@ -310,6 +333,42 @@ impl ActionView<'_> {
             return Err(RejectCode::PermissionDenied);
         }
         Ok(self.world.store().query(pos))
+    }
+
+    /// Read support through the terrain grant and record the observed state in
+    /// an unpublished plan. A later prepare or publish rejects a changed cell.
+    ///
+    /// Each call reads one cell and adds at most one condition. The caller's
+    /// normal transaction budget still applies. Registry metadata never widens
+    /// the actor's target grants or grants mutation permission.
+    pub fn face_support(
+        &self,
+        pos: BlockPos,
+        transaction: &mut Transaction,
+    ) -> Result<FaceSupportQuery<'_>, RejectCode> {
+        match self.terrain(pos)? {
+            TerrainQuery::Ready(state) => {
+                let support = self
+                    .world
+                    .registry()
+                    .face_support(state)
+                    .ok_or(RejectCode::InvalidData)?;
+                if transaction
+                    .preconditions
+                    .iter()
+                    .any(|read| read.pos == pos && read.expected != state)
+                {
+                    return Err(RejectCode::Conflict);
+                }
+                if !transaction.preconditions.iter().any(|read| read.pos == pos) {
+                    transaction.read_block(pos, state);
+                }
+                Ok(FaceSupportQuery::Loaded(support))
+            }
+            TerrainQuery::NotLoaded => Ok(FaceSupportQuery::NotLoaded),
+            TerrainQuery::OutOfBounds => Ok(FaceSupportQuery::OutOfBounds),
+            TerrainQuery::Exterior => Ok(FaceSupportQuery::Exterior),
+        }
     }
     /// Plan an unpublished body transition authored by the physics module.
     ///
