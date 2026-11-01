@@ -485,10 +485,9 @@ mod tests {
     }
     #[test]
     fn adding_item_bindings_preserves_old_custom_keys() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "../../.work/settings-item-migration-{}.toml",
-            std::process::id()
-        ));
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.work");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("settings-item-migration-{}.toml", std::process::id()));
         let old = Settings {
             bindings: Bindings {
                 forward: KeyCode::KeyF,
