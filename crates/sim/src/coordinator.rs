@@ -28,7 +28,7 @@ use torse_world::{
 };
 
 use crate::phase::Phase;
-use crate::transaction::Transaction;
+use crate::transaction::{BlockPrecondition, Transaction};
 
 /// A change that passed every check but has not affected the world yet.
 ///
@@ -43,6 +43,7 @@ pub struct PreparedChange {
     phase: Phase,
     edits: Vec<BlockEdit>,
     touched: Vec<SectionPos>,
+    block_reads: Vec<BlockPrecondition>,
     entity_moves: Vec<EntityMove>,
     movement_reads: Vec<(BlockPos, TerrainQuery)>,
     movement_handles: Vec<(EntityHandle, EntityId, Option<torse_world::EntityCollider>)>,
@@ -472,6 +473,7 @@ impl CommitCoordinator {
             phase,
             edits: Vec::new(),
             touched: Vec::new(),
+            block_reads: Vec::new(),
             entity_moves: Vec::new(),
             movement_reads: Vec::new(),
             movement_handles: Vec::new(),
@@ -623,6 +625,7 @@ impl CommitCoordinator {
     ) -> Result<PreparedChange, PrepareError> {
         let mut edits: Vec<BlockEdit> = Vec::new();
         let mut touched: Vec<SectionPos> = Vec::new();
+        let mut block_reads = Vec::new();
         let mut entity_moves = Vec::new();
         let mut movement_reads = Vec::new();
         let mut movement_handles = Vec::new();
@@ -667,6 +670,7 @@ impl CommitCoordinator {
                     }
                 }
             }
+            block_reads.extend_from_slice(&member.preconditions);
             let member_edits: Vec<BlockEdit> = member
                 .mutations
                 .iter()
@@ -876,6 +880,7 @@ impl CommitCoordinator {
             phase: group.ordering.phase,
             edits,
             touched,
+            block_reads,
             entity_moves,
             movement_reads,
             movement_handles,
@@ -1028,6 +1033,7 @@ impl CommitCoordinator {
             phase: transaction.ordering.phase,
             edits,
             touched,
+            block_reads: transaction.preconditions.clone(),
             entity_moves: Vec::new(),
             movement_reads: Vec::new(),
             movement_handles: Vec::new(),
@@ -1158,6 +1164,15 @@ impl CommitCoordinator {
         {
             return Err(CommitFault::Invariant(
                 "prepared change is not at the current commit position",
+            ));
+        }
+        if prepared
+            .block_reads
+            .iter()
+            .any(|read| store.query(read.pos) != TerrainQuery::Ready(read.expected))
+        {
+            return Err(CommitFault::Invariant(
+                "prepared terrain observations changed",
             ));
         }
         let touched = store
@@ -1660,6 +1675,35 @@ mod tests {
             store.query(BlockPos::new(1, 1, 1)),
             TerrainQuery::Ready(BlockStateId(9))
         );
+    }
+
+    #[test]
+    fn publication_rechecks_reads_outside_the_write_set_before_any_edit() {
+        for unload in [false, true] {
+            let mut store = store();
+            let mut coordinator = CommitCoordinator::new(WorldId(1));
+            let read = BlockPos::new(1, 1, 1);
+            let written = BlockPos::new(17, 1, 1);
+            let mut transaction = tx(5);
+            transaction
+                .read_block(read, BlockStateId::EMPTY)
+                .write_block(written, BlockStateId(3));
+            let prepared = coordinator.prepare(&store, &transaction).unwrap();
+            if unload {
+                store.unload(SectionPos::ZERO).unwrap();
+            } else {
+                store.edit(read, BlockStateId(9)).unwrap();
+            }
+            assert!(matches!(
+                coordinator.publish(&mut store, prepared),
+                Err(CommitFault::Invariant(_))
+            ));
+            assert_eq!(coordinator.seq(), CommitSeq::INITIAL);
+            assert_eq!(
+                store.query(written),
+                TerrainQuery::Ready(BlockStateId::EMPTY)
+            );
+        }
     }
 
     #[test]

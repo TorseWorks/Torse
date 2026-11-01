@@ -228,6 +228,7 @@ mod tests {
             assert_eq!(registry.state_values(state), Some(row.values.as_slice()));
             assert_eq!(registry.collision_shape(state), row.collision);
             assert_eq!(registry.occlusion_mask(state), row.occlusion);
+            assert_eq!(registry.face_support(state), Some(&row.face_support));
         }
     }
 

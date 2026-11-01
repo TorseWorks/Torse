@@ -540,6 +540,7 @@ fn content_pack(descriptor: &Descriptor, source: &str) -> Result<ContentPack, St
                 occlusion_profile: OcclusionProfile {
                     face_mask: if solid { 0b11_1111 } else { 0 },
                 },
+                face_support: torse_content::FaceSupport::NONE,
                 light_transport: LightTransport {
                     absorption: 0.0,
                     emission: 0.0,

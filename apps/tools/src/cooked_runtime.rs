@@ -77,6 +77,7 @@ fn run(path: &Path, root: &Path, bytes: u64) -> Result<String, String> {
             || registry.state_values(id) != Some(row.values.as_slice())
             || registry.collision_shape(id) != row.collision
             || registry.occlusion_mask(id) != row.occlusion
+            || registry.face_support(id) != Some(&row.face_support)
         {
             return Err("cooked authority row differs from the native registry".into());
         }

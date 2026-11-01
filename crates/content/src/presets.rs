@@ -70,6 +70,7 @@ fn apply_slab(block: &mut BlockDefinition, schema: ContentKey, tag: &str, axes: 
                 collision_shape: Some(shape.clone()),
                 selection_shape: Some(shape),
                 occlusion: Some(0),
+                face_support: None,
             }
         })
         .collect();

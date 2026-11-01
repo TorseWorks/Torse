@@ -6,7 +6,7 @@
 |---|---|
 | [types](types/src/lib.rs) | 身份、坐标、时间、结果、持久位置、复制与内存账本等公共类型 |
 | [runtime](runtime/README.md) | 有界CPU执行器、预留、优先级与取消，另含可选ECS实验 |
-| [content](content/src/lib.rs) | 内容契约、编译、摘要与基础内容夹具 |
+| [content](content/src/lib.rs) | 内容契约、编译、摘要、[独立面支撑](content/SUPPORT.md)与基础内容夹具 |
 | [world](world/src/lib.rs) | 方块状态、分区、实体、组件与快照、变更载荷 |
 | [sim](sim/src/lib.rs) | 固定步长、阶段排序、事务仲裁、动作授权、持久任务、授权复制与行走领域逻辑 |
 | [actions](actions/src/lib.rs) | 动作声明、命令冲突与注册检查 |

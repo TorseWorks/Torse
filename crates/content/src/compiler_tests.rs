@@ -503,3 +503,132 @@ fn same_face_material_change_keeps_authority_digest() {
 fn key(value: &str) -> torse_types::ContentKey {
     torse_types::ContentKey::parse(value).unwrap()
 }
+
+#[test]
+fn support_changes_authority_only_and_defaults_deny_every_face() {
+    use crate::{FaceSupport, SupportCategory};
+    let original = compile(m0_fixture_pack()).unwrap();
+    for block in original.blocks.values() {
+        for face in Face::ALL {
+            assert!(
+                !block
+                    .face_support
+                    .supports(face, SupportCategory::Attachment)
+            );
+            assert!(
+                !block
+                    .face_support
+                    .supports(face, SupportCategory::Structural)
+            );
+        }
+    }
+    let mut pack = m0_fixture_pack();
+    let block = &mut pack.blocks[0].value;
+    block.face_support = FaceSupport {
+        attachment: 1 << Face::PosY.index(),
+        structural: 1 << Face::NegX.index(),
+    };
+    let changed = compile(pack).unwrap();
+    assert_ne!(original.authority_digest, changed.authority_digest);
+    assert_eq!(original.presentation_digest, changed.presentation_digest);
+}
+
+#[test]
+fn support_is_independent_of_geometry_alpha_and_occlusion() {
+    use crate::FaceSupport;
+    let mut pack = m0_fixture_pack();
+    let plant = pack
+        .blocks
+        .iter_mut()
+        .find(|block| block.value.id == key("base:plant"))
+        .unwrap();
+    assert!(plant.value.collision_profile.shape.is_none());
+    assert_eq!(plant.value.occlusion_profile.face_mask, 0);
+    plant.value.face_support = FaceSupport {
+        attachment: 0x3f,
+        structural: 0,
+    };
+    assert!(compile(pack).is_ok());
+}
+
+#[test]
+fn support_masks_and_exact_override_states_are_validated() {
+    use crate::{FaceSupport, StateProfile};
+    let mut pack = m0_fixture_pack();
+    pack.blocks[0].value.face_support.attachment = 0x80;
+    let slab = pack
+        .blocks
+        .iter_mut()
+        .find(|block| !block.value.state_overrides.is_empty())
+        .unwrap();
+    slab.value.state_overrides[0].face_support = Some(FaceSupport {
+        attachment: 0,
+        structural: 0x40,
+    });
+    let mut invalid = StateProfile {
+        values: vec![u16::MAX],
+        render_shape: None,
+        collision_shape: None,
+        selection_shape: None,
+        occlusion: None,
+        face_support: Some(FaceSupport::NONE),
+    };
+    slab.value.state_overrides.push(invalid.clone());
+    invalid.values = slab.value.state_overrides[0].values.clone();
+    slab.value.state_overrides.push(invalid);
+    let errors = compile(pack).unwrap_err();
+    assert!(errors.iter().any(|error| error.field == "face_support"));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.field == "state_overrides.face_support")
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.field == "state_overrides")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn support_only_overrides_are_canonical_and_do_not_change_presentation() {
+    use crate::FaceSupport;
+    let mut pack = m0_fixture_pack();
+    let original = compile(pack.clone()).unwrap();
+    let slab = pack
+        .blocks
+        .iter_mut()
+        .find(|block| !block.value.state_overrides.is_empty())
+        .unwrap();
+    // Remove visual and collision overrides to exercise support-only selectors.
+    slab.value.state_overrides.iter_mut().for_each(|profile| {
+        profile.render_shape = None;
+        profile.collision_shape = None;
+        profile.selection_shape = None;
+        profile.occlusion = None;
+        profile.face_support = Some(FaceSupport::NONE);
+    });
+    let baseline = compile(pack.clone()).unwrap();
+    let slab = pack
+        .blocks
+        .iter_mut()
+        .find(|block| !block.value.state_overrides.is_empty())
+        .unwrap();
+    slab.value.state_overrides[0].face_support = Some(FaceSupport {
+        attachment: 8,
+        structural: 0,
+    });
+    let changed = compile(pack.clone()).unwrap();
+    assert_ne!(baseline.authority_digest, changed.authority_digest);
+    assert_eq!(baseline.presentation_digest, changed.presentation_digest);
+    assert_ne!(original.authority_digest, changed.authority_digest);
+    pack.blocks.reverse();
+    for block in &mut pack.blocks {
+        block.value.state_overrides.reverse();
+    }
+    let reordered = compile(pack).unwrap();
+    assert_eq!(changed.authority_digest, reordered.authority_digest);
+    assert_eq!(changed.presentation_digest, reordered.presentation_digest);
+}

@@ -938,6 +938,7 @@ fn parse_block(
             collision_profile: CollisionProfile { shape: collision },
             selection_profile: SelectionProfile { shape: selection },
             occlusion_profile: OcclusionProfile { face_mask },
+            face_support: torse_content::FaceSupport::NONE,
             light_transport: LightTransport {
                 absorption,
                 emission,
