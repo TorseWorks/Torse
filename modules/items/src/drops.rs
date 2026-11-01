@@ -122,6 +122,11 @@ impl DropState {
         [
             (field("item"), Value::Content(self.stack.item.clone())),
             (field("count"), Value::U32(self.stack.count)),
+            (
+                field("data_format"),
+                Value::U32(torse_inventory::DATA_FORMAT_VERSION),
+            ),
+            (field("data"), Value::Record(self.stack.data.clone())),
             (field("vx"), Value::I64(self.velocity[0])),
             (field("vy"), Value::I64(self.velocity[1])),
             (field("vz"), Value::I64(self.velocity[2])),
@@ -154,7 +159,20 @@ impl DropState {
             }
             velocity[axis] = *value;
         }
-        if fields.len() != 5
+        let data = match (
+            fields.get(&field("data_format")),
+            fields.get(&field("data")),
+        ) {
+            (None, None) if fields.len() == 5 => ComponentFields::new(),
+            (Some(Value::U32(torse_inventory::DATA_FORMAT_VERSION)), Some(Value::Record(data)))
+                if fields.len() == 7 =>
+            {
+                torse_inventory::validate_instance_data(data)?;
+                data.clone()
+            }
+            _ => return Err(RejectCode::InvalidData),
+        };
+        if !matches!(fields.len(), 5 | 7)
             || *count == 0
             || *count
                 > catalog
@@ -165,24 +183,26 @@ impl DropState {
         {
             return Err(RejectCode::InvalidData);
         }
-        Ok(Self {
-            stack: ItemStack {
-                item: item.clone(),
-                count: *count,
-            },
-            velocity,
-        })
+        let stack = ItemStack {
+            item: item.clone(),
+            count: *count,
+            data,
+        };
+        catalog.stacks.validate_stack(&stack)?;
+        Ok(Self { stack, velocity })
     }
 }
 
 pub(crate) fn declaration() -> ComponentSchema {
     ComponentSchema {
         id: schema(),
-        schema_version: 1,
+        schema_version: 2,
         owner_module: owner(),
         fields: [
             ("item", ComponentFieldType::ContentReference),
             ("count", ComponentFieldType::Unsigned32),
+            ("data_format", ComponentFieldType::Unsigned32),
+            ("data", ComponentFieldType::Record),
             ("vx", ComponentFieldType::Signed64),
             ("vy", ComponentFieldType::Signed64),
             ("vz", ComponentFieldType::Signed64),
@@ -191,7 +211,7 @@ pub(crate) fn declaration() -> ComponentSchema {
         .map(|(name, field_type)| ComponentField {
             id: field(name),
             field_type,
-            required: true,
+            required: !matches!(name, "data" | "data_format"),
         })
         .collect(),
         persistence: PersistencePolicy::Always,
@@ -245,7 +265,7 @@ pub(crate) fn insertion(
     for empty in [false, true] {
         for (slot, old) in slots.slots().iter().enumerate() {
             let capacity = match old {
-                Some(old) if !empty && old.item == stack.item => limit - old.count,
+                Some(old) if !empty && catalog.stacks.can_merge(old, stack)? => limit - old.count,
                 None if empty => limit,
                 _ => 0,
             };
@@ -254,10 +274,7 @@ pub(crate) fn insertion(
                 operations.push(InventoryOperation::Insert {
                     target: inventory,
                     slot,
-                    stack: ItemStack {
-                        item: stack.item.clone(),
-                        count,
-                    },
+                    stack: stack.with_count(count),
                 });
                 remaining -= count;
             }
@@ -390,7 +407,7 @@ pub fn plans(world: &WorldAuthority, catalog: &Catalog, tick: Tick) -> Vec<Trans
                         let Ok(mut target) = DropState::read(other, catalog) else {
                             continue;
                         };
-                        if target.stack.item != state.stack.item {
+                        if catalog.stacks.can_merge(&target.stack, &state.stack) != Ok(true) {
                             continue;
                         }
                         let limit = catalog.definitions[&state.stack.item].limit;

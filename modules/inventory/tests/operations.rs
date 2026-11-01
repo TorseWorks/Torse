@@ -11,10 +11,7 @@ use torse_types::{EntityId, RejectCode, TransactionOutcome};
 use torse_world::ComponentFields;
 
 fn stack(name: &str, count: u32) -> ItemStack {
-    ItemStack {
-        item: key(name),
-        count,
-    }
+    ItemStack::new(key(name), count)
 }
 fn expected(
     world: &torse_sim::WorldAuthority,

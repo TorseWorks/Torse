@@ -297,6 +297,7 @@ impl ActionHandler for Handler {
                 return Err(RejectCode::InvalidData);
             }
             ItemStack {
+                data: Default::default(),
                 item: item.clone(),
                 count: 1,
             }
@@ -307,10 +308,7 @@ impl ActionHandler for Handler {
                 .get(*slot as usize)
                 .and_then(Option::as_ref)
                 .ok_or(RejectCode::MissingTarget)?;
-            ItemStack {
-                item: stack.item.clone(),
-                count: 1,
-            }
+            stack.with_count(1)
         };
         if self.name == "throw_inventory" {
             parent(view, "throw")?;

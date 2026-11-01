@@ -17,7 +17,28 @@ fn key(v: &str) -> ContentKey {
     base::key(v)
 }
 fn create(dir: &Directory, rules: Vec<Box<dyn DurableRule>>) -> base::Files {
-    let (world, actions) = base::world().unwrap();
+    create_with_stack_data(dir, rules, ComponentFields::new())
+}
+fn create_with_stack_data(
+    dir: &Directory,
+    rules: Vec<Box<dyn DurableRule>>,
+    data: ComponentFields,
+) -> base::Files {
+    let (mut world, actions) = base::world().unwrap();
+    let catalog = torse_inventory::ItemCatalog::new([(key("base:stone"), 64)]).unwrap();
+    let handle = world.entities().handle_of(EntityId(1)).unwrap();
+    let fields = inventory(&world, EntityId(1));
+    let mut stock = torse_inventory::Inventory::from_fields(&fields, &catalog).unwrap();
+    let mut stack = stock.slots()[0].clone().unwrap();
+    stack.data = data;
+    stock.set(0, Some(stack), &catalog).unwrap();
+    let schemas = world.schemas().clone();
+    world
+        .entities_mut()
+        .components_mut(handle)
+        .unwrap()
+        .insert(&schemas, &torse_inventory::schema(), stock.fields())
+        .unwrap();
     let compatibility = world.coordinator().compatibility();
     let config = base::file_policy();
     base::Files::create_file(
@@ -348,7 +369,7 @@ fn failed_network_reseed_closes_connection_and_revokes_replaced_session() {
 fn transfer() -> Call {
     Call {
         action: key("inventory:action/transfer"),
-        version: 1,
+        version: 2,
         target: ActionTarget::Entity(EntityId(1)),
         parameters: [
             (key("inventory:field/source_slot"), ComponentValue::U32(0)),
@@ -451,7 +472,21 @@ fn rules(counter: Rc<Cell<u32>>) -> Vec<Box<dyn DurableRule>> {
 #[test]
 fn requests_are_durable_deduplicated_and_recover_with_world_changes() {
     let dir = Directory::new();
-    let mut server = create(&dir, Vec::new());
+    let data: ComponentFields = [
+        (key("test:durability"), ComponentValue::U32(23)),
+        (
+            key("extension:unknown"),
+            ComponentValue::Record(
+                [(
+                    key("extension:label"),
+                    ComponentValue::Text("durable instance".into()),
+                )]
+                .into(),
+            ),
+        ),
+    ]
+    .into();
+    let mut server = create_with_stack_data(&dir, Vec::new(), data.clone());
     session(&mut server);
     let queued = request(&server, 1, transfer());
     let id = queued.id;
@@ -472,13 +507,25 @@ fn requests_are_durable_deduplicated_and_recover_with_world_changes() {
         Admission::Duplicate
     );
     let mut different = transfer();
-    different.version = 2;
+    different.version = 3;
     assert_eq!(
         server.submit(request(&server, 1, different)),
         Admission::Rejected(RejectCode::DuplicateMismatch)
     );
     assert_eq!(server.authority().unwrap().world().seq(), before);
     let expected = inventory(server.authority().unwrap().world(), EntityId(2));
+    let catalog = torse_inventory::ItemCatalog::new([(key("base:stone"), 64)]).unwrap();
+    let stock = torse_inventory::Inventory::from_fields(&expected, &catalog).unwrap();
+    let stack = stock.slots()[0].as_ref().unwrap();
+    assert_eq!(stack.count, 1);
+    assert_eq!(stack.data, data);
+    let source = inventory(server.authority().unwrap().world(), EntityId(1));
+    assert!(
+        torse_inventory::Inventory::from_fields(&source, &catalog)
+            .unwrap()
+            .slots()[0]
+            .is_none()
+    );
     drop(server);
     let mut recovered = reopen(&dir, Vec::new()).unwrap();
     assert_eq!(
@@ -498,6 +545,10 @@ fn requests_are_durable_deduplicated_and_recover_with_world_changes() {
         Admission::Rejected(RejectCode::StaleSession)
     );
     assert_ne!(recovered.binding().epoch, id.epoch);
+    assert_eq!(
+        inventory(recovered.authority().unwrap().world(), EntityId(2)),
+        expected
+    );
 }
 
 #[test]
@@ -805,7 +856,7 @@ fn two_clients_share_durable_authority_without_leaking_inventory() {
             seq: RequestSeq(2),
             call: Call {
                 action: key("inventory:action/inspect"),
-                version: 1,
+                version: 2,
                 target: ActionTarget::Entity(EntityId(1)),
                 parameters: ComponentFields::new(),
             },
@@ -1579,7 +1630,7 @@ fn receipt_expiry_and_input_limits_never_readmit_an_old_operation() {
     session(&mut server);
     let inspect = Call {
         action: key("inventory:action/inspect"),
-        version: 1,
+        version: 2,
         target: ActionTarget::Entity(EntityId(1)),
         parameters: ComponentFields::new(),
     };

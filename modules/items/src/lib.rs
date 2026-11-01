@@ -19,6 +19,56 @@ pub fn owner() -> ContentKey {
     key("items:module")
 }
 
+fn digest_data(hash: &mut sha2::Sha256, fields: &torse_world::ComponentFields) {
+    use sha2::Digest as _;
+    use torse_world::ComponentValue as Value;
+    fn text(hash: &mut sha2::Sha256, value: &str) {
+        hash.update((value.len() as u64).to_le_bytes());
+        hash.update(value.as_bytes());
+    }
+    fn value(hash: &mut sha2::Sha256, data: &Value) {
+        match data {
+            Value::Bool(v) => hash.update([0, u8::from(*v)]),
+            Value::U32(v) => {
+                hash.update([1]);
+                hash.update(v.to_le_bytes());
+            }
+            Value::I64(v) => {
+                hash.update([2]);
+                hash.update(v.to_le_bytes());
+            }
+            Value::Content(v) => {
+                hash.update([3]);
+                text(hash, &v.to_string());
+            }
+            Value::Entity(v) => {
+                hash.update([4]);
+                hash.update(v.0.to_le_bytes());
+            }
+            Value::Text(v) => {
+                hash.update([5]);
+                text(hash, v);
+            }
+            Value::List(values) => {
+                hash.update([6]);
+                hash.update((values.len() as u64).to_le_bytes());
+                for entry in values {
+                    value(hash, entry);
+                }
+            }
+            Value::Record(fields) => {
+                hash.update([7]);
+                digest_data(hash, fields);
+            }
+        }
+    }
+    hash.update((fields.len() as u64).to_le_bytes());
+    for (key, data) in fields {
+        text(hash, &key.to_string());
+        value(hash, data);
+    }
+}
+
 /// Stable item identity, stack policy and optional placement association.
 #[derive(Clone, Debug)]
 pub struct ItemDefinition {
@@ -37,11 +87,33 @@ pub struct Catalog {
     pub(crate) world_drops: bool,
 }
 impl Catalog {
+    /// Bind the same inventory and physical-drop rules to storage and recovery.
+    pub fn bind_schemas(
+        &self,
+        schemas: &mut torse_world::ComponentSchemas,
+    ) -> Result<(), torse_world::ComponentError> {
+        self.stacks.bind_schemas(schemas)?;
+        schemas.register_validator(
+            &owner(),
+            &drops::schema(),
+            std::sync::Arc::new(self.clone()),
+        )
+    }
     /// Conservative retained catalog charge for a host's module budget.
     pub fn accounted_bytes(&self) -> u64 {
         32768
             + (self.definitions.len() + self.drops.len()) as u64 * 1024
             + self.states.len() as u64 * 768
+            + self
+                .drops
+                .values()
+                .chain(self.states.values())
+                .map(|stack| {
+                    torse_world::component_size(&stack.data)
+                        .unwrap_or(torse_inventory::MAX_INSTANCE_BYTES)
+                        .saturating_mul(64)
+                })
+                .sum::<u64>()
     }
     pub fn new(
         definitions: impl IntoIterator<Item = ItemDefinition>,
@@ -72,9 +144,7 @@ impl Catalog {
         for (block, stack) in drops {
             if drop_map.len() == 4096
                 || registry.default_state(&block).is_none()
-                || !entries
-                    .get(&stack.item)
-                    .is_some_and(|entry| stack.count > 0 && stack.count <= entry.limit)
+                || stacks.validate_stack(&stack).is_err()
                 || drop_map.insert(block, stack).is_some()
             {
                 return Err(RejectCode::InvalidData);
@@ -116,7 +186,7 @@ impl Catalog {
         use sha2::{Digest as _, Sha256};
         let mut result = self.stacks.bind_compatibility(base);
         let mut hash = Sha256::new();
-        hash.update(b"torse:items/rules/v1\0");
+        hash.update(b"torse:items/rules/v2\0");
         if self.world_drops {
             hash.update(b"physical-drops/v1\0");
         }
@@ -142,6 +212,7 @@ impl Catalog {
                 hash.update(text.as_bytes());
             }
             hash.update(stack.count.to_le_bytes());
+            digest_data(&mut hash, &stack.data);
         }
         result.rules_digest = Digest(hash.finalize().into());
         result
@@ -153,6 +224,7 @@ impl Catalog {
             inventory.set(
                 slot,
                 Some(ItemStack {
+                    data: Default::default(),
                     item: entry.id.clone(),
                     count: entry.limit.min(64),
                 }),
@@ -160,6 +232,26 @@ impl Catalog {
             )?;
         }
         Ok(inventory)
+    }
+}
+
+impl torse_world::ComponentValidator for Catalog {
+    fn validate(
+        &self,
+        fields: &torse_world::ComponentFields,
+    ) -> Result<(), torse_world::ComponentError> {
+        drops::DropState::from_fields(fields, self)
+            .map(|_| ())
+            .map_err(|_| torse_world::ComponentError::InvalidConfiguration {
+                id: drops::schema(),
+            })
+    }
+    fn rules_digest(&self) -> Digest {
+        use sha2::Digest as _;
+        let mut hash = sha2::Sha256::new();
+        hash.update(b"torse:items/drop-validator/v2\0");
+        hash.update(self.stacks.rules_digest().0);
+        Digest(hash.finalize().into())
     }
 }
 
@@ -181,6 +273,7 @@ pub fn fixture_catalog(registry: &BlockStateRegistry) -> Result<Catalog, RejectC
             (
                 key(block),
                 ItemStack {
+                    data: Default::default(),
                     item: key(item),
                     count,
                 },
@@ -206,6 +299,7 @@ pub fn block_catalog(registry: &BlockStateRegistry) -> Result<Catalog, RejectCod
             (
                 id.clone(),
                 ItemStack {
+                    data: Default::default(),
                     item: id.clone(),
                     count: 1,
                 },

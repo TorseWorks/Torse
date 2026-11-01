@@ -27,7 +27,7 @@ pub fn descriptors() -> Vec<ActionDescriptor> {
         .into_iter()
         .map(|name| ActionDescriptor {
             id: key(&format!("inventory:action/{name}")),
-            api_version: 1,
+            api_version: 2,
             kind: if name == "inspect" {
                 ActionKind::Query
             } else {
@@ -80,7 +80,7 @@ pub fn register_content(pack: &mut ContentPack) {
         };
         components.push(ComponentSchema {
             id: key(&format!("inventory:schema/{name}")),
-            schema_version: 1,
+            schema_version: if name == "container" { 2 } else { 1 },
             owner_module: owner(),
             fields: fields
                 .into_iter()
@@ -115,7 +115,7 @@ pub fn register_content(pack: &mut ContentPack) {
     };
     let capability = CapabilityDescriptor {
         id: key("inventory:capability/item_port"),
-        api_version: 1,
+        api_version: 2,
         query_methods: vec![method("inspect")],
         mutation_methods: vec![method("transfer")],
         target_schema_constraints: vec![schema()],

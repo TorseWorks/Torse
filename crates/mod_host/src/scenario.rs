@@ -579,9 +579,12 @@ pub fn run_scenario(
     policy: &GrantPolicy<'_>,
     components: BTreeMap<ContentKey, Vec<u8>>,
 ) -> Result<ScenarioReport, String> {
-    let (registry, schemas) = crate::package::registries(&set.content)?;
+    let (registry, mut schemas) = crate::package::registries(&set.content)?;
     let catalog = ItemCatalog::new([(ContentKey::parse("base:stone").expect("fixture item"), 64)])
         .map_err(|code| format!("catalog: {code:?}"))?;
+    catalog
+        .bind_schemas(&mut schemas)
+        .map_err(|error| format!("item validation: {error}"))?;
 
     let authority = WorldAuthority::new(
         WorldId(97),
@@ -669,6 +672,7 @@ pub fn run_scenario(
                     .set(
                         index,
                         Some(ItemStack {
+                            data: Default::default(),
                             item: fixture_key(item)?,
                             count: 1,
                         }),

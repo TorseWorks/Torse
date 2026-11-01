@@ -95,7 +95,7 @@ fn every_origin_requires_permission_and_secondary_target_access() {
 #[test]
 fn input_versions_phases_and_schemas_are_checked_before_execution() {
     let (world, service, _, ids) = setup();
-    for variant in 0..5 {
+    for variant in 0..6 {
         let mut req = request(ids[0], ids[1], 1);
         match variant {
             0 => req.api_version += 1,
@@ -107,6 +107,7 @@ fn input_versions_phases_and_schemas_are_checked_before_execution() {
             3 => {
                 req.parameters.remove(&key("inventory:field/count"));
             }
+            4 => req.api_version = 1,
             _ => {
                 req.parameters
                     .insert(key("unknown:field"), ComponentValue::U32(1));
@@ -314,6 +315,7 @@ fn place_and_break_actions_use_the_same_authorized_transaction_path() {
     let mut req = request(ids[0], ids[1], 1);
     req.target = ActionTarget::Block(pos);
     req.action = key("world:action/place");
+    req.api_version = 1;
     req.parameters = [(
         key("world:field/block"),
         ComponentValue::Content(key("base:stone")),
@@ -397,6 +399,7 @@ fn building_world_runs_without_the_inventory_module() {
         .target(ActionTarget::Block(pos));
     let mut req = request(EntityId(1), EntityId(2), 1);
     req.action = key("world:action/place");
+    req.api_version = 1;
     req.target = ActionTarget::Block(pos);
     req.parameters = [(
         key("world:field/block"),

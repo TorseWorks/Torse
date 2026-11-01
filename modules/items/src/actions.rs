@@ -309,10 +309,7 @@ impl ActionHandler for Handler {
             vec![InventoryOperation::Consume {
                 target: *target,
                 slot,
-                stack: ItemStack {
-                    item: stack.item.clone(),
-                    count: 1,
-                },
+                stack: stack.with_count(1),
             }]
         } else {
             let state = match view.terrain(pos)? {
@@ -332,7 +329,9 @@ impl ActionHandler for Handler {
             for empty in [false, true] {
                 for (slot, existing) in inventory.slots().iter().enumerate() {
                     let capacity = match existing {
-                        Some(other) if !empty && other.item == stack.item => limit - other.count,
+                        Some(other) if !empty && self.catalog.stacks.can_merge(other, stack)? => {
+                            limit - other.count
+                        }
                         None if empty => limit,
                         _ => 0,
                     };
@@ -341,10 +340,7 @@ impl ActionHandler for Handler {
                         operations.push(InventoryOperation::Insert {
                             target: *target,
                             slot,
-                            stack: ItemStack {
-                                item: stack.item.clone(),
-                                count,
-                            },
+                            stack: stack.with_count(count),
                         });
                         remaining -= count;
                     }

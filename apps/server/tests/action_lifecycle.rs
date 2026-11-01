@@ -17,7 +17,7 @@ fn key(value: &str) -> ContentKey {
 fn request() -> ActionRequest {
     ActionRequest {
         action: key("inventory:action/transfer"),
-        api_version: 1,
+        api_version: 2,
         origin: ActionOrigin::Network,
         target: ActionTarget::Block(BlockPos::new(8, 1, 1)),
         parameters: ComponentFields::new(),

@@ -12,3 +12,6 @@ torse-content = { path = "../../crates/content" }
 torse-sim = { path = "../../crates/sim" }
 torse-types = { path = "../../crates/types" }
 torse-world = { path = "../../crates/world" }
+
+[dev-dependencies]
+torse-codec = { path = "../../crates/codec" }

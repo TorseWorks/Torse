@@ -30,7 +30,8 @@ fn limits() -> ReplicaLimits {
 
 #[test]
 fn inventory_seed_and_transfer_delta_preserve_nested_slots_and_hide_ungranted_containers() {
-    let (world, service, catalog, ids) = setup();
+    let (mut world, service, catalog, ids) = setup();
+    install_instance(&mut world, &catalog, ids[0]);
     let binding = Binding {
         world: world.world(),
         epoch: WorldEpoch(10),
@@ -43,8 +44,9 @@ fn inventory_seed_and_transfer_delta_preserve_nested_slots_and_hide_ungranted_co
     let owner = source
         .open_replica(viewer(1), actor(&ids), scope.clone(), budget())
         .unwrap();
+    let owner = codec_roundtrip(&owner);
     let observer = source
-        .open_replica(viewer(2), actor(&[]), scope, budget())
+        .open_replica(viewer(2), actor(&[]), scope.clone(), budget())
         .unwrap();
     assert!(
         observer
@@ -65,6 +67,7 @@ fn inventory_seed_and_transfer_delta_preserve_nested_slots_and_hide_ungranted_co
     let batches = source
         .take_replica_batches(binding, owner.subscription, budget())
         .unwrap();
+    let batches = codec_roundtrip(&batches);
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].seq, ReplicaSeq(1));
     assert_eq!(batches[0].changes.entities.len(), 2);
@@ -81,6 +84,23 @@ fn inventory_seed_and_transfer_delta_preserve_nested_slots_and_hide_ungranted_co
             .is_empty()
     );
     assert_eq!(total(source.world(), &ids, &catalog), 1);
+    source.close_replica(binding, owner.subscription).unwrap();
+    let reconnected = source
+        .open_replica(viewer(1), actor(&ids), scope, budget())
+        .unwrap();
+    let reconnected = codec_roundtrip(&reconnected);
+    let destination = reconnected
+        .state
+        .entities
+        .iter()
+        .find(|entity| entity.id == ids[1])
+        .unwrap();
+    let inventory = torse_inventory::Inventory::from_fields(
+        &destination.components[&torse_inventory::schema()],
+        &catalog,
+    )
+    .unwrap();
+    assert_eq!(inventory.slots()[0].as_ref().unwrap().data, instance_data());
 }
 
 #[test]

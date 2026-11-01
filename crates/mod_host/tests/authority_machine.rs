@@ -145,6 +145,30 @@ fn machine_progress(instance: &ModInstance, machine: EntityId) -> u32 {
 #[test]
 fn machine_processes_and_transfers() {
     let mut fixture = fixture(&[], true);
+    let data = [
+        (key("test:durability"), ComponentValue::U32(23)),
+        (
+            key("extension:opaque"),
+            ComponentValue::Text("preserved through item port".into()),
+        ),
+    ]
+    .into();
+    let stack = ItemStack {
+        item: key("base:stone"),
+        count: 1,
+        data,
+    };
+    let mut input = Inventory::new(2).unwrap();
+    input.set(0, Some(stack.clone()), &fixture.catalog).unwrap();
+    let authority = fixture.instance.host_mut().authority_mut();
+    let schemas = authority.schemas().clone();
+    let handle = authority.entities().handle_of(fixture.input).unwrap();
+    authority
+        .entities_mut()
+        .components_mut(handle)
+        .unwrap()
+        .insert(&schemas, &torse_inventory::schema(), input.fields())
+        .unwrap();
     let outcomes = fixture.instance.run_ticks(1, 6).expect("ticks run");
     assert_eq!(outcomes.len(), 6);
     assert!(
@@ -156,13 +180,7 @@ fn machine_processes_and_transfers() {
     // Four wakeups advance the counter, the fourth also transfers and resets.
     assert_eq!(machine_progress(&fixture.instance, fixture.machine), 2);
     assert_eq!(slot0(&fixture.instance, fixture.input), None);
-    assert_eq!(
-        slot0(&fixture.instance, fixture.output),
-        Some(ItemStack {
-            item: key("base:stone"),
-            count: 1,
-        })
-    );
+    assert_eq!(slot0(&fixture.instance, fixture.output), Some(stack));
     assert!(fixture.instance.host().seq().0 >= 6);
 }
 
@@ -212,6 +230,7 @@ fn failed_transfer_leaves_no_partial_processing() {
     assert_eq!(
         slot0(&fixture.instance, fixture.output),
         Some(ItemStack {
+            data: Default::default(),
             item: key("base:stone"),
             count: 1,
         })
@@ -229,6 +248,7 @@ fn restock(fixture: &mut Fixture) {
         .set(
             0,
             Some(ItemStack {
+                data: Default::default(),
                 item: key("base:stone"),
                 count: 1,
             }),

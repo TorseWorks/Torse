@@ -1,13 +1,13 @@
 //! Item-port planning; both inventory endpoints publish in one transaction.
 
-use crate::{Inventory, ItemCatalog, ItemStack, key, owner, schema};
+use crate::{Inventory, ItemCatalog, key, owner, schema};
 use std::sync::Arc;
 use torse_sim::action::{
     ActionHandler, ActionOutput, ActionRequest, ActionTarget, ActionView, NativeHandler,
 };
-use torse_sim::{OrderingKey, Phase, Transaction};
+use torse_sim::{OrderingKey, Transaction};
 use torse_types::{EntityId, RejectCode, TransactionId};
-use torse_world::{ComponentEdit, ComponentFields, ComponentValue};
+use torse_world::{ComponentFields, ComponentValue, component_size};
 
 /// Bind query and transfer handlers to one immutable, game-supplied item catalog.
 pub fn handlers(catalog: ItemCatalog) -> Vec<NativeHandler> {
@@ -71,13 +71,17 @@ pub fn plan_transfers(
     if !view.actor().permits(&key("inventory:permission/transfer")) {
         return Err(RejectCode::PermissionDenied);
     }
+    let mut budget = 4096;
     for transfer in transfers {
         for entity in [transfer.source, transfer.destination] {
             if !view.actor().allows(ActionTarget::Entity(entity)) {
                 return Err(RejectCode::PermissionDenied);
             }
             if let std::collections::btree_map::Entry::Vacant(entry) = expected.entry(entity) {
-                entry.insert(view.component(entity, &schema())?.clone());
+                let fields = view.component(entity, &schema())?;
+                let bytes = component_size(fields).map_err(|_| RejectCode::QuotaExceeded)?;
+                crate::operations::charge_plan(&mut budget, bytes * 4 + 256)?;
+                entry.insert(fields.clone());
             }
         }
     }
@@ -143,83 +147,5 @@ pub fn plan_transfer(
     transaction: TransactionId,
     ordering: OrderingKey,
 ) -> Result<Transaction, RejectCode> {
-    if !view.actor().permits(&key("inventory:permission/transfer"))
-        || !view.actor().allows(ActionTarget::Entity(transfer.source))
-        || !view
-            .actor()
-            .allows(ActionTarget::Entity(transfer.destination))
-    {
-        return Err(RejectCode::PermissionDenied);
-    }
-    if !matches!(ordering.phase, Phase::Interaction | Phase::Simulation) {
-        return Err(RejectCode::InvalidData);
-    }
-    let Transfer {
-        source,
-        source_slot: from,
-        destination,
-        destination_slot: to,
-        count,
-    } = transfer;
-    if count == 0 || (source == destination && from == to) {
-        return Err(RejectCode::InvalidData);
-    }
-    let original = read(view, source)?;
-    let mut input = Inventory::from_fields(original, catalog)?;
-    let stack = input
-        .slots()
-        .get(from)
-        .ok_or(RejectCode::InvalidData)?
-        .as_ref()
-        .ok_or(RejectCode::Conflict)?
-        .clone();
-    if stack.count < count {
-        return Err(RejectCode::Conflict);
-    }
-    let destination_fields = read(view, destination)?;
-    let mut output = Inventory::from_fields(destination_fields, catalog)?;
-    let target = output.slots().get(to).ok_or(RejectCode::InvalidData)?;
-    let target_count = match target {
-        None => 0,
-        Some(existing) if existing.item == stack.item => existing.count,
-        Some(_) => return Err(RejectCode::Conflict),
-    };
-    let next_count = target_count
-        .checked_add(count)
-        .ok_or(RejectCode::Conflict)?;
-    if next_count > catalog.limit(&stack.item)? {
-        return Err(RejectCode::Conflict);
-    }
-    let remaining = if stack.count == count {
-        None
-    } else {
-        Some(ItemStack {
-            item: stack.item.clone(),
-            count: stack.count - count,
-        })
-    };
-    let added = Some(ItemStack {
-        item: stack.item,
-        count: next_count,
-    });
-    input.set(from, remaining, catalog)?;
-    let mut tx = Transaction::new(transaction, owner(), ordering);
-    if source == destination {
-        input.set(to, added, catalog)?;
-    } else {
-        output.set(to, added, catalog)?;
-        tx.components.push(ComponentEdit {
-            id: destination,
-            schema: schema(),
-            previous: Some(destination_fields.clone()),
-            fields: Some(output.fields()),
-        });
-    }
-    tx.components.push(ComponentEdit {
-        id: source,
-        schema: schema(),
-        previous: Some(original.clone()),
-        fields: Some(input.fields()),
-    });
-    Ok(tx)
+    plan_transfers(view, catalog, &[transfer], transaction, ordering)
 }

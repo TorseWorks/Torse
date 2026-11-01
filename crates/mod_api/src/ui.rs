@@ -117,7 +117,7 @@ impl MachineView {
         let output = self.output.as_ref()?;
         Some(ActionIntent {
             action: key("inventory:action/transfer"),
-            version: 1,
+            version: 2,
             target: input.entity,
             parameters: BTreeMap::from([
                 (key("inventory:field/source_slot"), ComponentValue::U32(0)),
@@ -136,6 +136,7 @@ impl MachineView {
 }
 
 fn inventory_summary(entity: EntityId, fields: &ComponentFields) -> Option<InventorySummary> {
+    torse_world::component_size(fields).ok()?;
     let ComponentValue::List(slots) = fields.get(&key("inventory:field/slots"))? else {
         return None;
     };
@@ -156,9 +157,19 @@ fn inventory_summary(entity: EntityId, fields: &ComponentFields) -> Option<Inven
         let ComponentValue::U32(count) = fields.get(&key("inventory:field/count"))? else {
             return None;
         };
-        if fields.len() != 2 || *count == 0 {
+        let valid_envelope = match (
+            fields.get(&key("inventory:field/data_format")),
+            fields.get(&key("inventory:field/data")),
+        ) {
+            (None, None) => fields.len() == 2,
+            (Some(ComponentValue::U32(1)), Some(ComponentValue::Record(_))) => fields.len() == 4,
+            _ => false,
+        };
+        if !valid_envelope || *count == 0 {
             return None;
         }
+        // This display total does not decide slot compatibility. Transfer intents
+        // retain source slots, and authority checks the complete instance data.
         let total = items.entry(item.clone()).or_default();
         *total = total.checked_add(*count)?;
     }
@@ -168,6 +179,46 @@ fn inventory_summary(entity: EntityId, fields: &ComponentFields) -> Option<Inven
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summaries_accept_versioned_instances_without_changing_payloads() {
+        let mut stack: ComponentFields = [
+            (
+                key("inventory:field/item"),
+                ComponentValue::Content(key("base:stone")),
+            ),
+            (key("inventory:field/count"), ComponentValue::U32(2)),
+            (key("inventory:field/data_format"), ComponentValue::U32(1)),
+            (
+                key("inventory:field/data"),
+                ComponentValue::Record(
+                    [(
+                        key("extension:unknown"),
+                        ComponentValue::Text("keep exactly".into()),
+                    )]
+                    .into(),
+                ),
+            ),
+        ]
+        .into();
+        let fields = |stack| {
+            ComponentFields::from([(
+                key("inventory:field/slots"),
+                ComponentValue::List(vec![ComponentValue::Record(stack)]),
+            )])
+        };
+        let input = fields(stack.clone());
+        let original = input.clone();
+        assert_eq!(
+            inventory_summary(EntityId(1), &input).unwrap().items[&key("base:stone")],
+            2
+        );
+        assert_eq!(input, original);
+        stack.insert(key("inventory:field/data_format"), ComponentValue::U32(2));
+        assert!(inventory_summary(EntityId(1), &fields(stack.clone())).is_none());
+        stack.remove(&key("inventory:field/data_format"));
+        assert!(inventory_summary(EntityId(1), &fields(stack)).is_none());
+    }
 
     #[test]
     fn summaries_reject_overflow_invalid_slots_and_excess_output() {

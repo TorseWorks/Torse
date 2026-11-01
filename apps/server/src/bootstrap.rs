@@ -237,9 +237,19 @@ fn assemble(
         || catalog.bind_compatibility(base),
         |items| items.bind_compatibility(base),
     );
-    let (schemas, compatibility) =
-        ComponentSchemas::assemble(&content, ComponentConfiguration::default(), compatibility)
-            .map_err(|error| Fault::invalid_data(error.to_string()))?;
+    let mut schemas = ComponentSchemas::build(&content);
+    if let Some(items) = &item_catalog {
+        items.bind_schemas(&mut schemas)
+    } else {
+        catalog.bind_schemas(&mut schemas)
+    }
+    .map_err(|error| Fault::invalid_data(error.to_string()))?;
+    schemas
+        .validate_block_defaults()
+        .map_err(|error| Fault::invalid_data(error.to_string()))?;
+    let (schemas, compatibility) = schemas
+        .bind_compatibility(compatibility)
+        .map_err(|error| Fault::invalid_data(error.to_string()))?;
     let mut handlers = if items {
         torse_items::block_handlers()
     } else {
@@ -289,6 +299,7 @@ fn assemble(
                 .set(
                     0,
                     Some(torse_inventory::ItemStack {
+                        data: Default::default(),
                         item: key("base:stone"),
                         count: 1,
                     }),

@@ -10,6 +10,7 @@
 //! encoding need to reason about.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use torse_content::{CompiledContent, ComponentFieldType, ComponentSchema, PersistencePolicy};
 use torse_types::{ContentKey, EntityId};
@@ -46,12 +47,20 @@ pub enum ComponentValue {
     Record(BTreeMap<ContentKey, Self>),
 }
 
+/// Trusted owner rules shared by live publication, recovery and replica decoding.
+/// Implementations must be deterministic, bounded and independent of world state.
+pub trait ComponentValidator: std::fmt::Debug + Send + Sync {
+    fn validate(&self, fields: &ComponentFields) -> Result<(), ComponentError>;
+    fn rules_digest(&self) -> torse_types::Digest;
+}
+
 /// Component schemas available to the world, indexed by identity.
 ///
 /// The set is built once from compiled content and never changes at runtime,
 /// which is what lets storage trust a schema identity without re-validating it.
 #[derive(Clone, Debug, Default)]
 pub struct ComponentSchemas {
+    pub(crate) validators: BTreeMap<ContentKey, Arc<dyn ComponentValidator>>,
     pub(crate) schemas: BTreeMap<ContentKey, ComponentSchema>,
     pub(crate) persistence: BTreeMap<ContentKey, bool>,
     pub(crate) block_defaults: BTreeMap<ContentKey, BTreeMap<ContentKey, ComponentFields>>,
@@ -76,6 +85,7 @@ impl ComponentSchemas {
         let motion = crate::player_motion::schema();
         schemas.insert(motion.id.clone(), motion);
         Self {
+            validators: BTreeMap::new(),
             schemas,
             persistence: BTreeMap::new(),
             block_defaults: BTreeMap::new(),
@@ -92,6 +102,27 @@ impl ComponentSchemas {
             compatibility: None,
             exterior: crate::ExteriorPolicy::default(),
         }
+    }
+
+    /// Install one schema owner's semantic validator before freezing startup.
+    /// Its declared rules identity is included in authority compatibility.
+    pub fn register_validator(
+        &mut self,
+        owner: &ContentKey,
+        id: &ContentKey,
+        validator: Arc<dyn ComponentValidator>,
+    ) -> Result<(), ComponentError> {
+        if self.compatibility.is_some() {
+            return Err(ComponentError::ConfigurationFrozen);
+        }
+        let schema = self
+            .get(id)
+            .ok_or_else(|| ComponentError::UnknownSchema { id: id.clone() })?;
+        if &schema.owner_module != owner || self.validators.contains_key(id) {
+            return Err(ComponentError::InvalidConfiguration { id: id.clone() });
+        }
+        self.validators.insert(id.clone(), validator);
+        Ok(())
     }
 
     /// Resolve an owner-defined save policy during trusted startup. Unresolved
@@ -269,6 +300,10 @@ impl ComponentSet {
                     field: declared.id.clone(),
                 });
             }
+        }
+
+        if let Some(validator) = schemas.validators.get(id) {
+            validator.validate(fields)?;
         }
 
         Ok(())

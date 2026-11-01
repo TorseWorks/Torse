@@ -299,10 +299,14 @@ impl World {
         let mut pack = m0_fixture_pack();
         torse_inventory::register_content(&mut pack);
         let content = compile(pack).map_err(|errors| format!("content: {errors:?}"))?;
+        let catalog = ItemCatalog::new([(key("base:stone"), 64)])
+            .map_err(|code| format!("catalog: {code:?}"))?;
+        let mut schemas = ComponentSchemas::build(&content);
+        catalog.bind_schemas(&mut schemas)?;
         let authority = WorldAuthority::new(
             WORLD,
             BlockStateRegistry::build(&content)?,
-            ComponentSchemas::build(&content),
+            schemas,
             SIDE,
             WorldBounds::new(0, 32)?,
             Compatibility {
@@ -315,8 +319,7 @@ impl World {
             authority,
             handles: Vec::new(),
             ids: Vec::new(),
-            catalog: ItemCatalog::new([(key("base:stone"), 64)])
-                .map_err(|code| format!("catalog: {code:?}"))?,
+            catalog,
         })
     }
 
@@ -344,6 +347,7 @@ impl World {
             let mut inventory = Inventory::new(2).map_err(|code| format!("{code:?}"))?;
             if let Some(count) = stack {
                 let stack = ItemStack {
+                    data: Default::default(),
                     item: key("base:stone"),
                     count,
                 };
@@ -411,14 +415,8 @@ impl World {
         let mut to = Inventory::from_fields(&destination, &self.catalog)
             .map_err(|code| format!("destination inventory: {code:?}"))?;
         let held = from.slots()[0].clone().ok_or("source slot is empty")?;
-        let left = (held.count > count).then(|| ItemStack {
-            item: held.item.clone(),
-            count: held.count - count,
-        });
-        let moved = ItemStack {
-            item: held.item,
-            count,
-        };
+        let left = (held.count > count).then(|| held.with_count(held.count - count));
+        let moved = held.with_count(count);
         from.set(0, left, &self.catalog)
             .map_err(|code| format!("{code:?}"))?;
         to.set(0, Some(moved), &self.catalog)
