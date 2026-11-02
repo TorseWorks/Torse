@@ -56,7 +56,7 @@ Ping在应用协议版本2加入，当前协议版本4在Hello阶段拒绝旧版
 
 版本4的ReplicaChanges依次为presentation、states、sections、removed_sections、entities、removed_entities。presentation是最多32项的完整有界列表，每项为PresentationId与PresentationDraft。
 
-PresentationId依次为epoch:u128、cursor（WorldId:u128、CommitSeq:u64）、index:u32。epoch与cursor须匹配批次绑定和through，index严格递增且小于32；过滤其他受众的事件后可以跳号。PresentationDraft依次为kind:ContentKey、version:u32、section:SectionPos、recipient:Option<EntityId>、fields:ComponentFields。version不得为0。
+PresentationId依次为epoch:u128、cursor（WorldId:u128、CommitSeq:u64）、index:u32。epoch与cursor须匹配批次绑定和through，index严格递增且小于32；过滤其他受众的事件后可以跳号。PresentationDraft依次为kind:ContentKey、version:u32、section:SectionPos、`recipient:Option<EntityId>`、fields:ComponentFields。version不得为0。
 
 事件由启动时注册的独立PresentationSchema校验。公开类型要求recipient为空；授权类型要求既有实体、订阅的实体授权及类型声明的permission。两类均要求批准范围包含事件锚点。载荷只有声明的基础字段，最多32字段，不接受List或Record，不从权威组件隐式复制。每项保守计费最多4096字节，每生产者每提交最多16项，整次提交最多32项及32768字节。队列另受ReplicaLimits限制，超额使整个订阅失效并清空待发状态和事件。
 
