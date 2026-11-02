@@ -530,48 +530,50 @@ impl DurableRule for FailureRule {
 }
 #[test]
 fn failure_panic_and_output_limits_leave_phase_retryable_and_join_all_workers() {
-    for failure in 1..=4 {
-        let mode = Arc::new(AtomicUsize::new(failure));
-        let finished = Arc::new(AtomicUsize::new(0));
-        let rules = (0..2)
-            .map(|index| {
-                Box::new(FailureRule {
-                    index,
-                    mode: Arc::clone(&mode),
-                    finished: Arc::clone(&finished),
-                }) as Box<dyn DurableRule>
-            })
-            .collect();
-        let (world, actions) = base::world().unwrap();
-        let mut host = ExecutionHost::new(
-            binding(&world),
-            world,
-            actions,
-            rules,
-            base::execution_limits(),
-        )
-        .unwrap();
-        host.set_parallel_planning(Some(PlanningConfig {
-            workers: 4,
-            max_in_flight: 2,
-        }))
-        .unwrap();
-        until_simulation(&mut host);
-        let before = bytes(&host);
-        let error = host.prepare_next().err().expect("planning must fail");
-        if failure == 1 {
-            assert_eq!(error.context, "failure 0");
+    for count in [1, 2] {
+        for failure in 1..=4 {
+            let mode = Arc::new(AtomicUsize::new(failure));
+            let finished = Arc::new(AtomicUsize::new(0));
+            let rules = (0..count)
+                .map(|index| {
+                    Box::new(FailureRule {
+                        index,
+                        mode: Arc::clone(&mode),
+                        finished: Arc::clone(&finished),
+                    }) as Box<dyn DurableRule>
+                })
+                .collect();
+            let (world, actions) = base::world().unwrap();
+            let mut host = ExecutionHost::new(
+                binding(&world),
+                world,
+                actions,
+                rules,
+                base::execution_limits(),
+            )
+            .unwrap();
+            host.set_parallel_planning(Some(PlanningConfig {
+                workers: 4,
+                max_in_flight: 2,
+            }))
+            .unwrap();
+            until_simulation(&mut host);
+            let before = bytes(&host);
+            let error = host.prepare_next().err().expect("planning must fail");
+            if failure == 1 {
+                assert_eq!(error.context, "failure 0");
+            }
+            if failure >= 3 {
+                assert_eq!(error.code, FaultCode::ResourceLimit);
+            }
+            assert_eq!(finished.load(Ordering::SeqCst), count);
+            assert_eq!(before, bytes(&host));
+            mode.store(0, Ordering::SeqCst);
+            let prepared = host.prepare_next().unwrap().unwrap();
+            assert_eq!(finished.load(Ordering::SeqCst), count * 2);
+            host.publish(prepared).unwrap();
+            assert_eq!(host.runtime().work.as_ref().unwrap().tasks.len(), 0);
         }
-        if failure >= 3 {
-            assert_eq!(error.code, FaultCode::ResourceLimit);
-        }
-        assert_eq!(finished.load(Ordering::SeqCst), 2);
-        assert_eq!(before, bytes(&host));
-        mode.store(0, Ordering::SeqCst);
-        let prepared = host.prepare_next().unwrap().unwrap();
-        assert_eq!(finished.load(Ordering::SeqCst), 4);
-        host.publish(prepared).unwrap();
-        assert_eq!(host.runtime().work.as_ref().unwrap().tasks.len(), 0);
     }
 }
 

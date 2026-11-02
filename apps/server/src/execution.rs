@@ -21,7 +21,7 @@ use torse_world::{BlockStateRegistry, ComponentFields, ComponentSchemas};
 
 #[path = "planning.rs"]
 mod planning;
-pub use planning::PlanningConfig;
+pub use planning::{NativePlanningStats, PlanningConfig, PlanningContext};
 #[path = "runtime_budget.rs"]
 mod runtime_budget;
 use runtime_budget::RuntimeBudget;
@@ -101,6 +101,18 @@ pub trait DurableRule {
     fn parallel_planner(&self) -> Option<&(dyn DurableRule + Sync)> {
         None
     }
+    /// Split one otherwise isolated opt-in rule into bounded native jobs.
+    /// Called on the host thread only when no other rule overlaps this batch.
+    /// Default implementations retain their ordinary planner; timed callbacks
+    /// remain serial. All work must finish before returning the plan.
+    fn plan_parallel(
+        &self,
+        world: &WorldAuthority,
+        tick: Tick,
+        _context: &PlanningContext,
+    ) -> Result<Vec<WorkPlan>, Fault> {
+        self.plan(world, tick)
+    }
     /// Derive bounded notifications from a planned action. They are frozen with
     /// that action and registered only if its world transaction commits.
     /// This callback must not invoke guests or change process-local state.
@@ -171,6 +183,7 @@ pub struct ExecutionHost {
     highest_session: u128,
     profiler: SerialProfiler,
     planning: Option<PlanningConfig>,
+    native_planning_stats: std::cell::Cell<NativePlanningStats>,
     compact_records: bool,
     budget_cache: RefCell<RuntimeBudget>,
     prevalidation: Option<PrevalidationConfig>,
@@ -463,6 +476,7 @@ impl ExecutionHost {
             highest_session: 0,
             profiler: SerialProfiler::default(),
             planning: None,
+            native_planning_stats: Default::default(),
             compact_records: true,
             budget_cache: RefCell::default(),
             prevalidation: None,

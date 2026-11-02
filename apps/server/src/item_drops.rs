@@ -1,5 +1,5 @@
 //! Optional demo adapter for durable physical item rules and scoped pickup.
-use crate::execution::{DurableRule, WorkPlan};
+use crate::execution::{DurableRule, PlanningContext, WorkPlan};
 use torse_items::{Catalog, drops, key};
 use torse_sim::{Phase, SystemSpec, WorldAuthority};
 use torse_types::{Fault, Tick};
@@ -13,6 +13,9 @@ impl DropPhysics {
     }
 }
 impl DurableRule for DropPhysics {
+    fn parallel_planner(&self) -> Option<&(dyn DurableRule + Sync)> {
+        Some(self)
+    }
     fn spec(&self) -> SystemSpec {
         SystemSpec {
             id: key("items:system/physics"),
@@ -24,6 +27,43 @@ impl DurableRule for DropPhysics {
     }
     fn plan(&self, world: &WorldAuthority, tick: Tick) -> Result<Vec<WorkPlan>, Fault> {
         Ok(drops::plans(world, &self.catalog, tick)
+            .into_iter()
+            .map(|group| WorkPlan {
+                transaction: Some(group),
+                schedule: vec![],
+                cancel: vec![],
+            })
+            .collect())
+    }
+    fn plan_parallel(
+        &self,
+        world: &WorldAuthority,
+        tick: Tick,
+        context: &PlanningContext,
+    ) -> Result<Vec<WorkPlan>, Fault> {
+        let batch = drops::prepare(world, &self.catalog, tick);
+        let jobs = batch.jobs();
+        let budgets = jobs
+            .iter()
+            .map(|job| job.budget())
+            .collect::<Option<Vec<_>>>();
+        let results = if let Some(budgets) = budgets.filter(|_| jobs.len() >= 8) {
+            let (output, scratch) = budgets
+                .into_iter()
+                .fold((0, 0), |(output, scratch), (o, s)| {
+                    (output.max(o), scratch.max(s))
+                });
+            // Typed inputs and accumulated outputs survive all lane calculations.
+            context.map(jobs.len(), output.saturating_mul(2), scratch, |i| {
+                jobs[i].plan()
+            })?
+        } else {
+            None
+        };
+        let results = results.unwrap_or_else(|| jobs.iter().map(drops::DropMotion::plan).collect());
+        Ok(batch
+            .finish(results)
+            .map_err(|error| Fault::invalid_data(format!("drop planning results: {error:?}")))?
             .into_iter()
             .map(|group| WorkPlan {
                 transaction: Some(group),

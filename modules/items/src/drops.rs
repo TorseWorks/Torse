@@ -348,10 +348,10 @@ pub fn near(left: Position, right: Position, distance: f64) -> bool {
 }
 
 /// Pure, bounded plans. The host commits them in order through its ordinary journal.
-pub fn plans(world: &WorldAuthority, catalog: &Catalog, tick: Tick) -> Vec<TransactionGroup> {
+pub fn prepare<'a>(world: &'a WorldAuthority, catalog: &Catalog, tick: Tick) -> DropBatch<'a> {
     let count = world.entities().len();
     if count == 0 {
-        return Vec::new();
+        return DropBatch::default();
     }
     let offset = (tick.0 as usize).wrapping_mul(MAX_STEP_BODIES) % count;
     let candidates: Vec<_> = world
@@ -363,7 +363,7 @@ pub fn plans(world: &WorldAuthority, catalog: &Catalog, tick: Tick) -> Vec<Trans
         .filter(|(_, e)| e.components.component(&schema()).is_some())
         .collect();
     let mut used = BTreeSet::new();
-    let mut groups = Vec::new();
+    let mut batch = DropBatch::default();
     for (handle, entity) in candidates {
         if !used.insert(entity.id) {
             continue;
@@ -447,7 +447,7 @@ pub fn plans(world: &WorldAuthority, catalog: &Catalog, tick: Tick) -> Vec<Trans
                         }
                         if let Ok(group) = TransactionGroup::new(id, ordering, vec![tx]) {
                             used.insert(other.id);
-                            groups.push(group);
+                            batch.slots.push(Some(group));
                             merged = true;
                         }
                         break 'neighbors;
@@ -458,6 +458,60 @@ pub fn plans(world: &WorldAuthority, catalog: &Catalog, tick: Tick) -> Vec<Trans
         if merged {
             continue;
         }
+        let slot = batch.slots.len();
+        batch.slots.push(None);
+        batch.jobs.push(DropMotion {
+            world,
+            handle,
+            entity,
+            state,
+            id,
+            ordering,
+            slot,
+        });
+    }
+    batch
+}
+
+/// One immutable typed input selected from the authoritative component model.
+/// The borrowed entity keeps exact identity/fields for transaction observations.
+pub struct DropMotion<'a> {
+    world: &'a WorldAuthority,
+    handle: torse_types::EntityHandle,
+    entity: &'a Entity,
+    state: DropState,
+    id: TransactionId,
+    ordering: OrderingKey,
+    slot: usize,
+}
+
+impl DropMotion<'_> {
+    /// Conservative owned output and scratch estimates for the native adapter.
+    /// Fixed scratch covers bounded native-body terrain sweeps of at most 3.2 units.
+    pub fn budget(&self) -> Option<(usize, usize)> {
+        // Activation/relocation and externally configured colliders use the
+        // serial reference; only the native body's bounded sweep is estimated.
+        if EntityCollider::of(self.entity) != Ok(Some(EntityCollider::Box { half: [125_000; 3] })) {
+            return None;
+        }
+        let bytes = torse_inventory::validate_instance_data(&self.state.stack.data)
+            .expect("selected drop data was validated") as usize;
+        let output = bytes.saturating_mul(64).saturating_add(32 * 1024);
+        Some((output, output.saturating_add(512 * 1024)))
+    }
+
+    /// Compute against the borrowed phase world; never publish this result here.
+    pub fn plan(&self) -> Option<TransactionGroup> {
+        let world = self.world;
+        let Self {
+            handle,
+            entity,
+            state,
+            id,
+            ordering,
+            ..
+        } = self;
+        let (handle, id, ordering) = (*handle, *id, *ordering);
         if matches!(
             EntityCollider::of(entity),
             Ok(Some(EntityCollider::Disabled))
@@ -473,13 +527,13 @@ pub fn plans(world: &WorldAuthority, catalog: &Catalog, tick: Tick) -> Vec<Trans
                 ordering,
             ) && let Ok(group) = TransactionGroup::new(id, ordering, vec![tx])
             {
-                groups.push(group);
+                return Some(group);
             } else if let Some(tx) = leave_filled_cell(world, entity, id, ordering)
                 && let Ok(group) = TransactionGroup::new(id, ordering, vec![tx])
             {
-                groups.push(group);
+                return Some(group);
             }
-            continue;
+            return None;
         }
         let mut next = state.clone();
         next.velocity[1] = (next.velocity[1] - 1_000_000).max(-32_000_000);
@@ -487,23 +541,21 @@ pub fn plans(world: &WorldAuthority, catalog: &Catalog, tick: Tick) -> Vec<Trans
         let mut tx = Transaction::new(id, owner(), ordering);
         tx.move_entity(handle, entity.id, entity.position, delta, [0.25; 3]);
         let Ok(prepared) = world.prepare(&tx) else {
-            continue;
+            return None;
         };
         if prepared
             .collision_reads()
             .iter()
             .any(|(_, q)| matches!(q, torse_world::TerrainQuery::NotLoaded))
         {
-            continue;
+            return None;
         }
         for (pos, query) in prepared.collision_reads() {
             if let Some(state) = query.ready() {
                 tx.read_block(*pos, state);
             }
         }
-        let Some(movement) = prepared.entity_moves().first() else {
-            continue;
-        };
+        let movement = prepared.entity_moves().first()?;
         let settled = Position::from_bits(movement.position_bits);
         let actual = [
             settled.x - entity.position.x,
@@ -517,13 +569,47 @@ pub fn plans(world: &WorldAuthority, catalog: &Catalog, tick: Tick) -> Vec<Trans
                 next.velocity[axis] = next.velocity[axis] * 4 / 5;
             }
         }
-        if settled.to_bits() == entity.position.to_bits() && next == state {
-            continue;
+        if settled.to_bits() == entity.position.to_bits() && next == *state {
+            return None;
         }
         replace(&mut tx, entity, &next);
         if let Ok(group) = TransactionGroup::new(id, ordering, vec![tx]) {
-            groups.push(group);
+            return Some(group);
         }
+        None
     }
-    groups
+}
+
+/// A transient phase view. Merge arbitration is already fixed in slot order;
+/// independent motion jobs may complete in any order before ordered assembly.
+#[derive(Default)]
+pub struct DropBatch<'a> {
+    slots: Vec<Option<TransactionGroup>>,
+    jobs: Vec<DropMotion<'a>>,
+}
+impl<'a> DropBatch<'a> {
+    pub fn jobs(&self) -> &[DropMotion<'a>] {
+        &self.jobs
+    }
+
+    /// Preserve the selected order, including positions occupied by merge plans.
+    pub fn finish(
+        mut self,
+        results: Vec<Option<TransactionGroup>>,
+    ) -> Result<Vec<TransactionGroup>, RejectCode> {
+        if results.len() != self.jobs.len() {
+            return Err(RejectCode::InvalidData);
+        }
+        for (job, result) in self.jobs.into_iter().zip(results) {
+            self.slots[job.slot] = result;
+        }
+        Ok(self.slots.into_iter().flatten().collect())
+    }
+}
+
+/// Pure, bounded serial reference using the same selection and body calculations.
+pub fn plans(world: &WorldAuthority, catalog: &Catalog, tick: Tick) -> Vec<TransactionGroup> {
+    let batch = prepare(world, catalog, tick);
+    let results = batch.jobs().iter().map(DropMotion::plan).collect();
+    batch.finish(results).expect("one result per selected body")
 }

@@ -4,6 +4,10 @@ use crate::{HostCheckpointStore, Server};
 use torse_runtime::{ExecutorConfig, JobBudget, JobError, JobOutput, run_scoped};
 use torse_storage::CommitJournal;
 
+#[cfg(test)]
+#[path = "planning/tests.rs"]
+mod tests;
+
 /// Limits one joined planning batch. The phase world is borrowed once, never
 /// cloned. Each admitted rule reserves four times `ExecutionLimits.runtime`
 /// bytes for trusted planner work, stable capture, and bounded wire validation.
@@ -61,7 +65,125 @@ impl PlanningConfig {
     }
 }
 
+/// Borrowed native job admission within an already reserved rule-planning batch.
+/// Adapter estimates cover retained inputs/results and concurrent scratch. This
+/// is a cooperative budget for trusted code, not an allocator sandbox.
+pub struct PlanningContext {
+    config: PlanningConfig,
+    max_work_bytes: usize,
+    stats: std::cell::Cell<NativePlanningStats>,
+}
+
+/// Process-local diagnostics; never part of ordering, compatibility or recovery.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativePlanningStats {
+    pub batches: u64,
+    pub jobs: u64,
+    pub peak_lanes: usize,
+    pub budget_fallbacks: u64,
+}
+
+impl PlanningContext {
+    fn fallback<T>(&self) -> Result<Option<Vec<T>>, Fault> {
+        let mut stats = self.stats.get();
+        stats.budget_fallbacks = stats.budget_fallbacks.saturating_add(1);
+        self.stats.set(stats);
+        Ok(None)
+    }
+    /// Return None when the estimated batch cannot fit, so the rule can use its
+    /// serial reference. Results preserve input order and no worker outlives us.
+    pub fn map<T: Send, F: Fn(usize) -> T + Sync>(
+        &self,
+        count: usize,
+        retained_bytes_per_job: usize,
+        scratch_bytes_per_job: usize,
+        work: F,
+    ) -> Result<Option<Vec<T>>, Fault> {
+        if count == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        // Each lane owns a bounded slice of retained results and reuses scratch
+        // across bodies. Start one joined thread batch rather than one per window.
+        let retained_bytes_per_job =
+            retained_bytes_per_job.max(size_of::<T>().saturating_mul(4).saturating_add(64));
+        let Some(retained) = retained_bytes_per_job.checked_mul(count) else {
+            return self.fallback();
+        };
+        let Some(available) = self.max_work_bytes.checked_sub(retained) else {
+            return self.fallback();
+        };
+        let lanes = self
+            .config
+            .workers
+            .min(self.config.max_in_flight)
+            .min(count)
+            .min(available / scratch_bytes_per_job.max(1));
+        if lanes == 0 {
+            return self.fallback();
+        }
+        let Some(per_lane) = count
+            .div_ceil(lanes)
+            .checked_mul(retained_bytes_per_job)
+            .and_then(|bytes| bytes.checked_add(scratch_bytes_per_job))
+        else {
+            return self.fallback();
+        };
+        let Some(total) = per_lane
+            .checked_mul(lanes)
+            .filter(|bytes| *bytes <= self.max_work_bytes)
+        else {
+            return self.fallback();
+        };
+        let executor = ExecutorConfig {
+            workers: lanes,
+            max_jobs: lanes,
+            max_input_bytes: lanes,
+            max_output_bytes: total,
+        };
+        let budget = JobBudget {
+            input_bytes: 0,
+            output_bytes: per_lane,
+        };
+        let mut stats = self.stats.get();
+        stats.batches = stats.batches.saturating_add(1);
+        stats.jobs = stats.jobs.saturating_add(count as u64);
+        stats.peak_lanes = stats.peak_lanes.max(lanes);
+        self.stats.set(stats);
+        let batches = run_scoped(executor, budget, lanes, |lane| {
+            let values: Vec<_> = (lane..count)
+                .step_by(lanes)
+                .map(|index| (index, work(index)))
+                .collect();
+            Ok(JobOutput {
+                value: values,
+                bytes: per_lane,
+            })
+        })
+        .map_err(|error| {
+            Fault::new(
+                FaultCode::InvalidState,
+                format!("native planning workers: {error}"),
+            )
+        })?;
+        let mut indexed = Vec::with_capacity(count);
+        for batch in batches {
+            indexed.extend(batch.map_err(|error| {
+                Fault::new(
+                    FaultCode::InvalidState,
+                    format!("native planning job: {error:?}"),
+                )
+            })?);
+        }
+        indexed.sort_unstable_by_key(|(index, _)| *index);
+        let results = indexed.into_iter().map(|(_, value)| value).collect();
+        Ok(Some(results))
+    }
+}
+
 impl ExecutionHost {
+    pub fn native_planning_stats(&self) -> NativePlanningStats {
+        self.native_planning_stats.get()
+    }
     /// Configure between drive calls, including after recovery. Existing frozen
     /// work is retained; this only affects the next uncollected phase.
     pub fn set_parallel_planning(&mut self, config: Option<PlanningConfig>) -> Result<(), Fault> {
@@ -160,6 +282,49 @@ impl ExecutionHost {
             } else {
                 None
             };
+            // A single rule may expose finer-grained native jobs. Execute its
+            // dispatcher here so it never starts a nested pool inside a worker.
+            if batch.len() == 1 {
+                let context = PlanningContext {
+                    config,
+                    max_work_bytes: budget.output_bytes,
+                    stats: Default::default(),
+                };
+                let plans = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    batch[0].plan_parallel(world, tick, &context)
+                }));
+                let mut stats = self.native_planning_stats.get();
+                let current = context.stats.get();
+                stats.batches = stats.batches.saturating_add(current.batches);
+                stats.jobs = stats.jobs.saturating_add(current.jobs);
+                stats.peak_lanes = stats.peak_lanes.max(current.peak_lanes);
+                stats.budget_fallbacks = stats
+                    .budget_fallbacks
+                    .saturating_add(current.budget_fallbacks);
+                self.native_planning_stats.set(stats);
+                let plans = plans.map_err(|_| {
+                    Fault::new(
+                        FaultCode::InvalidState,
+                        "native planning dispatcher panicked",
+                    )
+                })??;
+                if plans.len() > limits.phase_tasks.saturating_sub(tasks.len()) {
+                    return Err(Fault::resource_limit("phase task budget"));
+                }
+                let frozen = plans
+                    .into_iter()
+                    .map(|plan| freeze_rule_plan(world, plan, phase, None))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut bytes = Vec::new();
+                wire::encode(&frozen, &mut bytes, limits.runtime, limits.codec)?;
+                tasks.extend(wire::decode::<Vec<FrozenTask>>(
+                    &bytes,
+                    limits.runtime,
+                    limits.codec,
+                )?);
+                next += 1;
+                continue;
+            }
             let results = run_scoped(executor, budget, batch.len(), |index| {
                 let result = (|| {
                     let plans = batch[index].plan(world, tick)?;

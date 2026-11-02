@@ -1,0 +1,8 @@
+ticks=30
+warmup=5
+backend=memory-journal-with-complete-byte-comparison
+subscribers=0
+commit_batch_limit=16
+max_in_flight=4
+logical_cpus=32
+rustc 1.93.1 (01f6ddf75 2026-02-11)
