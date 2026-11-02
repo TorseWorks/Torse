@@ -312,6 +312,7 @@ mod tests {
         let mut cache = RuntimeBudget::default();
         for count in [0, 1, 16, 128] {
             state.work = Some(PhaseWork {
+                event_batch: false,
                 tasks: (0..count)
                     .map(|_| FrozenTask {
                         transaction: None,

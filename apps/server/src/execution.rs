@@ -1,4 +1,4 @@
-//! Durable phase driver. Phase output is frozen before the first task
+//! Durable phase driver. Each bounded batch is frozen before its first task
 //! commits; every task, request result, event change and execution position then
 //! shares one journal record with its world mutation. Recovery never runs rules.
 use crate::{HostAuthority, PreparedChange, RecoveryTarget};
@@ -59,6 +59,7 @@ pub struct ExecutionLimits {
     pub input: OutputBudget,
     pub sessions: usize,
     pub receipt_window: usize,
+    /// Retained tasks per ordinary/event batch and event callbacks per admission attempt.
     pub phase_tasks: usize,
     pub events: usize,
     pub runtime: OutputBudget,
@@ -75,6 +76,7 @@ impl ExecutionLimits {
             self.events,
         ]
         .contains(&0)
+            || self.phase_tasks >= (1 << 31)
             || self.runtime.max_items == 0
             || self.runtime.max_bytes == 0
             || self.input.max_bytes == 0
@@ -88,8 +90,9 @@ impl ExecutionLimits {
 }
 
 /// A rule is a pure planner. Persistent machine state belongs in world components;
-/// callbacks have no I/O or mutable authority. Every phase sees the same phase-start
-/// world. Freeze/retry may call a planner again before it has published any state.
+/// callbacks have no I/O or mutable authority. Ordinary planners share the phase-start
+/// world; each later event batch shares its committed batch-start world.
+/// Freeze/retry may call a planner again before it has published any state.
 pub trait DurableRule {
     fn spec(&self) -> SystemSpec;
     /// Opt in only when `plan` is thread-safe, pure, and bounded by the host's
@@ -280,6 +283,16 @@ fn checked_state_cached(
         }
     }
     if let Some(work) = &state.work {
+        if work.event_batch
+            && (Phase::from_index(point.next_phase) != Some(Phase::Simulation)
+                || work.tasks.is_empty()
+                || work
+                    .tasks
+                    .iter()
+                    .any(|task| task.consume.is_none() || task.request.is_some()))
+        {
+            return Err(Fault::invalid_data("invalid event batch"));
+        }
         let mut requests = std::collections::BTreeSet::new();
         let mut consumes = std::collections::BTreeSet::new();
         for (index, task) in work.tasks.iter().enumerate() {
@@ -305,10 +318,12 @@ fn checked_state_cached(
             if index >= work.next as usize {
                 if let Some(id) = task.consume
                     && (!consumes.insert(id.0)
-                        || !state
+                        || id.0 == 0
+                        || id.0 >= state.next_event
+                        || state
                             .events
                             .iter()
-                            .any(|e| e.id == id && e.event.tick <= point.tick))
+                            .any(|e| e.id == id && e.event.tick > point.tick))
                 {
                     return Err(Fault::invalid_data("invalid event acknowledgement"));
                 }
@@ -335,6 +350,37 @@ fn checked_state_cached(
     let _: RuntimeState = wire::decode(&encoded, limits.runtime, limits.codec)?;
     Ok(())
 }
+/// Replay validates admission without invoking a callback. Event batches must
+/// freeze a nonempty canonical prefix, never skip or invent queued identities.
+fn valid_batch_freeze(before: &RuntimeState, work: &PhaseWork, point: ResumePoint) -> bool {
+    if work.next != 0 {
+        return false;
+    }
+    if work.event_batch {
+        Phase::from_index(point.next_phase) == Some(Phase::Simulation)
+            && !work.tasks.is_empty()
+            && work.tasks.len()
+                <= before
+                    .events
+                    .iter()
+                    .take_while(|event| event.event.tick <= point.tick)
+                    .count()
+            && work
+                .tasks
+                .iter()
+                .zip(&before.events)
+                .all(|(task, event)| task.consume == Some(event.id) && task.request.is_none())
+    } else {
+        // Legacy ordinary batches may also contain already frozen events.
+        work.tasks.iter().filter_map(|task| task.consume).all(|id| {
+            before
+                .events
+                .iter()
+                .any(|event| event.id == id && event.event.tick <= point.tick)
+        })
+    }
+}
+
 fn receipt_bounds(state: &RuntimeState, cursor: CommitCursor) -> Result<(), Fault> {
     if state
         .windows
@@ -591,19 +637,26 @@ impl ExecutionHost {
         let _span = self.profiler.span(Stage::Planning);
         let point = self.resume_point();
         let phase = Phase::from_index(point.next_phase).expect("validated phase");
+        let mut ordinary = Vec::new();
+        self.collect_rules(phase, point.tick, &mut ordinary)?;
         let mut tasks = Vec::new();
         if !self.pending.is_empty() {
-            for q in self.pending.iter().filter(|q| {
-                q.tick <= point.tick
-                    && if q.request.input.action == movement_action() {
-                        phase == Phase::Simulation
-                    } else {
-                        self.actions
-                            .phase(&q.request.input.action)
-                            .unwrap_or(Phase::Interaction)
-                            == phase
-                    }
-            }) {
+            for q in self
+                .pending
+                .iter()
+                .filter(|q| {
+                    q.tick <= point.tick
+                        && if q.request.input.action == movement_action() {
+                            phase == Phase::Simulation
+                        } else {
+                            self.actions
+                                .phase(&q.request.input.action)
+                                .unwrap_or(Phase::Interaction)
+                                == phase
+                        }
+                })
+                .take(self.limits.phase_tasks.saturating_sub(ordinary.len()))
+            {
                 let id = q.request.id;
                 let mut task = FrozenTask {
                     transaction: None,
@@ -699,26 +752,10 @@ impl ExecutionHost {
                 tasks.push(task);
             }
         }
-        if phase == Phase::Simulation {
-            for event in self
-                .runtime
-                .events
-                .iter()
-                .filter(|e| e.event.tick <= point.tick)
-            {
-                let rule = self
-                    .rules
-                    .iter()
-                    .find(|r| r.spec().id == event.event.rule)
-                    .ok_or_else(|| Fault::incompatible("missing event rule"))?;
-                tasks.push(self.freeze_plan(
-                    rule.event(self.world(), point.tick, event)?,
-                    phase,
-                    Some(event.id),
-                )?);
-            }
+        tasks.extend(ordinary);
+        if tasks.is_empty() && self.has_due_events() {
+            return self.collect_event_batch();
         }
-        self.collect_rules(phase, point.tick, &mut tasks)?;
         if tasks.len() > self.limits.phase_tasks {
             return Err(Fault::resource_limit("phase task budget"));
         }
@@ -736,8 +773,91 @@ impl ExecutionHost {
         Ok(PhaseWork {
             tasks: tasks.into(),
             next: 0,
+            event_batch: false,
         })
     }
+    fn has_due_events(&self) -> bool {
+        Phase::from_index(self.resume_point().next_phase) == Some(Phase::Simulation)
+            && self
+                .runtime
+                .events
+                .first()
+                .is_some_and(|e| e.event.tick <= self.resume_point().tick)
+    }
+
+    /// Invoke at most one bounded prefix of due callbacks. Only frozen work is
+    /// published here; unselected events retain their durable queue entries.
+    fn collect_event_batch(&self) -> Result<PhaseWork, Fault> {
+        let point = self.resume_point();
+        let mut work = PhaseWork {
+            tasks: Arc::default(),
+            next: 0,
+            event_batch: true,
+        };
+        let budget = RefCell::new(RuntimeBudget::default());
+        for event in self
+            .runtime
+            .events
+            .iter()
+            .take_while(|e| e.event.tick <= point.tick)
+            .take(self.limits.phase_tasks)
+        {
+            let rule = self
+                .rules
+                .iter()
+                .find(|r| r.spec().id == event.event.rule)
+                .ok_or_else(|| Fault::incompatible("missing event rule"))?;
+            let task = self.freeze_plan(
+                rule.event(self.world(), point.tick, event)?,
+                Phase::Simulation,
+                Some(event.id),
+            )?;
+            Arc::make_mut(&mut work.tasks).push(task);
+            let mut candidate = self.runtime.clone();
+            candidate.work = Some(work.clone());
+            let admission: Result<(), Fault> = (|| {
+                fit_state_cached(
+                    &mut candidate,
+                    self.limits,
+                    point,
+                    self.binding.world,
+                    Some(&budget),
+                )?;
+                // Include the retained table and successful output at every
+                // settlement, so aggregate growth defers work instead of
+                // rejecting events which would fit in smaller batches.
+                for task in work.tasks.iter() {
+                    let status = if task
+                        .consume
+                        .is_some_and(|id| !candidate.events.iter().any(|event| event.id == id))
+                    {
+                        ReplyStatus::Rejected(RejectCode::Conflict)
+                    } else {
+                        task.status.clone()
+                    };
+                    candidate = settle(
+                        &candidate,
+                        task,
+                        &status,
+                        self.cursor(),
+                        point,
+                        self.limits,
+                        Some(&budget),
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = admission {
+                Arc::make_mut(&mut work.tasks).pop();
+                if work.tasks.is_empty() || error.code != FaultCode::ResourceLimit {
+                    return Err(error);
+                }
+                break;
+            }
+        }
+        Ok(work)
+    }
+
     fn record(
         &self,
         prepared: torse_sim::PreparedChange,
@@ -799,7 +919,14 @@ impl ExecutionHost {
     }
     fn prepare_task(&self, task: &FrozenTask) -> Result<ExecutionPrepared, Fault> {
         let mut status = task.status.clone();
-        let movement_rejection = self.check_frozen_movement(task).err();
+        let movement_rejection = if task
+            .consume
+            .is_some_and(|id| !self.runtime.events.iter().any(|e| e.id == id))
+        {
+            Some(RejectCode::Conflict)
+        } else {
+            self.check_frozen_movement(task).err()
+        };
         let mut prepared = if let Some(reason) = movement_rejection {
             status = ReplyStatus::Rejected(reason);
             self.source.prepare_barrier().map_err(commit_fault)?
@@ -998,6 +1125,15 @@ fn settle(
     limits: ExecutionLimits,
     cache: Option<&RefCell<RuntimeBudget>>,
 ) -> Result<RuntimeState, Fault> {
+    if task
+        .consume
+        .is_some_and(|id| !before.events.iter().any(|e| e.id == id))
+        && status != &ReplyStatus::Rejected(RejectCode::Conflict)
+    {
+        return Err(Fault::invalid_data(
+            "cancelled frozen event must be skipped",
+        ));
+    }
     if status != &task.status
         && (matches!(task.status, ReplyStatus::Rejected(_))
             || !matches!(status, ReplyStatus::Rejected(_)))
@@ -1473,10 +1609,21 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
                         && before.events == after.events
                         && pruned_windows(&before.windows, &after.windows)
                         && before.next_event == after.next_event
+                        && valid_batch_freeze(before, work, previous)
                 }
                 (Some(old), Some(new)) => {
-                    if record.meta.resume_at != previous
+                    if old.next as usize == old.tasks.len() {
+                        empty
+                            && record.changes.outcome.is_none()
+                            && record.meta.resume_at == previous
+                            && new.event_batch
+                            && before.events == after.events
+                            && before.next_event == after.next_event
+                            && pruned_windows(&before.windows, &after.windows)
+                            && valid_batch_freeze(before, new, previous)
+                    } else if record.meta.resume_at != previous
                         || old.tasks != new.tasks
+                        || old.event_batch != new.event_batch
                         || (old.next as usize) >= old.tasks.len()
                     {
                         false
@@ -1507,6 +1654,11 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
                         && before.events == after.events
                         && before.windows == after.windows
                         && before.next_event == after.next_event
+                        && !(Phase::from_index(previous.next_phase) == Some(Phase::Simulation)
+                            && before
+                                .events
+                                .first()
+                                .is_some_and(|event| event.event.tick <= previous.tick))
                 }
                 _ => false,
             }
@@ -1592,6 +1744,26 @@ impl ExecutionHost {
             if let Some(task) = work.tasks.get(work.next as usize) {
                 self.fill_prevalidation();
                 return self.prepare_task(task).map(Some);
+            }
+            if self.has_due_events() {
+                if self.frozen.is_none() {
+                    self.frozen = Some(self.collect_event_batch()?);
+                }
+                let mut state = self.runtime.clone();
+                state.work = self.frozen.clone();
+                fit_state(
+                    &mut state,
+                    self.limits,
+                    self.resume_point(),
+                    self.binding.world,
+                )?;
+                return self
+                    .record(
+                        self.source.prepare_barrier().map_err(commit_fault)?,
+                        state,
+                        Vec::new(),
+                    )
+                    .map(Some);
             }
             let mut state = self.runtime.clone();
             state.work = None;

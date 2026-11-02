@@ -105,7 +105,11 @@ impl ExecutionHost {
         while next < ordered.len() {
             let (_, rule) = ordered[next];
             let Some(config) = self.planning.filter(|_| rule.parallel_planner().is_some()) else {
-                for plan in rule.plan(self.world(), tick)? {
+                let plans = rule.plan(self.world(), tick)?;
+                if plans.len() > self.limits.phase_tasks.saturating_sub(tasks.len()) {
+                    return Err(Fault::resource_limit("phase task budget"));
+                }
+                for plan in plans {
                     tasks.push(self.freeze_plan(plan, phase, None)?);
                 }
                 next += 1;
@@ -141,7 +145,11 @@ impl ExecutionHost {
                 match pool.reserve(MemoryClass::Executor, bytes, EvictionRank::Pinned) {
                     Ok(lease) => Some(lease),
                     Err(error) if error.code == FaultCode::ResourceLimit => {
-                        for plan in rule.plan(self.world(), tick)? {
+                        let plans = rule.plan(self.world(), tick)?;
+                        if plans.len() > self.limits.phase_tasks.saturating_sub(tasks.len()) {
+                            return Err(Fault::resource_limit("phase task budget"));
+                        }
+                        for plan in plans {
                             tasks.push(self.freeze_plan(plan, phase, None)?);
                         }
                         next += 1;

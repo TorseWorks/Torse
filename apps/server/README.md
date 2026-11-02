@@ -53,7 +53,7 @@ cargo run --release -p torse-server --example serial_baseline --locked -- --outp
 
 `ExecutionHost::set_parallel_planning(Some(PlanningConfig { workers: 4, max_in_flight: 4 }))`启用有界批次；Server提供同名入口，主程序可传`--planning-workers 4`。默认保留串行执行。规则通过`DurableRule::parallel_planner`返回`Some(self)`显式加入，编译器要求其实现Sync。现有Mod适配器继续在宿主线程执行。
 
-请求与定时事件先按原次序规划，周期规则只在相邻且没有声明依赖时并行。工作线程借用同一阶段起点世界，批次全部结束后按原拓扑次序归并，再使用原稳定事务排序。每批最多max_in_flight项，原生规划器须遵守阶段和运行态预算。冻结缓存、逐项准备、日志接纳、发布、刷盘和恢复均沿用现有路径。
+普通规则先按拓扑次序规划，只在相邻且没有声明依赖时并行；请求规划使用普通输出剩余的phase_tasks槽位，未选中请求继续等待。工作线程借用同一阶段起点世界，全部结束后按原拓扑次序归并，再按既有稳定事务次序冻结普通工作。普通规则输出须符合阶段和运行态预算。到期事件在普通工作结算后独立分批规划，不与周期规划线程重叠。冻结缓存、逐项准备、日志接纳、发布、刷盘和恢复均沿用现有路径。
 
 借用批次通过torse-runtime的run_scoped执行，每批创建并回收有限线程；轻规划会增加开销，启用前应实测。`cargo run --release -p torse-server --example parallel_baseline -- --output .work/parallel-baseline`生成串行、1和4线程对照，详见[并行规划记录](../../benchmarks/archive/performance/M6-parallel-planning.md)。
 
@@ -90,7 +90,21 @@ cargo run -p torse-server --example headless_client -- 127.0.0.1:7777
 
 第二条在另一终端执行，需保持服务端运行。默认或`--ticks 0`持续运行，指定`--ticks 60`会在60个Tick后保存并关闭；同目录再次启动恢复Tick、事件、结果和任务位置，使用新epoch。演示创建两个Section及两个容器，对新连接使用只读访客PeerPolicy，因而headless_client看到实体但看不到库存组件。`--fill`仅用于新世界，把两个演示分区铺一层石头地面，方便图形客户端连上后有地形可见；已有存档的世界使用该参数会报错。`--editors`对新连接授予订阅分区内的编辑权限（ActorContext分区授权），配合图形客户端可完成经服务端提交的放置与破坏。`--revoke-after N`以首个连接为锚点，N个Tick后撤销全部会话并关闭传输，用于验收撤权与重连；行为与验证见[授权验收](../../benchmarks/archive/network/A8-acceptance.md)。
 
-ExecutionHost独占ReplicaSource，使用纯DurableRule规划系统和事件。阶段先写完整冻结任务，再逐项原子记录世界变化、任务进度、事件和结果，最后推进一个阶段。未来输入的关闭拒绝可以使用独立Stopping记录，不越过截止边界执行下一Tick。旧Simulation保留参考用途，不能在日志外直接执行后再补写进度。
+ExecutionHost独占ReplicaSource，使用纯DurableRule规划系统和事件。阶段先冻结普通工作，再逐项原子记录世界变化、任务进度、事件和结果；Simulation阶段继续结算全部到期事件后才推进。未来输入的关闭拒绝可以使用独立Stopping记录，不越过截止边界执行下一Tick。旧Simulation保留参考用途，不能在日志外直接执行后再补写进度。
+
+## 到期事件预算与进度
+
+phase_tasks限制每批冻结任务数，事件队列总量另由events限制。普通规则每阶段只规划一次；已有冻结工作在恢复后直接续行。普通工作结算后，到期事件按`(tick, EventId)`升序取有界前缀，每次准备最多调用phase_tasks个事件回调。事件批次共享该批开始时的已提交世界，后续批次可观察前批效果，不重复规划普通规则。空普通输出可以直接冻结首个事件批次。
+
+冻结前检查完整运行态预算，并预检保留任务表及各次成功结算的事件输出；组合超限会缩小批次，未选中事件仍在持久队列中。单个事件计划在当前队列下仍无法容纳，或回调返回非法数据时明确报错。单次可信回调自身的执行成本仍由实现方保证有界，宿主不能抢占任意原生回调。
+
+每批先以Full记录冻结，再以Progress逐项结算。结束后可在同一Tick和阶段冻结下一批；全部到期事件处理完才推进阶段。每条记录继续遵守准备、日志预留、发布、接纳、刷盘的顺序，重开只重放记录，不调用规划器。尚未冻结的回调、以及预算探测后未接纳的回调可能再次调用，必须保持纯函数。
+
+取消尚未规划的事件会直接移除队列项；取消同批已冻结事件时保留其任务位置，以Conflict空结算跳过全部效果。未处理事件的驻留声明持续生效，部分批次期间不能卸载依赖分区。检查点仍只接受Tick起点，批间检查点请求无修改地拒绝；已有检查点加逐项持久日志可恢复批间进度。编码兼容见[Execution载荷](../../crates/codec/EXECUTION.md)。
+
+```sh
+cargo test -p torse-server --test event_budget --locked
+```
 
 WorkPlan支持携带TransactionGroup。Mod机器自有状态与库存规划器返回的事务按来源组成一个任务，连同新唤醒共同预留、发布和刷盘。冻结任务保存稳定成员，恢复不重跑已规划或已结算的Guest。库存拒绝保留机器完成前的进度，不登记该计划的新唤醒；陷阱重试次数由持久事件载荷记录，停机以没有后续唤醒表示。ModStats只供诊断，不影响恢复后的执行。验证见[Mod原子执行](../../benchmarks/archive/mods/M4-mod-atomic.md)。
 

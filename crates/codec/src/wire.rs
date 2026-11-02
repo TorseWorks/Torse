@@ -720,7 +720,26 @@ impl Wire for FrozenTask {
         })
     }
 }
-fields!(PhaseWork { tasks, next });
+impl Wire for PhaseWork {
+    fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        if self.next >= (1 << 31) {
+            return Err(invalid("phase task cursor overflow"));
+        }
+        self.tasks.write(e)?;
+        // Ordinary work keeps its legacy encoding. Old hosts reject the event
+        // flag as an out-of-range task cursor before applying a journal record.
+        (self.next | if self.event_batch { 1 << 31 } else { 0 }).write(e)
+    }
+    fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
+        let tasks = Wire::read(d)?;
+        let next = u32::read(d)?;
+        Ok(Self {
+            tasks,
+            next: next & 0x7fff_ffff,
+            event_batch: next & (1 << 31) != 0,
+        })
+    }
+}
 fields!(RuntimeState {
     rules,
     next_event,
