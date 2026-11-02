@@ -111,6 +111,8 @@ pub struct OrderingKey {
 /// A prepared change that has not been committed yet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Transaction {
+    /// Bounded presentation drafts, published only with a successful commit.
+    pub presentation: Vec<torse_world::PresentationDraft>,
     /// Stable transaction identity used for diagnostics and deduplication.
     pub id: TransactionId,
     /// Module or system that produced the changes.
@@ -255,6 +257,7 @@ impl Transaction {
             id,
             source,
             ordering,
+            presentation: Vec::new(),
             preconditions: Vec::new(),
             mutations: Vec::new(),
             clearance: Vec::new(),

@@ -1512,6 +1512,19 @@ impl<'a> ExecutionRecovery<'a> {
         if *state.rules != specifications(&self.rules)? {
             return Err(Fault::incompatible("execution rules mismatch"));
         }
+        for member in state
+            .work
+            .iter()
+            .flat_map(|w| w.tasks.iter())
+            .filter_map(|t| t.transaction.as_ref())
+            .flat_map(|g| &g.members)
+        {
+            for draft in &member.presentation {
+                self.recovery
+                    .schemas()
+                    .validate_presentation(&member.source, draft)?;
+            }
+        }
         checked_state_cached(
             state,
             self.limits,

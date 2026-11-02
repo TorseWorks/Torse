@@ -74,6 +74,16 @@ impl ReplicaMirror {
         })
     }
     pub fn apply(&mut self, batch: WorldReplicaBatch) -> Result<(), Fault> {
+        self.apply_with_presentation(batch).map(|_| ())
+    }
+
+    /// Apply state and release this commit's bounded presentation events once.
+    /// Duplicate, stale or invalid batches return no events and change nothing.
+    /// There is no historical queue: dropping this result drops its effects.
+    pub fn apply_with_presentation(
+        &mut self,
+        batch: WorldReplicaBatch,
+    ) -> Result<Vec<torse_world::PresentationEvent>, Fault> {
         if batch.binding != self.binding
             || batch.subscription != self.subscription
             || batch.seq.0 != self.seq.0.checked_add(1).ok_or_else(invalid)?
@@ -83,6 +93,20 @@ impl ReplicaMirror {
             return Err(invalid());
         }
         let c = batch.changes;
+        torse_world::presentation_budget(
+            c.presentation.iter().map(|e| &e.draft),
+            torse_world::MAX_PRESENTATION_PER_COMMIT,
+        )
+        .map_err(|_| invalid())?;
+        if !sorted(c.presentation.iter().map(|e| e.id.index))
+            || c.presentation.iter().any(|event| {
+                event.id.epoch != self.binding.epoch
+                    || event.id.cursor != batch.through
+                    || event.id.index as usize >= torse_world::MAX_PRESENTATION_PER_COMMIT
+            })
+        {
+            return Err(invalid());
+        }
         if !sorted(c.sections.iter().map(|s| s.pos))
             || !sorted(c.entities.iter().map(|e| e.id))
             || !sorted(c.removed_sections.iter().copied())
@@ -116,6 +140,6 @@ impl ReplicaMirror {
         self.state = next;
         self.seq = batch.seq;
         self.through = batch.through;
-        Ok(())
+        Ok(c.presentation)
     }
 }

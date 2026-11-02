@@ -36,6 +36,7 @@ use crate::transaction::{BlockPrecondition, Transaction};
 /// valid outcome and consumes nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedChange {
+    presentation: Vec<torse_world::PresentationDraft>,
     meta: CommitMeta,
     observed_resume: ResumePoint,
     transaction: TransactionId,
@@ -146,6 +147,10 @@ fn body_positions(entities: &EntityStore, edits: &[ComponentEdit]) -> Vec<(Entit
 }
 
 impl PreparedChange {
+    /// Validated transient output, in canonical order, before reservation.
+    pub fn presentation(&self) -> &[torse_world::PresentationDraft] {
+        &self.presentation
+    }
     /// Complete creation/removal records and proposed allocator state, before publication.
     pub fn entity_lifecycle(&self) -> Option<&EntityLifecycle> {
         self.lifecycle_batch.as_ref().map(LifecycleBatch::change)
@@ -286,6 +291,7 @@ impl CommitCoordinator {
                         .components
                         .iter()
                         .any(|e| e.schema == torse_world::collider_schema())
+                    && m.presentation.is_empty()
                     && m.spawns.is_empty()
                     && m.despawns.is_empty()
             })
@@ -337,6 +343,7 @@ impl CommitCoordinator {
                     && m.mutations.is_empty()
                     && m.clearance.is_empty()
                     && m.components.is_empty()
+                    && m.presentation.is_empty()
                     && m.spawns.is_empty()
                     && m.despawns.is_empty()
             });
@@ -458,6 +465,7 @@ impl CommitCoordinator {
         let phase = Phase::from_index(self.resume.next_phase)
             .ok_or(CommitFault::Invariant("invalid phase"))?;
         Ok(PreparedChange {
+            presentation: Vec::new(),
             meta: CommitMeta {
                 cursor: CommitCursor {
                     world: self.world,
@@ -500,7 +508,8 @@ impl CommitCoordinator {
         store: &SectionStore,
         transaction: &Transaction,
     ) -> Result<PreparedChange, PrepareError> {
-        if !transaction.movements.is_empty()
+        if !transaction.presentation.is_empty()
+            || !transaction.movements.is_empty()
             || !transaction.relocations.is_empty()
             || !transaction.clearance.is_empty()
             || !transaction.components.is_empty()
@@ -520,7 +529,8 @@ impl CommitCoordinator {
         registry: &BlockStateRegistry,
         transaction: &Transaction,
     ) -> Result<PreparedChange, PrepareError> {
-        if !transaction.components.is_empty()
+        if !transaction.presentation.is_empty()
+            || !transaction.components.is_empty()
             || !transaction.spawns.is_empty()
             || !transaction.despawns.is_empty()
         {
@@ -541,6 +551,7 @@ impl CommitCoordinator {
         schemas: &ComponentSchemas,
         transaction: &Transaction,
     ) -> Result<PreparedChange, PrepareError> {
+        crate::presentation_events::validate(store, entities, schemas, transaction)?;
         let lifecycle = crate::lifecycle::prepare_lifecycle(store, entities, schemas, transaction)
             .map_err(PrepareError::Rejected)?;
         if transaction.components.len() > torse_world::MAX_COMPONENT_EDITS {
@@ -566,6 +577,7 @@ impl CommitCoordinator {
                 })
             })?;
         let mut prepared = self.prepare_world(store, entities, registry, transaction)?;
+        prepared.presentation = transaction.presentation.clone();
         prepared.component_edits = transaction.components.clone();
         prepared.component_batch = batch;
         prepared.lifecycle_batch = crate::block_instances::prepare(
@@ -632,6 +644,13 @@ impl CommitCoordinator {
         let mut component_edits: Vec<ComponentEdit> = Vec::new();
         let mut component_batches = Vec::new();
         let mut clearance = Vec::new();
+        if group.members.iter().any(|m| !m.presentation.is_empty())
+            && (group.members.len() > crate::MAX_GROUP_MEMBERS
+                || group.members.windows(2).any(|w| w[0].source >= w[1].source)
+                || group.members.iter().any(|m| m.ordering != group.ordering))
+        {
+            return Err(PrepareError::Rejected(RejectCode::InvalidData));
+        }
         if group
             .members
             .iter()
@@ -648,7 +667,13 @@ impl CommitCoordinator {
             .try_fold(0usize, |n, m| n.checked_add(m.components.len()))
             .is_none_or(|n| n > torse_world::MAX_COMPONENT_EDITS);
         let mut lifecycle_batch = None;
+        torse_world::presentation_budget(
+            group.members.iter().flat_map(|m| &m.presentation),
+            torse_world::MAX_PRESENTATION_PER_COMMIT,
+        )
+        .map_err(|_| PrepareError::Rejected(RejectCode::QuotaExceeded))?;
         for member in &group.members {
+            crate::presentation_events::validate(store, entities, schemas, member)?;
             if !member.relocations.is_empty() && member.source != crate::action::relocation_source()
             {
                 return Err(PrepareError::Rejected(RejectCode::PermissionDenied));
@@ -768,6 +793,7 @@ impl CommitCoordinator {
             && entity_moves.is_empty()
             && component_edits.is_empty()
             && lifecycle_batch.is_none()
+            && group.members.iter().all(|m| m.presentation.is_empty())
         {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
         }
@@ -863,6 +889,11 @@ impl CommitCoordinator {
             return Err(PrepareError::Rejected(RejectCode::Conflict));
         }
         Ok(PreparedChange {
+            presentation: group
+                .members
+                .iter()
+                .flat_map(|m| m.presentation.iter().cloned())
+                .collect(),
             meta: CommitMeta {
                 cursor,
                 previous: self.seq,
@@ -980,7 +1011,8 @@ impl CommitCoordinator {
             && transaction.components.is_empty()
             && transaction.spawns.is_empty()
             && transaction.despawns.is_empty()
-            && transaction.relocations.is_empty())
+            && transaction.relocations.is_empty()
+            && transaction.presentation.is_empty())
             || has_duplicate_targets(transaction)
         {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
@@ -1021,6 +1053,7 @@ impl CommitCoordinator {
             seq: next,
         };
         Ok(PreparedChange {
+            presentation: Vec::new(),
             meta: CommitMeta {
                 cursor,
                 previous: self.seq,
@@ -1278,7 +1311,8 @@ impl CommitCoordinator {
         transaction: &crate::Transaction,
         lifecycle: Result<Option<LifecycleBatch>, torse_types::RejectCode>,
     ) -> Result<PreparedChange, PrepareError> {
-        if transaction.movements.len() != 1
+        if !transaction.presentation.is_empty()
+            || transaction.movements.len() != 1
             || !transaction.clearance.is_empty()
             || !transaction.mutations.is_empty()
             || !transaction.components.is_empty()

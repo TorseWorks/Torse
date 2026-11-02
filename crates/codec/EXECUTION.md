@@ -59,11 +59,13 @@ Simulation中普通工作耗尽后，可用空世界变更在同一恢复位置�
 
 内存中的规则与任务列表使用Arc共享，编码仍写完整规范列表，不保存地址。解码另计共享容器及计数控制区的拥有字节。宿主可缓存不可变列表的完整编码、解码预算成本；事件和窗口每次重新检查，合并后的完整RuntimeState仍须满足原字节和条目上限。该缓存不改变磁盘字段或领域恢复规则。
 
-授权复制使用相同基础词汇，ReplicaSeed按binding、subscription、baseline、state，ReplicaBatch按binding、subscription、seq、through、changes。ReplicaSnapshot和ReplicaChanges字段顺序按A7登记；Dense在此使用带计数的符号列表，因此网络编码条目预算可能比A7内存预检更严格。客户端必须通过state表解析符号，不能直接使用远端运行编号。
+授权复制使用相同基础词汇，ReplicaSeed按binding、subscription、baseline、state，ReplicaBatch按binding、subscription、seq、through、changes。ReplicaSnapshot字段顺序按A7登记；协议4的ReplicaChanges新增前置presentation列表，详见[应用协议](../protocol/FORMAT.md)。Dense在此使用带计数的符号列表，因此网络编码条目预算可能比A7内存预检更严格。客户端必须通过state表解析符号，不能直接使用远端运行编号。
 
 decode要求消耗完整输入，拒绝未知版本、标签、超额集合、非法内容键和尾随字节。StorageCodec执行包裹元数据核对，ExecutionRecovery执行规则、阶段、事件、结果和世界领域校验。不能把编码成功当作授权或持久确认。
 
 ## 机器UI与方块通知
+
+呈现草稿使用独立的PresentationDraft，不复用下面的服务器定时通知，冻结与恢复规则见本文末节。
 
 B10沿用上述字段布局。UI只消费授权ReplicaSnapshot/ReplicaChanges，按钮发送既有Call：inventory:action/transfer、version=1、target为输入实体，parameters为source_slot=0、destination=输出实体、destination_slot=0、count=1。相同意图重发沿用原RequestId，不新建扣料请求。
 
@@ -93,3 +95,9 @@ EventDraft字段布局不变。可选保留字段`torse:event/dependencies-v1`�
 `generation.bin`最多512字节：ASCII标记TORSEGN1、wire版本1编码的GenerationIdentity，最后追加前述全部字节的CRC32C。GenerationIdentity依次为ContentKey、version:u32及configuration:32字节；version必须大于0，摘要应覆盖种子及全部生成参数。先同步`generation.next`，再原子发布正式文件；草稿不参与预检或恢复。
 
 ResidencyArchive是新的显式归档类型。wire外层版本1后写归档版本u16=1，再写完整ExecutionArchive和`Option<GenerationIdentity>`。其中世界快照合并当前驻留数据与全部引用页，保持实体身份、分配水位、事件及请求窗口。恢复前核对生成器描述，未知归档版本拒绝。原ExecutionArchive布局不变；内容迁移不能自动授权生成器语义变化。
+
+## 冻结呈现草稿
+
+带呈现草稿的FrozenTask.transaction使用新标签5，随后写组id、u32成员数（1至4），每成员依次写旧StoredTransaction正文、clearance、relocations、presentation。presentation为计数加PresentationDraft，字段顺序见[应用协议](../protocol/FORMAT.md)。解码在分配前检查每成员最多16项，整组最多32项和32768字节，并逐项检查4096字节及基础字段形状。解码旧标签1至4得到空presentation；无草稿的任务保持旧编码。新读取器支持0至5，旧读取器遇5明确拒绝，不能降级丢弃草稿后继续运行。
+
+草稿所属类型、生产者、版本、受众与字段由ComponentSchemas的独立启动注册表检查；注册内容纳入规则兼容摘要，冻结后不允许修改。提交仍写Execution版本3，快照仍写版本2，世界状态布局不变。已经提交的呈现事件不放入世界快照、不作为定时回调入队，重放只恢复持久结果，不再次投递。冻结但未结算的任务保留草稿，恢复后按普通校验与提交规则结算；原请求去重窗口继续防止二次执行。

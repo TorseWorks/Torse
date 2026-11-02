@@ -22,6 +22,7 @@ const BUDGET: OutputBudget = OutputBudget {
 
 fn member(source: &str, x: i64) -> StoredTransaction {
     StoredTransaction {
+        presentation: Vec::new(),
         id: TransactionId(7),
         source: ContentKey::parse(source).unwrap(),
         phase: 3,

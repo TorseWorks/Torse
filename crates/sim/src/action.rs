@@ -848,7 +848,13 @@ impl ActionService {
                 {
                     return Err(RejectCode::PermissionDenied);
                 }
-                if !tx.spawns.is_empty() || !tx.despawns.is_empty() {
+                if tx.presentation.iter().any(|event| match event.recipient {
+                    Some(entity) => !actor.allows(ActionTarget::Entity(entity)),
+                    None => !actor.sections.contains(&event.section) && !actor.targets.iter().any(|target| {
+                        matches!(target, TargetKey::Block(pos) if pos.to_section(side).is_ok_and(|(section, _)| section == event.section))
+                    }),
+                }) { return Err(RejectCode::PermissionDenied); }
+                if !tx.spawns.is_empty() || !tx.despawns.is_empty() || !tx.presentation.is_empty() {
                     check_group_budget(
                         std::slice::from_ref(tx.as_ref()),
                         action.max_items,
@@ -906,11 +912,19 @@ fn check_group_budget(
             + tx.movements.len()
             + tx.components.len()
             + tx.spawns.len()
-            + tx.despawns.len();
+            + tx.despawns.len()
+            + tx.presentation.len();
         items = items.saturating_add(entries as u64);
         bytes = bytes
             .saturating_add(128 + key_bytes(&tx.source))
             .saturating_add((entries as u64).saturating_mul(128));
+        bytes = bytes.saturating_add(
+            torse_world::presentation_budget(
+                &tx.presentation,
+                torse_world::MAX_PRESENTATION_PER_PRODUCER,
+            )
+            .map_err(|_| RejectCode::QuotaExceeded)?,
+        );
         for edit in &tx.components {
             bytes = bytes.saturating_add(key_bytes(&edit.schema));
             for fields in edit.previous.iter().chain(edit.fields.iter()) {

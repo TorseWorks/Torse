@@ -335,6 +335,7 @@ pub(super) fn update(
         }
     }
     let changes = ReplicaChanges {
+        presentation: Vec::new(),
         states,
         sections: changed_sections,
         removed_sections: vec![],

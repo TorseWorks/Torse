@@ -81,6 +81,7 @@ pub struct StableSpawn {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredTransaction {
+    pub presentation: Vec<torse_world::PresentationDraft>,
     pub id: TransactionId,
     pub source: ContentKey,
     pub phase: u16,
@@ -145,6 +146,16 @@ impl StoredTransactionGroup {
     pub fn validate(&self) -> Result<(), Fault> {
         if self.members.is_empty() || self.members.len() > crate::transaction::MAX_GROUP_MEMBERS {
             return Err(Fault::invalid_data("invalid frozen group size"));
+        }
+        torse_world::presentation_budget(
+            self.members.iter().flat_map(|m| &m.presentation),
+            torse_world::MAX_PRESENTATION_PER_COMMIT,
+        )?;
+        for member in &self.members {
+            torse_world::presentation_budget(
+                &member.presentation,
+                torse_world::MAX_PRESENTATION_PER_PRODUCER,
+            )?;
         }
         let first = &self.members[0];
         if self.members.windows(2).any(|w| w[0].source >= w[1].source)
@@ -365,7 +376,15 @@ fn resolve(registry: &BlockStateRegistry, value: &CellContent) -> Result<BlockSt
 }
 impl StoredTransaction {
     pub fn capture(world: &WorldAuthority, tx: &Transaction) -> Result<Self, Fault> {
+        torse_world::presentation_budget(
+            &tx.presentation,
+            torse_world::MAX_PRESENTATION_PER_PRODUCER,
+        )?;
+        for draft in &tx.presentation {
+            world.schemas().validate_presentation(&tx.source, draft)?;
+        }
         Ok(Self {
+            presentation: tx.presentation.clone(),
             id: tx.id,
             source: tx.source.clone(),
             phase: tx.ordering.phase.index_u16(),
@@ -483,6 +502,18 @@ impl StoredTransaction {
                 policy,
             );
         }
+        torse_world::presentation_budget(
+            &self.presentation,
+            torse_world::MAX_PRESENTATION_PER_PRODUCER,
+        )
+        .map_err(|_| RejectCode::QuotaExceeded)?;
+        for draft in &self.presentation {
+            world
+                .schemas()
+                .validate_presentation(&self.source, draft)
+                .map_err(|_| RejectCode::InvalidData)?;
+        }
+        tx.presentation = self.presentation.clone();
         tx.components = self.components.clone();
         for s in &self.spawns {
             tx.spawn_entity(Position::from_bits(s.position), s.components.clone());

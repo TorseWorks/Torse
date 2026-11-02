@@ -1,10 +1,10 @@
-# 应用协议版本3
+# 应用协议版本4
 
 每个TCP帧为u32小端正文长度 + 正文。零长度或超出本地frame上限拒绝。正文使用codec/wire版本u16=1，再跟u8消息标签和以下字段。TCP分段不等于应用分片，正文未收齐不解码。
 
 | 客户端标签 | 字段顺序 |
 |---|---|
-| 0 Hello | protocol_version:u16=3、Compatibility |
+| 0 Hello | protocol_version:u16=4、Compatibility |
 | 1 Request | RequestSeq:u64、泛型输入I |
 | 2 Subscribe | SectionPos的有界Vec |
 | 3 Unsubscribe | SubscriptionId:u128 |
@@ -40,7 +40,7 @@ Move的水平意向以i8的二进制补码写入两个u8，服务端归一化方
 
 断线撤销父会话及内部移动会话，冻结任务在提交前重查绑定、运行代数与批准范围。重连创建新会话；订阅替换保留当前移动序号并建立新代数基线，旧代数增量不能进入新镜像。移动路径及碰撞读取涉及的所有分区必须处于批准范围。
 
-标签0至5及codec/wire版本1保持原布局，但Hello拒绝协议版本1、2和未知版本。协议升级不重写现有存档；存在玩家运动组件的新世界需要支持该组件的读取器。具体预算和验证见[权威移动](../../benchmarks/archive/network/M5-authoritative-movement.md)。
+外层消息标签及codec/wire版本1保持原布局，Batch正文增加呈现事件。Hello拒绝协议版本1至3和未知版本。协议升级不重写现有存档；存在玩家运动组件的新世界需要支持该组件的读取器。具体预算和验证见[权威移动](../../benchmarks/archive/network/M5-authoritative-movement.md)。
 
 机器UI复用Seed/Batch中的Authorized组件和Request中的Call。机器对象及两个端口分别授权，引用端口身份不扩大读取权限。UI描述版本1是客户端编译期模型版本，独立于应用协议版本；未知描述版本清空视图。按钮ActionID与版本见[执行载荷](../codec/EXECUTION.md)，模型和场景见[机器UI验证](../../benchmarks/archive/mods/M4-machine-ui.md)。
 
@@ -50,4 +50,18 @@ Ping仅在Hello成功后接纳，没有响应、不占RequestSeq、不写日志�
 
 应用时序须满足`idle_ticks * tick_period >= 3 * heartbeat_interval`。演示配置为1200个Tick、50毫秒一个Tick、10秒心跳，空闲上限为60秒。停发后仍按原空闲规则回收连接。未握手连接也受空闲上限约束，Ping不能延长其占位。
 
-Ping在应用协议版本2加入，当前协议版本3在Hello阶段拒绝旧版本混用。codec/wire版本保持1，既有标签顺序、存档及执行记录布局不变；未知消息标签仍拒绝。
+Ping在应用协议版本2加入，当前协议版本4在Hello阶段拒绝旧版本混用。codec/wire版本保持1，既有标签顺序、存档及执行记录布局不变；未知消息标签仍拒绝。
+
+## 提交呈现事件
+
+版本4的ReplicaChanges依次为presentation、states、sections、removed_sections、entities、removed_entities。presentation是最多32项的完整有界列表，每项为PresentationId与PresentationDraft。
+
+PresentationId依次为epoch:u128、cursor（WorldId:u128、CommitSeq:u64）、index:u32。epoch与cursor须匹配批次绑定和through，index严格递增且小于32；过滤其他受众的事件后可以跳号。PresentationDraft依次为kind:ContentKey、version:u32、section:SectionPos、recipient:Option<EntityId>、fields:ComponentFields。version不得为0。
+
+事件由启动时注册的独立PresentationSchema校验。公开类型要求recipient为空；授权类型要求既有实体、订阅的实体授权及类型声明的permission。两类均要求批准范围包含事件锚点。载荷只有声明的基础字段，最多32字段，不接受List或Record，不从权威组件隐式复制。每项保守计费最多4096字节，每生产者每提交最多16项，整次提交最多32项及32768字节。队列另受ReplicaLimits限制，超额使整个订阅失效并清空待发状态和事件。
+
+同一次事务或原子组的状态与事件共用一个Batch。没有可见状态变化时可以只发事件；没有匹配事件或状态时不产生空批次。普通规则无需RequestId即可产生事件，拒绝及未预留任务不发事件，Result、Batch仍等待DurableSeq。
+
+ReplicaMirror.apply_with_presentation在完整状态与事件校验通过后一次返回该批事件。重复批次返回ResetRequired，不修改镜像或再次释放事件。apply保留只应用状态的用法并丢弃事件。客户端NetEvent::Increment携带经镜像验证的事件，消费者按kind/version选择处理器，未知类型或版本跳过，不转成服务器任务。返回值有界且不存历史；应用须在连接失效、重建基线或退出时丢弃尚未处理的旧连接输出。
+
+Seed只包含状态。重连、订阅重建和新epoch都从新基线开始，不重播已提交事件。已提交但尚未发出的呈现事件是易失输出，重启时丢弃；冻结但未提交的任务保留草稿，恢复后首次提交按新epoch产生身份。音频设备、混音与粒子渲染不属于本通道。
