@@ -2,7 +2,23 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'figures/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - 'LICENSE'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'figures/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - 'LICENSE'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
