@@ -57,6 +57,12 @@ cargo run --release -p torse-server --example serial_baseline --locked -- --outp
 
 借用批次通过torse-runtime的run_scoped执行，每批创建并回收有限线程；轻规划会增加开销，启用前应实测。`cargo run --release -p torse-server --example parallel_baseline -- --output .work/parallel-baseline`生成串行、1和4线程对照，详见[并行规划记录](../../benchmarks/archive/performance/M6-parallel-planning.md)。
 
+原生规则还可实现`DurableRule::plan_parallel`，在独占当前规划批次时通过`PlanningContext::map`细分任务。宿主在主线程调用调度入口，一次启动有限计算通道，各通道复用临时空间，按输入序号汇总结果；与其他规则并行时仍调用普通plan，避免嵌套创建线程。保留输入、结果及临时空间的可信估计超过既有规则预留时，map返回None供调用方串行计算。线程异常在全部回收后返回错误，冻结前继续检查任务与编解码预算。
+
+默认掉落物规则已经接入该入口，`--planning-workers 4`也可细分单个物理规则。候选轮转、邻域合并与输出占位先按既定次序确定，随后计算独立运动；至少8项运动、全部使用原生固定碰撞体且预算可容纳时才启动计算通道。激活、其他碰撞体、小批次与预算不足沿用串行路径。`ExecutionHost::native_planning_stats`报告进程内批次数、物体数、峰值通道数和预算回退次数，恢复后重新计数。
+
+掉落物计算视图借用同一阶段权威世界，持有稳定观察及解析状态，规划返回后销毁；事务继续串行校验和提交。实体存储、组件模式、存档和网络格式不变，独立ECS实验尚未接管权威状态。真实物体的完整Tick测量未显示稳定的整体加速，P95也有退化，默认继续串行。复现入口为`cargo run --release -p torse-server --example drop_baseline --locked -- --output .work/drop-baseline`，详见上述记录的原生掉落物补充。
+
 ## 移动预验证
 
 `ExecutionHost::set_prevalidation(Some(PrevalidationConfig::default()))`启用冻结任务的只读碰撞预计算，Server提供同名入口。主程序使用`--prevalidate-workers 4`，默认关闭。默认最多4线程、16项在途任务，每项预留8MiB；预计扫掠体积不足512格的轻任务继续串行准备。
