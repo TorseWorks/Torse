@@ -1724,3 +1724,94 @@ fn shutdown_rejects_future_admitted_input_at_a_durable_boundary() {
         assert_eq!(server.authority().unwrap().resume_point().tick, Tick(1));
     }
 }
+
+struct OrderedPathRule;
+impl DurableRule for OrderedPathRule {
+    fn spec(&self) -> SystemSpec {
+        SystemSpec {
+            id: key("test:ordered-path"),
+            phase: Phase::Simulation,
+            rule_priority: 0,
+            before: Vec::new(),
+            after: Vec::new(),
+        }
+    }
+    fn plan(&self, world: &WorldAuthority, tick: Tick) -> Result<Vec<WorkPlan>, Fault> {
+        if tick != Tick(0) {
+            return Ok(Vec::new());
+        }
+        let handle = world.entities().handle_of(EntityId(1)).unwrap();
+        let entity = world.entities().get(handle).unwrap();
+        let mut tx = Transaction::new(
+            TransactionId(909),
+            key("test:ordered-path"),
+            OrderingKey {
+                phase: Phase::Simulation,
+                rule_priority: 0,
+                stable_task_key: 0,
+                local_sequence: 0,
+            },
+        );
+        tx.move_entity_path(
+            handle,
+            entity.id,
+            entity.position,
+            &[[0.0, 1.0, 0.0], [0.5, 0.0, 0.0], [0.0, -1.0, 0.0]],
+            [0.3, 0.9, 0.3],
+        )
+        .map_err(|e| Fault::invalid_data(format!("path request: {e:?}")))?;
+        Ok(vec![WorkPlan::transaction(tx)])
+    }
+}
+
+#[test]
+fn ordered_path_frozen_before_commit_replays_once_without_replanning() {
+    let dir = Directory::new();
+    let rules = || vec![Box::new(OrderedPathRule) as Box<dyn DurableRule>];
+    let mut server = create(&dir, rules());
+    let initial = server
+        .authority()
+        .unwrap()
+        .world()
+        .entities()
+        .get(
+            server
+                .authority()
+                .unwrap()
+                .world()
+                .entities()
+                .handle_of(EntityId(1))
+                .unwrap(),
+        )
+        .unwrap()
+        .position;
+    loop {
+        let a = server.authority().unwrap();
+        if a.resume_point().next_phase == 3 && a.runtime().work.is_some() {
+            break;
+        }
+        server.drive_one(&mut NoReplicas).unwrap();
+    }
+    drop(server);
+    let mut restored = reopen(&dir, rules()).unwrap();
+    tick(&mut restored);
+    let world = restored.authority().unwrap().world();
+    let position = world
+        .entities()
+        .get(world.entities().handle_of(EntityId(1)).unwrap())
+        .unwrap()
+        .position;
+    assert!((position.x - initial.x - 0.5).abs() < 1e-7);
+    assert!((position.y - initial.y).abs() < 1e-7);
+    restored.shutdown(Tick(2), &mut NoReplicas).unwrap();
+    let restored = reopen(&dir, rules()).unwrap();
+    let world = restored.authority().unwrap().world();
+    assert_eq!(
+        world
+            .entities()
+            .get(world.entities().handle_of(EntityId(1)).unwrap())
+            .unwrap()
+            .position,
+        position
+    );
+}

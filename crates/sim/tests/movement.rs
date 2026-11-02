@@ -1038,3 +1038,124 @@ fn opened_storage_face_is_empty_and_unloaded_sections_stay_solid() {
         opened.coordinator().compatibility()
     );
 }
+
+#[test]
+fn ordered_translation_path_crosses_an_obstacle_without_shortcutting() {
+    let mut world = authority();
+    let handle = spawn(&mut world, 1.0);
+    let entity = world.entities().get(handle).unwrap();
+    let (id, position) = (entity.id, entity.position);
+    let stone = world.registry().default_state(&key("base:stone")).unwrap();
+    for y in 1..=2 {
+        world
+            .store_mut()
+            .edit(BlockPos::new(2, y, 2), stone)
+            .unwrap();
+    }
+    let mut tx = transaction(1);
+    tx.move_entity_path(
+        handle,
+        id,
+        position,
+        &[[0.0, 2.0, 0.0], [3.0, 0.0, 0.0], [0.0, -2.0, 0.0]],
+        [0.3, 0.9, 0.3],
+    )
+    .unwrap();
+    let stored = torse_sim::durable::StoredTransaction::capture(&world, &tx).unwrap();
+    let restored = stored.restore(&world).unwrap();
+    assert_eq!(restored, tx);
+    let group =
+        torse_sim::TransactionGroup::new(restored.id, restored.ordering, vec![restored]).unwrap();
+    let prepared = world.prepare_group(&group).unwrap();
+    assert_eq!(prepared.entity_moves().len(), 1);
+    world.publish(prepared).unwrap();
+    let final_position = world.entities().get(handle).unwrap().position;
+    assert!((final_position.x - 4.0).abs() < 1e-7);
+    assert!((final_position.y - 2.0).abs() < 1e-7);
+}
+
+#[test]
+fn ordered_path_rejects_stale_route_observations_and_blocked_intermediate_legs() {
+    let mut world = authority();
+    let handle = spawn(&mut world, 1.0);
+    let entity = world.entities().get(handle).unwrap();
+    let (id, position) = (entity.id, entity.position);
+    let stone = world.registry().default_state(&key("base:stone")).unwrap();
+    let mut tx = transaction(1);
+    tx.move_entity_path(
+        handle,
+        id,
+        position,
+        &[[0.0, 2.0, 0.0], [3.0, 0.0, 0.0], [0.0, -2.0, 0.0]],
+        [0.3, 0.9, 0.3],
+    )
+    .unwrap();
+    let group = torse_sim::TransactionGroup::new(tx.id, tx.ordering, vec![tx]).unwrap();
+    let prepared = world.prepare_group(&group).unwrap();
+    world
+        .store_mut()
+        .edit(BlockPos::new(2, 4, 2), stone)
+        .unwrap();
+    assert!(world.publish(prepared).is_err());
+    assert_eq!(world.entities().get(handle).unwrap().position, position);
+    assert!(world.prepare_group(&group).is_err());
+    assert_eq!(world.entities().get(handle).unwrap().position, position);
+}
+
+#[test]
+fn ordered_path_admission_is_bounded_atomic_and_does_not_accept_duplicate_moves() {
+    let mut world = authority();
+    let handle = spawn(&mut world, 1.0);
+    let entity = world.entities().get(handle).unwrap();
+    let (id, position) = (entity.id, entity.position);
+    let mut tx = transaction(1);
+    for path in [
+        vec![],
+        vec![[0.0; 3]; 5],
+        vec![[9.0, 0.0, 0.0]; 2],
+        vec![[f64::NAN, 0.0, 0.0]],
+    ] {
+        assert!(
+            tx.move_entity_path(handle, id, position, &path, [0.3, 0.9, 0.3])
+                .is_err()
+        );
+        assert!(tx.movements.is_empty());
+    }
+    tx.move_entity(handle, id, position, [1.0, 0.0, 0.0], [0.3, 0.9, 0.3]);
+    tx.move_entity(handle, id, position, [1.0, 0.0, 0.0], [0.3, 0.9, 0.3]);
+    rejected(&mut world, &tx, RejectCode::InvalidData);
+    assert_eq!(world.entities().get(handle).unwrap().position, position);
+}
+
+#[test]
+fn ordered_path_cannot_cross_unknown_cells_or_reuse_a_stale_source() {
+    let mut world = authority();
+    let handle = spawn(&mut world, 14.0);
+    let entity = world.entities().get(handle).unwrap();
+    let (id, position) = (entity.id, entity.position);
+    let mut tx = transaction(1);
+    tx.move_entity_path(
+        handle,
+        id,
+        position,
+        &[[0.0, 1.0, 0.0], [3.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
+        [0.3, 0.9, 0.3],
+    )
+    .unwrap();
+    assert!(matches!(
+        world.commit(&tx).unwrap().outcome,
+        TransactionOutcome::Rejected(_)
+    ));
+    assert_eq!(world.entities().get(handle).unwrap().position, position);
+    let mut tx = transaction(2);
+    tx.move_entity_path(
+        handle,
+        id,
+        position,
+        &[[-1.0, 0.0, 0.0], [0.0, 0.5, 0.0]],
+        [0.3, 0.9, 0.3],
+    )
+    .unwrap();
+    committed(world.commit(&tx).unwrap());
+    rejected(&mut world, &tx, RejectCode::Conflict);
+}

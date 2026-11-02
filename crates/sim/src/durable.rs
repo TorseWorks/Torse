@@ -191,11 +191,20 @@ impl StoredTransactionGroup {
                 }
                 touched.insert(edit.id);
             }
+            crate::transaction::validate_movement_paths(
+                member
+                    .moves
+                    .iter()
+                    .map(|m| (m.id, m.previous, m.delta, m.half)),
+            )
+            .map_err(|_| Fault::invalid_data("invalid frozen movement path"))?;
             let mut moved = std::collections::BTreeSet::new();
             for id in member
                 .moves
                 .iter()
                 .map(|movement| movement.id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
                 .chain(member.relocations.iter().map(|relocation| relocation.id))
             {
                 if !moved.insert(id) {

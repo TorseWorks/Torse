@@ -7,7 +7,7 @@
 //! prepared record without moving an entity or changing an index.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use torse_content::Shape;
 use torse_types::{BlockPos, EntityHandle, EntityId, RejectCode};
@@ -19,6 +19,10 @@ use torse_world_services::{
 };
 
 use crate::transaction::Movement;
+
+// Repeated bounded sweeps can round the reconstructed center by a few ULPs.
+// Always sweep from the actual preceding result, never the requested waypoint.
+const PATH_WAYPOINT_EPSILON: f64 = 1e-7;
 
 /// Prototype limit for each absolute center coordinate, in block units.
 pub const MAX_MOVEMENT_COORDINATE: f64 = 1_048_576.0;
@@ -163,6 +167,14 @@ pub(crate) fn prepare_movements(
     requests: &[Movement],
     mode: MovementMode,
 ) -> Result<ResolvedMovements, RejectCode> {
+    crate::transaction::validate_movement_paths(
+        requests
+            .iter()
+            .map(|m| (m.id, m.previous_bits, m.delta_bits, m.half_bits)),
+    )?;
+    if mode == MovementMode::Escape && requests.len() > 1 {
+        return Err(RejectCode::InvalidData);
+    }
     if requests.len() > MAX_TRANSACTION_MOVEMENTS {
         return Err(RejectCode::QuotaExceeded);
     }
@@ -176,12 +188,8 @@ pub(crate) fn prepare_movements(
         reads: RefCell::new(BTreeMap::new()),
         unknown: RefCell::new(false),
     };
-    let mut seen = BTreeSet::new();
-    let mut moves = Vec::with_capacity(requests.len());
+    let mut moves: Vec<EntityMove> = Vec::with_capacity(requests.len());
     for request in requests {
-        if !seen.insert(request.id) {
-            return Err(RejectCode::InvalidData);
-        }
         let entity = entities
             .get(request.handle)
             .ok_or(RejectCode::MissingTarget)?;
@@ -195,12 +203,25 @@ pub(crate) fn prepare_movements(
         {
             return Err(RejectCode::PermissionDenied);
         }
-        if entity.position.to_bits() != request.previous_bits {
+        let continuing = moves.last().filter(|m| m.id == request.id);
+        if continuing.is_none() && entity.position.to_bits() != request.previous_bits {
             return Err(RejectCode::Conflict);
         }
         let delta = request.delta_bits.map(f64::from_bits);
         let half = request.half_bits.map(f64::from_bits);
-        let position = entity.position;
+        let position = continuing.map_or(entity.position, |m| Position::from_bits(m.position_bits));
+        if continuing.is_some()
+            && position
+                .to_bits()
+                .into_iter()
+                .zip(request.previous_bits)
+                .any(|(actual, expected)| {
+                    (f64::from_bits(actual) - f64::from_bits(expected)).abs()
+                        > PATH_WAYPOINT_EPSILON
+                })
+        {
+            return Err(RejectCode::Conflict);
+        }
         if !bounded_position(position)
             || delta
                 .iter()
@@ -221,11 +242,14 @@ pub(crate) fn prepare_movements(
             if *view.unknown.borrow() {
                 return Err(RejectCode::NotLoaded);
             }
-            moves.push(EntityMove {
-                id: request.id,
-                previous_bits: request.previous_bits,
-                position_bits: position.translated(delta).to_bits(),
-            });
+            record_move(
+                &mut moves,
+                EntityMove {
+                    id: request.id,
+                    previous_bits: request.previous_bits,
+                    position_bits: position.translated(delta).to_bits(),
+                },
+            );
             continue;
         };
         if declared.is_none() && half.iter().any(|v| *v < torse_world_services::MAX_SUBSTEP) {
@@ -247,11 +271,14 @@ pub(crate) fn prepare_movements(
             if collides(&view, &target_aabb) || *view.unknown.borrow() {
                 return Err(RejectCode::Conflict);
             }
-            moves.push(EntityMove {
-                id: request.id,
-                previous_bits: request.previous_bits,
-                position_bits: target.to_bits(),
-            });
+            record_move(
+                &mut moves,
+                EntityMove {
+                    id: request.id,
+                    previous_bits: request.previous_bits,
+                    position_bits: target.to_bits(),
+                },
+            );
             continue;
         }
         let result = if declared.is_some() {
@@ -267,11 +294,14 @@ pub(crate) fn prepare_movements(
             return Err(RejectCode::Conflict);
         }
         let center = result_aabb.center();
-        moves.push(EntityMove {
-            id: request.id,
-            previous_bits: request.previous_bits,
-            position_bits: Position::new(center[0], center[1], center[2]).to_bits(),
-        });
+        record_move(
+            &mut moves,
+            EntityMove {
+                id: request.id,
+                previous_bits: request.previous_bits,
+                position_bits: Position::new(center[0], center[1], center[2]).to_bits(),
+            },
+        );
     }
     Ok(ResolvedMovements {
         moves,
@@ -600,6 +630,14 @@ pub fn boxes(shape: &Shape) -> Vec<LocalBox> {
             max: bounds.max.map(f64::from),
         },
     }]
+}
+
+fn record_move(moves: &mut Vec<EntityMove>, next: EntityMove) {
+    if let Some(previous) = moves.last_mut().filter(|m| m.id == next.id) {
+        previous.position_bits = next.position_bits;
+    } else {
+        moves.push(next);
+    }
 }
 
 #[cfg(test)]

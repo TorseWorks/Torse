@@ -48,7 +48,7 @@ pub struct Movement {
     pub handle: EntityHandle,
     /// Persistent identity observed through that handle.
     pub id: EntityId,
-    /// Source position observed by the producing system.
+    /// Observed source for the first leg; requested preceding endpoint for later legs.
     pub previous_bits: [u64; 3],
     /// Requested translation, in world block units.
     pub delta_bits: [u64; 3],
@@ -124,7 +124,7 @@ pub struct Transaction {
     /// Final block shapes that must remain clear of ordinary entity occupancy.
     /// Each guard must match this transaction's final write at the same cell.
     pub clearance: Vec<Mutation>,
-    /// Translations resolved against authoritative collision before publication.
+    /// Ordered translations. Consecutive entries for one entity form one bounded path.
     pub movements: Vec<Movement>,
     /// Schema-validated protected fields; only the schema owner may write them.
     pub components: Vec<ComponentEdit>,
@@ -198,14 +198,22 @@ impl TransactionGroup {
                 }
                 touched_entities.insert(edit.id);
             }
-            for movement in &member.movements {
+            validate_movement_paths(
+                member
+                    .movements
+                    .iter()
+                    .map(|m| (m.id, m.previous_bits, m.delta_bits, m.half_bits)),
+            )?;
+            let member_moved: std::collections::BTreeSet<_> =
+                member.movements.iter().map(|m| m.id).collect();
+            for id in member_moved {
                 // One entity may be moved by one member only: the merged
                 // change set forbids duplicate identities, and a duplicate
                 // would otherwise surface as an invariant stop at publish.
-                if !moved_entities.insert(movement.id) {
+                if !moved_entities.insert(id) {
                     return Err(RejectCode::Conflict);
                 }
-                touched_entities.insert(movement.id);
+                touched_entities.insert(id);
             }
             for relocation in &member.relocations {
                 if !moved_entities.insert(relocation.id) {
@@ -321,6 +329,45 @@ impl Transaction {
         self
     }
 
+    /// Request an ordered path against one observed entity and body. Every waypoint
+    /// is collision checked; partial intermediate legs cannot skip to the next leg.
+    /// A rejected path leaves this transaction unchanged.
+    pub fn move_entity_path(
+        &mut self,
+        handle: EntityHandle,
+        id: EntityId,
+        previous: Position,
+        deltas: &[[f64; 3]],
+        half: [f64; 3],
+    ) -> Result<&mut Self, RejectCode> {
+        if deltas.is_empty() || deltas.len() > MAX_MOVEMENT_SEGMENTS {
+            return Err(RejectCode::InvalidData);
+        }
+        let mut position = previous;
+        let path: Vec<_> = deltas
+            .iter()
+            .map(|delta| {
+                let request = Movement {
+                    handle,
+                    id,
+                    previous_bits: position.to_bits(),
+                    delta_bits: delta.map(f64::to_bits),
+                    half_bits: half.map(f64::to_bits),
+                };
+                position = position.translated(*delta);
+                request
+            })
+            .collect();
+        validate_movement_paths(
+            self.movements
+                .iter()
+                .chain(&path)
+                .map(|m| (m.id, m.previous_bits, m.delta_bits, m.half_bits)),
+        )?;
+        self.movements.extend(path);
+        Ok(self)
+    }
+
     /// Request an exact relocation. The destination is not a movement delta.
     pub fn relocate_entity(
         &mut self,
@@ -347,6 +394,55 @@ impl Transaction {
         });
         transactions
     }
+}
+
+/// Maximum ordered legs for one entity in one atomic transaction.
+pub const MAX_MOVEMENT_SEGMENTS: usize = 4;
+
+pub(crate) fn validate_movement_paths(
+    requests: impl IntoIterator<Item = (EntityId, [u64; 3], [u64; 3], [u64; 3])>,
+) -> Result<(), RejectCode> {
+    let requests = requests.into_iter();
+    if requests.size_hint().0 > crate::movement::MAX_TRANSACTION_MOVEMENTS {
+        return Err(RejectCode::QuotaExceeded);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut current = None;
+    let mut endpoint = [0; 3];
+    let mut body = [0; 3];
+    let mut legs = 0;
+    let mut count = 0;
+    let mut travel = [0.0; 3];
+    for (id, previous, delta, half) in requests {
+        count += 1;
+        if count > crate::movement::MAX_TRANSACTION_MOVEMENTS {
+            return Err(RejectCode::QuotaExceeded);
+        }
+        if current != Some(id) {
+            if !seen.insert(id) {
+                return Err(RejectCode::InvalidData);
+            }
+            current = Some(id);
+            body = half;
+            legs = 0;
+            travel = [0.0; 3];
+        } else if previous != endpoint || half != body {
+            return Err(RejectCode::InvalidData);
+        }
+        legs += 1;
+        if legs > MAX_MOVEMENT_SEGMENTS {
+            return Err(RejectCode::QuotaExceeded);
+        }
+        let delta = delta.map(f64::from_bits);
+        for axis in 0..3 {
+            travel[axis] += delta[axis].abs();
+            if !travel[axis].is_finite() || travel[axis] > crate::movement::MAX_MOVEMENT_DELTA {
+                return Err(RejectCode::InvalidData);
+            }
+        }
+        endpoint = Position::from_bits(previous).translated(delta).to_bits();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
