@@ -367,6 +367,7 @@ mod tests {
             .unwrap();
         let pos = SectionPos::new(1, 0, 0);
         let changes = ReplicaChanges {
+            presentation: Vec::new(),
             states: Vec::new(),
             sections: vec![SnapshotSection {
                 pos,

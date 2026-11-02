@@ -28,6 +28,7 @@ pub mod phase;
 mod placement;
 pub mod player;
 mod presentation;
+mod presentation_events;
 mod relocation;
 pub mod replica;
 pub mod simulation;

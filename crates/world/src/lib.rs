@@ -28,6 +28,7 @@ mod lifecycle;
 mod palette;
 mod persistence;
 mod player_motion;
+mod presentation;
 mod registry;
 mod section;
 mod snapshot_budget;
@@ -64,6 +65,11 @@ pub use lifecycle::{
 };
 pub use palette::{MAX_PALETTE_STATES, PaletteCells};
 pub use player_motion::{PlayerMotion, player_motion_schema};
+pub use presentation::{
+    MAX_PRESENTATION_BYTES, MAX_PRESENTATION_COMMIT_BYTES, MAX_PRESENTATION_PER_COMMIT,
+    MAX_PRESENTATION_PER_PRODUCER, PresentationDraft, PresentationEvent, PresentationId,
+    PresentationSchema, PresentationVisibility, presentation_budget, presentation_size,
+};
 pub use registry::{BlockStateId, BlockStateRegistry, EMPTY_BLOCK_KEY, RegistryError};
 pub use section::{
     DEFAULT_SECTION_SIDE, DenseCells, MAX_SECTION_SIDE, Section, SectionError, SectionStorage,

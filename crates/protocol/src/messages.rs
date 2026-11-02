@@ -1,6 +1,6 @@
 use torse_codec::{Decoder, EncodeResult, Encoder, wire::Wire};
 use torse_types::*;
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 /// Negotiated separately from [`PROTOCOL_VERSION`] and from world payloads.
 pub const CONTROL_API_VERSION: u16 = 1;
 /// Movement sequencing is independent of ordinary action requests.

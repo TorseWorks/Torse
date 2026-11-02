@@ -74,7 +74,8 @@ fn candidate(task: &FrozenTask, config: PrevalidationConfig) -> Option<BTreeSet<
     let group = task.transaction.as_ref()?;
     if group.members.is_empty()
         || group.members.iter().any(|m| {
-            !m.reads.is_empty()
+            !m.presentation.is_empty()
+                || !m.reads.is_empty()
                 || !m.writes.is_empty()
                 || !m.moves.is_empty()
                 || !m.spawns.is_empty()
@@ -105,6 +106,7 @@ fn movement_candidate(task: &FrozenTask, config: PrevalidationConfig) -> Option<
     }
     let m = &group.members[0];
     if m.moves.len() != 1
+        || !m.presentation.is_empty()
         || !m.reads.is_empty()
         || !m.writes.is_empty()
         || !m.components.is_empty()

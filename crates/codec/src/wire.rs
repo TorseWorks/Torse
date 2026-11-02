@@ -580,6 +580,11 @@ fn write_legacy_transaction(t: &StoredTransaction, e: &mut Encoder<'_>) -> Encod
 }
 impl Wire for StoredTransaction {
     fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        if !self.presentation.is_empty() {
+            return Err(invalid(
+                "presentation drafts require frozen transaction tag 5",
+            ));
+        }
         if !self.clearance.is_empty() {
             return Err(invalid(
                 "placement conditions require frozen transaction tag 3",
@@ -600,6 +605,7 @@ impl Wire for StoredTransaction {
             local: Wire::read(d)?,
             reads: Wire::read(d)?,
             writes: Wire::read(d)?,
+            presentation: Vec::new(),
             clearance: Vec::new(),
             moves: Wire::read(d)?,
             relocations: Vec::new(),
@@ -616,7 +622,17 @@ impl Wire for FrozenTask {
             None => 0u8.write(e)?,
             Some(group) => {
                 group.validate()?;
-                if group
+                if group.members.iter().any(|m| !m.presentation.is_empty()) {
+                    5u8.write(e)?;
+                    group.id.write(e)?;
+                    write_items(e, group.members.len(), "frozen group")?;
+                    for member in &group.members {
+                        write_legacy_transaction(member, e)?;
+                        member.clearance.write(e)?;
+                        member.relocations.write(e)?;
+                        member.presentation.write(e)?;
+                    }
+                } else if group
                     .members
                     .iter()
                     .any(|member| !member.relocations.is_empty())
@@ -666,7 +682,7 @@ impl Wire for FrozenTask {
                     members: vec![member],
                 })
             }
-            2..=4 => {
+            2..=5 => {
                 let id = TransactionId::read(d)?;
                 // Check the group bound before allocating its member vector.
                 let n = read_items(d, 1, "frozen group")?;
@@ -678,7 +694,7 @@ impl Wire for FrozenTask {
                 let mut remaining_checks = torse_sim::transaction::MAX_CLEARANCE_CHECKS;
                 for _ in 0..n {
                     let mut member = StoredTransaction::read(d)?;
-                    if tag == 3 || tag == 4 {
+                    if tag >= 3 {
                         let checks = read_items(d, 1, "placement conditions")?;
                         remaining_checks = remaining_checks
                             .checked_sub(checks)
@@ -689,7 +705,7 @@ impl Wire for FrozenTask {
                             member.clearance.push(StableCell::read(d)?);
                         }
                     }
-                    if tag == 4 {
+                    if tag >= 4 {
                         let count = read_items(d, 1, "relocations")?;
                         if count > 1 {
                             return Err(invalid("too many relocations"));
@@ -698,6 +714,16 @@ impl Wire for FrozenTask {
                         member.relocations = Vec::with_capacity(count);
                         for _ in 0..count {
                             member.relocations.push(StableRelocation::read(d)?);
+                        }
+                    }
+                    if tag == 5 {
+                        let count = read_items(d, 1, "presentation drafts")?;
+                        if count > MAX_PRESENTATION_PER_PRODUCER {
+                            return Err(invalid("presentation producer count"));
+                        }
+                        charge_vec::<PresentationDraft>(d, count)?;
+                        for _ in 0..count {
+                            member.presentation.push(PresentationDraft::read(d)?);
                         }
                     }
                     members.push(member);
@@ -814,13 +840,70 @@ fields!(ReplicaSnapshot {
     sections,
     entities
 });
-fields!(ReplicaChanges {
-    states,
-    sections,
-    removed_sections,
-    entities,
-    removed_entities
+impl Wire for PresentationDraft {
+    fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        presentation_size(self)?;
+        self.kind.write(e)?;
+        self.version.write(e)?;
+        self.section.write(e)?;
+        self.recipient.write(e)?;
+        self.fields.write(e)
+    }
+    fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
+        let draft = Self {
+            kind: Wire::read(d)?,
+            version: Wire::read(d)?,
+            section: Wire::read(d)?,
+            recipient: Wire::read(d)?,
+            fields: Wire::read(d)?,
+        };
+        presentation_size(&draft)?;
+        Ok(draft)
+    }
+}
+fields!(PresentationId {
+    epoch,
+    cursor,
+    index
 });
+fields!(PresentationEvent { id, draft });
+impl Wire for ReplicaChanges {
+    fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        presentation_budget(
+            self.presentation.iter().map(|e| &e.draft),
+            MAX_PRESENTATION_PER_COMMIT,
+        )?;
+        self.presentation.write(e)?;
+        self.states.write(e)?;
+        self.sections.write(e)?;
+        self.removed_sections.write(e)?;
+        self.entities.write(e)?;
+        self.removed_entities.write(e)
+    }
+    fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
+        let count = read_items(d, 1, "presentation events")?;
+        if count > MAX_PRESENTATION_PER_COMMIT {
+            return Err(invalid("presentation event count"));
+        }
+        charge_vec::<PresentationEvent>(d, count)?;
+        let mut presentation = Vec::with_capacity(count);
+        for _ in 0..count {
+            presentation.push(PresentationEvent::read(d)?);
+        }
+        presentation_budget(
+            presentation.iter().map(|e| &e.draft),
+            MAX_PRESENTATION_PER_COMMIT,
+        )?;
+        Ok(Self {
+            presentation,
+            states: Wire::read(d)?,
+            sections: Wire::read(d)?,
+            removed_sections: Wire::read(d)?,
+            entities: Wire::read(d)?,
+            removed_entities: Wire::read(d)?,
+        })
+    }
+}
 
 pub struct ExecutionCodec<M> {
     pub limits: CodecLimits,

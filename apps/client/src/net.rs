@@ -273,12 +273,12 @@ impl<T: Transport> Connection<T> {
             }
             ServerMessage::Batch(batch) => {
                 let seq = batch.seq;
-                let changes = batch.changes.clone();
+                let mut changes = batch.changes.clone();
                 let mirror = self
                     .mirror
                     .as_mut()
                     .ok_or_else(|| Fault::invalid_data("batch before baseline"))?;
-                mirror.apply(batch)?;
+                changes.presentation = mirror.apply_with_presentation(batch)?;
                 let _ = seq;
                 Ok(Some(NetEvent::Increment(changes)))
             }

@@ -53,6 +53,7 @@ pub struct ReplicaSnapshot {
 /// Replace entities wholesale so removed components/fields cannot linger.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaChanges {
+    pub presentation: Vec<torse_world::PresentationEvent>,
     pub states: Vec<StateEntry>,
     pub sections: Vec<SnapshotSection>,
     pub removed_sections: Vec<SectionPos>,
@@ -267,7 +268,9 @@ impl ReplicaSource {
     /// Publish after B reserves the full authoritative record. Projection failure
     /// or slow consumers reset only their subscription, never reject a world commit.
     pub fn publish(&mut self, prepared: PreparedChange) -> Result<Publication, CommitFault> {
-        let visible_work = !prepared.edits().is_empty()
+        let presentation = prepared.presentation().to_vec();
+        let visible_work = !presentation.is_empty()
+            || !prepared.edits().is_empty()
             || !prepared.entity_moves().is_empty()
             || !prepared.component_edits().is_empty()
             || prepared.entity_lifecycle().is_some();
@@ -309,6 +312,17 @@ impl ReplicaSource {
                     sub,
                 )
             };
+            let result = result.and_then(|()| {
+                append_presentation(
+                    &self.world,
+                    self.binding,
+                    self.limits,
+                    SubscriptionId(id),
+                    publication.cursor,
+                    sub,
+                    &presentation,
+                )
+            });
             if result.is_err() {
                 reset(sub);
                 self.pending_invalidations.insert(id);
@@ -704,6 +718,7 @@ fn project(
 
 fn difference(previous: &ReplicaSnapshot, next: &ReplicaSnapshot) -> ReplicaChanges {
     ReplicaChanges {
+        presentation: Vec::new(),
         states: next.states.clone(),
         sections: next
             .sections
@@ -754,6 +769,11 @@ fn batch_cost(batch: &WorldReplicaBatch) -> Result<Cost, Fault> {
     let mut cost = Cost::default();
     cost.entries::<WorldReplicaBatch>(1)?;
     cost.states(&batch.changes.states)?;
+    cost.entries::<torse_world::PresentationEvent>(batch.changes.presentation.len())?;
+    for event in &batch.changes.presentation {
+        cost.key(&event.draft.kind)?;
+        cost.fields(&event.draft.fields)?;
+    }
     cost.sections(&batch.changes.sections)?;
     cost.entries::<SectionPos>(batch.changes.removed_sections.len())?;
     cost.entries::<EntityId>(batch.changes.removed_entities.len())?;
@@ -761,6 +781,108 @@ fn batch_cost(batch: &WorldReplicaBatch) -> Result<Cost, Fault> {
         cost.entity(entity)?;
     }
     Ok(cost)
+}
+
+/// Extend the current commit's batch, or create an event-only batch. Authorization
+/// and the full queue charge are checked before copying any selected payload.
+fn append_presentation(
+    world: &WorldAuthority,
+    binding: Binding,
+    limits: ReplicaLimits,
+    id: SubscriptionId,
+    through: CommitCursor,
+    sub: &mut Subscription,
+    drafts: &[torse_world::PresentationDraft],
+) -> Result<(), Fault> {
+    use torse_world::{PresentationEvent, PresentationId, PresentationVisibility};
+    let selected: Vec<_> = drafts
+        .iter()
+        .enumerate()
+        .filter(|(_, draft)| {
+            sub.scope.sections.contains(&draft.section)
+                && readable(world, draft.section)
+                && world
+                    .schemas()
+                    .presentation(&draft.kind)
+                    .is_some_and(|schema| match &schema.visibility {
+                        PresentationVisibility::Public => draft.recipient.is_none(),
+                        PresentationVisibility::Authorized { permission } => {
+                            sub.actor.permits(permission)
+                                && draft.recipient.is_some_and(|entity| {
+                                    sub.actor.allows(ActionTarget::Entity(entity))
+                                })
+                        }
+                    })
+        })
+        .collect();
+    if selected.is_empty() {
+        return Ok(());
+    }
+    let same_commit = sub
+        .queue
+        .back()
+        .is_some_and(|(batch, _)| batch.through == through);
+    let mut extra = Cost::default();
+    extra.entries::<PresentationEvent>(selected.len())?;
+    for (_, draft) in &selected {
+        extra.key(&draft.kind)?;
+        extra.fields(&draft.fields)?;
+    }
+    if !same_commit {
+        extra.entries::<WorldReplicaBatch>(1)?;
+        extra.states(&sub.state.as_ref().expect("active subscription").states)?;
+        if sub.queue.len() >= limits.max_queued_batches || sub.next_seq == u64::MAX {
+            return Err(Fault::resource_limit(
+                "presentation replica queue exhausted",
+            ));
+        }
+    }
+    let total = sub.queued.add(extra)?;
+    if !total.fits(limits.queue) {
+        return Err(Fault::resource_limit("presentation replica budget"));
+    }
+    let events = selected
+        .into_iter()
+        .map(|(index, draft)| PresentationEvent {
+            id: PresentationId {
+                epoch: binding.epoch,
+                cursor: through,
+                index: index as u32,
+            },
+            draft: draft.clone(),
+        })
+        .collect();
+    if same_commit {
+        let (batch, cost) = sub.queue.back_mut().expect("same commit batch");
+        batch.changes.presentation = events;
+        *cost = cost.add(extra)?;
+    } else {
+        sub.queue.push_back((
+            WorldReplicaBatch {
+                binding,
+                subscription: id,
+                seq: ReplicaSeq(sub.next_seq),
+                through,
+                changes: ReplicaChanges {
+                    presentation: events,
+                    states: sub
+                        .state
+                        .as_ref()
+                        .expect("active subscription")
+                        .states
+                        .clone(),
+                    sections: Vec::new(),
+                    removed_sections: Vec::new(),
+                    entities: Vec::new(),
+                    removed_entities: Vec::new(),
+                },
+            },
+            extra,
+        ));
+        sub.next_seq += 1;
+    }
+    sub.queued = total;
+    Ok(())
 }
 
 fn full_projection(

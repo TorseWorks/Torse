@@ -174,6 +174,41 @@ impl ComponentSchemas {
             }
             compatibility.rules_digest = Digest(hash.finalize().into());
         }
+        if !self.presentation.is_empty() {
+            let mut hash = Sha256::new();
+            hash.update(b"torse/presentation-schema/v1\0");
+            hash.update(compatibility.rules_digest.0);
+            count(&mut hash, self.presentation.len());
+            for schema in self.presentation.values() {
+                key(&mut hash, &schema.id);
+                key(&mut hash, &schema.owner);
+                hash.update(schema.version.to_le_bytes());
+                match &schema.visibility {
+                    crate::PresentationVisibility::Public => hash.update([0]),
+                    crate::PresentationVisibility::Authorized { permission } => {
+                        hash.update([1]);
+                        key(&mut hash, permission);
+                    }
+                }
+                count(&mut hash, schema.fields.len());
+                for field in &schema.fields {
+                    key(&mut hash, &field.id);
+                    let (tag, bound) = match field.field_type {
+                        torse_content::ComponentFieldType::Bool => (0, 0),
+                        torse_content::ComponentFieldType::Unsigned32 => (1, 0),
+                        torse_content::ComponentFieldType::Signed64 => (2, 0),
+                        torse_content::ComponentFieldType::ContentReference => (3, 0),
+                        torse_content::ComponentFieldType::EntityReference => (4, 0),
+                        torse_content::ComponentFieldType::String { max_bytes } => (5, max_bytes),
+                        torse_content::ComponentFieldType::List { max_items } => (6, max_items),
+                        torse_content::ComponentFieldType::Record => (7, 0),
+                    };
+                    hash.update([tag, u8::from(field.required)]);
+                    hash.update(bound.to_le_bytes());
+                }
+            }
+            compatibility.rules_digest = Digest(hash.finalize().into());
+        }
         self.compatibility = Some(compatibility);
         Ok((self, compatibility))
     }
@@ -188,7 +223,8 @@ impl ComponentSchemas {
             Some(expected) if expected == compatibility => Ok(()),
             None if self.persistence.is_empty()
                 && self.block_defaults.is_empty()
-                && self.validators.is_empty() =>
+                && self.validators.is_empty()
+                && self.presentation.is_empty() =>
             {
                 Ok(())
             }

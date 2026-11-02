@@ -2313,6 +2313,7 @@ mod tests {
             }
         }
         let changes = ReplicaChanges {
+            presentation: Vec::new(),
             states: vec![StateEntry {
                 id: BlockStateId(7),
                 block: key("base:stone"),

@@ -60,6 +60,7 @@ pub trait ComponentValidator: std::fmt::Debug + Send + Sync {
 /// which is what lets storage trust a schema identity without re-validating it.
 #[derive(Clone, Debug, Default)]
 pub struct ComponentSchemas {
+    pub(crate) presentation: BTreeMap<ContentKey, crate::PresentationSchema>,
     pub(crate) validators: BTreeMap<ContentKey, Arc<dyn ComponentValidator>>,
     pub(crate) schemas: BTreeMap<ContentKey, ComponentSchema>,
     pub(crate) persistence: BTreeMap<ContentKey, bool>,
@@ -85,6 +86,7 @@ impl ComponentSchemas {
         let motion = crate::player_motion::schema();
         schemas.insert(motion.id.clone(), motion);
         Self {
+            presentation: BTreeMap::new(),
             validators: BTreeMap::new(),
             schemas,
             persistence: BTreeMap::new(),
@@ -405,7 +407,7 @@ pub fn component_memory_bytes(fields: &ComponentFields) -> u64 {
     )
 }
 
-fn validate_value(
+pub(crate) fn validate_value(
     field: &ContentKey,
     field_type: ComponentFieldType,
     value: &ComponentValue,

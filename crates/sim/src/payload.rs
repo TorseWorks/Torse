@@ -27,6 +27,8 @@ pub fn persistent_changes_from_prepared(
 ///
 /// The caller owns the resulting payload independently of the preparation. A
 /// rejected reservation can drop both values without changing world state.
+/// Transient presentation drafts stay on the preparation for live replication;
+/// world replay deliberately does not retain or redeliver committed effects.
 pub fn changes_from_prepared(
     registry: &BlockStateRegistry,
     prepared: &PreparedChange,
