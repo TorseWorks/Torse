@@ -577,6 +577,7 @@ fn execution_archive_keeps_pending_work_and_refuses_implicit_event_or_rule_migra
     );
     source.runtime.events.clear();
     source.runtime.work = Some(PhaseWork {
+        event_batch: false,
         tasks: vec![FrozenTask {
             transaction: None,
             request: None,

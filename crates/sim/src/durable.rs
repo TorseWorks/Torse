@@ -250,6 +250,8 @@ impl StoredTransactionGroup {
 pub struct PhaseWork {
     pub tasks: Arc<Vec<FrozenTask>>,
     pub next: u32,
+    /// Ordinary output has already been frozen and settled for this phase.
+    pub event_batch: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeState {
@@ -295,7 +297,7 @@ pub struct ExecutionChanges {
     pub section: Option<SectionChange>,
 }
 
-/// Full state freezes/finishes a phase. Progress reuses its immutable rule and
+/// Full state freezes a batch or finishes a phase. Progress reuses its immutable rule and
 /// task tables; replay must resolve it against the immediately preceding state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeUpdate {
@@ -333,6 +335,7 @@ impl RuntimeUpdate {
                     work: Some(PhaseWork {
                         tasks: Arc::clone(&work.tasks),
                         next: progress.next,
+                        event_batch: work.event_batch,
                     }),
                 })
             }

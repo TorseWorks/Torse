@@ -24,7 +24,7 @@ ContentKey、ComponentValue与嵌套组件字段沿用WORLD.md。位置和位移
 | StoredTransactionGroup | id:TransactionId、members:`Vec<StoredTransaction>`，来源严格升序、数量1到4、排序键一致 |
 | Accepted | id:RequestId、input:Call |
 | FrozenTask | transaction:任务标签、request:Option、consume:`Option<EventId>`、schedule、cancel、status、output |
-| PhaseWork | tasks、next:u32 |
+| PhaseWork | tasks、cursor:u32（最高位为event_batch，低31位为next） |
 | SystemSpec | id、phase:u16、rule_priority:i32、before、after |
 | RuntimeState | rules、next_event:u128、events、windows、work:`Option<PhaseWork>` |
 | ExecutionSnapshot v1 | world:世界布局3的快照正文、runtime |
@@ -50,6 +50,10 @@ WorldSnapshot包裹先写SnapshotMeta，再写ExecutionSnapshot；CommitRecord�
 ## 运行态进度记录
 
 冻结、阶段结束与关闭拒绝使用Full；逐任务结算默认使用Progress。后者复用紧邻前态中的规则声明和完整冻结任务列表，只保存有界事件、请求窗口的终态替换及任务位置。恢复要求已有冻结工作、next恰好增加1、阶段不变、有outcome且无cancelled，再按原结算规则重新计算终态并校验世界变更。缺少冻结列表、跳项、重复进度、伪造事件或结果均拒绝。读取版本1时把完整运行态提升为Full，允许同一追加日志混合两个版本。
+
+到期事件分批使用PhaseWork.cursor的最高位作为event_batch标记，低31位仍为任务位置，任务容量与next必须小于2的31次方。普通批次的字节与旧布局完全一致；旧冻结批次读取为event_batch=false，继续执行已有任务。新事件批次仍使用Full冻结，逐项Progress继承前态标记，不另存或改写任务表。世界载荷、快照与提交外层版本均不改变。旧宿主将标记后的cursor解释为超范围next，在领域恢复时明确拒绝，不能忽略标记继续执行；本补充不提供降级迁移。
+
+Simulation中普通工作耗尽后，可用空世界变更在同一恢复位置冻结下一事件批次。新批次非空、next=0，consume必须逐项匹配前态到期队列的规范前缀，不允许跳项、换序、捏造身份或夹带请求。未耗尽的表不能替换，逐项结算不能改变标记；尚有到期事件时不能直接推进阶段。普通规则不因批次切换重跑。取消已冻结事件后保留其任务并要求Conflict空结算，拒绝伪造提交效果。重放检查不调用任何回调。
 
 当前快照写版本2，外层日志包裹保持版本1。新读取器可以重开旧快照和提交文件，继续追加提交版本3；旧程序不能读取新版本。
 
