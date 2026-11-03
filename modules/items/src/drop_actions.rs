@@ -59,9 +59,8 @@ pub(crate) fn descriptors() -> Vec<ActionDescriptor> {
 pub(crate) fn declarations() -> Vec<ComponentSchema> {
     let mut result = vec![drops::declaration()];
     for name in NAMES {
-        let mut fields = vec![];
+        let mut fields = vec![("inventory", ComponentFieldType::EntityReference, true)];
         if name != "spawn_harvest" {
-            fields.push(("inventory", ComponentFieldType::EntityReference, true));
             fields.push((
                 if name.starts_with("pickup") {
                     "drop"
@@ -216,6 +215,7 @@ impl ActionHandler for Handler {
                 .ok_or(RejectCode::MissingTarget)?
                 .clone();
             let mut tx = Transaction::new(request.transaction, owner(), request.ordering);
+            crate::supply::observe(view, entity(&request.parameters, "inventory")?, &mut tx)?;
             tx.read_block(pos, state);
             drops::spawn(
                 &mut tx,
@@ -241,14 +241,16 @@ impl ActionHandler for Handler {
                 }
                 "pickup_drop" => {
                     parent(view, "pickup")?;
-                    return mutation(drops::take(
+                    let mut tx = drops::take(
                         view,
                         &self.catalog,
                         drop,
                         inventory,
                         request.transaction,
                         request.ordering,
-                    )?);
+                    )?;
+                    crate::supply::observe(view, inventory, &mut tx)?;
+                    return mutation(tx);
                 }
                 _ => {}
             }
@@ -334,15 +336,7 @@ impl ActionHandler for Handler {
             let at = position(view, inventory, &request.parameters)?;
             let mut tx = Transaction::new(request.transaction, owner(), request.ordering);
             drops::spawn(&mut tx, at, stack, [0, 1_500_000, 0]);
-            if infinite {
-                let fields = view.component(inventory, &crate::supply::schema())?.clone();
-                tx.components.push(torse_world::ComponentEdit {
-                    id: inventory,
-                    schema: crate::supply::schema(),
-                    previous: Some(fields.clone()),
-                    fields: Some(fields),
-                });
-            }
+            crate::supply::observe(view, inventory, &mut tx)?;
             return mutation(tx);
         }
         if infinite {

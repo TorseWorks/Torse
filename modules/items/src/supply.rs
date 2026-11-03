@@ -49,6 +49,33 @@ pub fn with_item(mut call: Call, item: ContentKey) -> Call {
         .insert(key("items:field/supply_item"), Value::Content(item));
     call
 }
+
+/// Freeze the observed policy in the item-owned transaction member. Missing
+/// policy becomes explicit finite state only when the whole interaction commits.
+pub(crate) fn observe(
+    view: &ActionView<'_>,
+    inventory: EntityId,
+    tx: &mut Transaction,
+) -> Result<(), RejectCode> {
+    view.component(inventory, &torse_inventory::schema())?;
+    let previous = view
+        .entity(inventory)?
+        .1
+        .components
+        .component(&schema())
+        .cloned();
+    tx.components.push(ComponentEdit {
+        id: inventory,
+        schema: schema(),
+        fields: Some(
+            previous
+                .clone()
+                .unwrap_or_else(|| [(field(), Value::Bool(false))].into()),
+        ),
+        previous,
+    });
+    Ok(())
+}
 pub(crate) fn declarations() -> Vec<ComponentSchema> {
     ["supply", "supply_guard"]
         .into_iter()
@@ -91,7 +118,7 @@ pub(crate) fn descriptors() -> Vec<ActionDescriptor> {
                 permission: Some(key(if name == "supply" {
                     "items:permission/configure_supply"
                 } else {
-                    "items:permission/unlimited"
+                    "items:permission/use"
                 })),
             },
             target_constraints: vec![],
@@ -140,11 +167,17 @@ impl ActionHandler for Handler {
             if !["place", "harvest", "throw"]
                 .into_iter()
                 .any(|name| view.caller_action() == Some(&key(&format!("items:action/{name}"))))
-                || mode(entity) != SupplyMode::Infinite
             {
                 return Err(RejectCode::PermissionDenied);
             }
-            previous.clone().ok_or(RejectCode::InvalidData)?
+            if mode(entity) == SupplyMode::Infinite
+                && !view.actor().permits(&key("items:permission/unlimited"))
+            {
+                return Err(RejectCode::PermissionDenied);
+            }
+            let mut tx = Transaction::new(request.transaction, owner(), request.ordering);
+            observe(view, id, &mut tx)?;
+            return Ok(ActionOutput::Mutation(Box::new(tx)));
         } else {
             let Some(Value::Bool(infinite)) = request.parameters.get(&field()) else {
                 return Err(RejectCode::InvalidData);

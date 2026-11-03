@@ -604,6 +604,160 @@ fn supply_requires_host_permission_and_stale_unlimited_edits_are_rejected() {
         catalog.starter(36).unwrap()
     );
 }
+
+#[test]
+fn finite_item_plans_cannot_commit_after_supply_mode_changes() {
+    use torse_items::supply::{SupplyMode, call};
+    for physical in [false, true] {
+        for explicit in [false, true] {
+            for operation in ["place", "harvest", "throw", "pickup"] {
+                let (mut world, service, catalog, id) = setup_policy(physical);
+                let manager = actor(id)
+                    .permission(key("items:permission/configure_supply"))
+                    .permission(key("items:permission/unlimited"));
+                let mut config = request(id, true, 0, 20);
+                let configure = call(id, SupplyMode::Finite);
+                config.action = configure.action;
+                config.target = configure.target;
+                config.parameters = configure.parameters;
+                if explicit {
+                    let ActionOutput::Mutation(tx) = service
+                        .plan(&world, &manager, Phase::Interaction, &config)
+                        .unwrap()
+                    else {
+                        panic!("mode mutation");
+                    };
+                    world.publish(world.prepare(&tx).unwrap()).unwrap();
+                }
+                let mut req = request(id, operation == "place", 2, 21);
+                let mut player = actor(id);
+                if operation == "harvest" {
+                    let stone = world.registry().default_state(&key("base:stone")).unwrap();
+                    world
+                        .store_mut()
+                        .edit(BlockPos::new(8, 8, 8), stone)
+                        .unwrap();
+                } else if operation == "throw" {
+                    let throw = torse_items::throw_call(id, 2);
+                    req.action = throw.action;
+                    req.target = throw.target;
+                    req.parameters = throw.parameters;
+                } else if operation == "pickup" {
+                    let h = world
+                        .entities_mut()
+                        .spawn(Position::new(2., 2., 1.))
+                        .unwrap();
+                    let drop = world.entities().get(h).unwrap().id;
+                    let schemas = world.schemas().clone();
+                    world
+                        .entities_mut()
+                        .components_mut(h)
+                        .unwrap()
+                        .insert(
+                            &schemas,
+                            &torse_items::drops::schema(),
+                            torse_items::drops::DropState {
+                                stack: ItemStack {
+                                    item: key("base:stone"),
+                                    count: 1,
+                                    data: Default::default(),
+                                },
+                                velocity: [0; 3],
+                            }
+                            .fields(),
+                        )
+                        .unwrap();
+                    // Make room in a finite stack before planning the pickup.
+                    let mut stock = catalog.starter(36).unwrap();
+                    stock.set(2, None, catalog.stack_rules()).unwrap();
+                    let inventory_handle = world.entities().handle_of(id).unwrap();
+                    world
+                        .entities_mut()
+                        .components_mut(inventory_handle)
+                        .unwrap()
+                        .insert(&schemas, &torse_inventory::schema(), stock.fields())
+                        .unwrap();
+                    let pickup = torse_items::pickup_call(id, drop);
+                    req.action = pickup.action;
+                    req.target = pickup.target;
+                    req.parameters = pickup.parameters;
+                    player = player.target(ActionTarget::Entity(drop));
+                }
+                let ActionOutput::Atomic(group) = service
+                    .plan(&world, &player, Phase::Interaction, &req)
+                    .unwrap()
+                else {
+                    panic!("atomic item interaction");
+                };
+                let prepared = world.prepare_group(&group).unwrap();
+                // Planning must leave the original optional mode untouched.
+                let entity = world
+                    .entities()
+                    .get(world.entities().handle_of(id).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    entity
+                        .components
+                        .component(&torse_items::supply::schema())
+                        .is_some(),
+                    explicit
+                );
+                config.transaction = TransactionId(22);
+                config.parameters = call(id, SupplyMode::Infinite).parameters;
+                let ActionOutput::Mutation(tx) = service
+                    .plan(&world, &manager, Phase::Interaction, &config)
+                    .unwrap()
+                else {
+                    panic!("mode mutation");
+                };
+                world.publish(world.prepare(&tx).unwrap()).unwrap();
+                let stock = inventory(&world, &catalog, id);
+                let seq = world.seq();
+                let entities: Vec<_> = world
+                    .entities()
+                    .iter()
+                    .map(|(_, e)| EntityState::capture(e))
+                    .collect();
+                let terrain = world.store().query(BlockPos::new(8, 8, 8));
+                assert!(
+                    world.prepare_group(&group).is_err(),
+                    "stale {operation}, physical={physical}, explicit={explicit}"
+                );
+                assert!(world.publish(prepared).is_err());
+                assert_eq!(world.seq(), seq);
+                assert_eq!(inventory(&world, &catalog, id), stock);
+                assert_eq!(world.store().query(BlockPos::new(8, 8, 8)), terrain);
+                assert_eq!(
+                    world
+                        .entities()
+                        .iter()
+                        .map(|(_, e)| EntityState::capture(e))
+                        .collect::<Vec<_>>(),
+                    entities
+                );
+                // Switching back permits a fresh action without unlimited authority.
+                config.transaction = TransactionId(23);
+                config.parameters = call(id, SupplyMode::Finite).parameters;
+                let ActionOutput::Mutation(tx) = service
+                    .plan(&world, &manager, Phase::Interaction, &config)
+                    .unwrap()
+                else {
+                    panic!("mode mutation");
+                };
+                world.publish(world.prepare(&tx).unwrap()).unwrap();
+                req.transaction = TransactionId(24);
+                let ActionOutput::Atomic(fresh) = service
+                    .plan(&world, &player, Phase::Interaction, &req)
+                    .unwrap()
+                else {
+                    panic!("fresh item interaction");
+                };
+                world.publish(world.prepare_group(&fresh).unwrap()).unwrap();
+            }
+        }
+    }
+}
+
 fn commit(world: &mut WorldAuthority, service: &ActionService, id: EntityId, req: &ActionRequest) {
     let ActionOutput::Atomic(group) = service
         .plan(world, &actor(id), Phase::Interaction, req)
@@ -736,6 +890,13 @@ fn direct_settlement_raw_edits_and_ungranted_inventory_are_rejected() {
     let (world, service, _, id) = setup();
     let mut req = request(id, false, 0, 1);
     req.action = key("items:action/settle");
+    assert_eq!(
+        service.plan(&world, &actor(id), Phase::Interaction, &req),
+        Err(RejectCode::PermissionDenied)
+    );
+    req.action = key("items:action/supply_guard");
+    req.target = ActionTarget::Entity(id);
+    req.parameters.clear();
     assert_eq!(
         service.plan(&world, &actor(id), Phase::Interaction, &req),
         Err(RejectCode::PermissionDenied)

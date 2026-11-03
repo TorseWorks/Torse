@@ -262,7 +262,11 @@ impl ActionHandler for Handler {
                     action: key("items:action/spawn_harvest"),
                     api_version: 1,
                     target: request.target,
-                    parameters: ComponentFields::new(),
+                    parameters: [(
+                        key("items:field/inventory"),
+                        ComponentValue::Entity(*target),
+                    )]
+                    .into(),
                 },
             ]));
         }
@@ -378,6 +382,12 @@ impl ActionHandler for Handler {
                 api_version: 1,
                 target: request.target,
                 parameters: request.parameters.clone(),
+            },
+            ActionInvocation {
+                action: key("items:action/supply_guard"),
+                api_version: 1,
+                target: ActionTarget::Entity(*target),
+                parameters: ComponentFields::new(),
             },
         ]))
     }
