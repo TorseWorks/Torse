@@ -421,11 +421,9 @@ impl View<'_> {
                     TerrainQuery::Ready(state) => scene
                         .authority
                         .registry()
-                        .definition(state)
-                        .map_or(15, |definition| {
-                            (definition.light_transport.absorption * 15.0)
-                                .ceil()
-                                .clamp(0.0, 15.0) as u8
+                        .light_transport(state)
+                        .map_or(15, |light| {
+                            (light.absorption * 15.0).ceil().clamp(0.0, 15.0) as u8
                         }),
                     _ => 15,
                 };
@@ -647,8 +645,10 @@ impl Scene {
 mod tests {
     use super::*;
     fn scene() -> Scene {
+        scene_from_pack(content_pack())
+    }
+    pub(super) fn scene_from_pack(mut pack: torse_content::ContentPack) -> Scene {
         let mut scene = Scene::new(0).unwrap();
-        let mut pack = content_pack();
         for block in &mut pack.blocks {
             if block.value.id == key("base:stone") {
                 block.value.light_transport.absorption = 1.0;
