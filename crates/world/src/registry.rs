@@ -19,7 +19,8 @@
 use std::collections::BTreeMap;
 
 use torse_content::{
-    BlockDefinition, CompiledContent, FiniteField, MAX_FINITE_STATES, Shape, StateProfile,
+    BlockDefinition, CompiledContent, FiniteField, LightTransport, MAX_FINITE_STATES, Shape,
+    StateProfile,
 };
 use torse_types::ContentKey;
 
@@ -59,6 +60,8 @@ struct BlockEntry {
     fields: Vec<ContentKey>,
     /// Per-state field values, `state_count * fields.len()` entries.
     values: Vec<u16>,
+    /// Effective optics in state order, resolved once during registration.
+    light_transport: Vec<LightTransport>,
     /// State identifier used for newly placed blocks.
     default_state: u16,
 }
@@ -182,12 +185,25 @@ impl BlockStateRegistry {
             registry
                 .slots
                 .extend(std::iter::repeat_n(index, usize::from(state_count)));
+            let light_transport = (0..usize::from(state_count))
+                .map(|row| {
+                    let start = row * fields.len();
+                    let state_values = &values[start..start + fields.len()];
+                    definition
+                        .state_overrides
+                        .iter()
+                        .find(|profile| profile.values == state_values)
+                        .and_then(|profile| profile.light_transport)
+                        .unwrap_or(definition.light_transport)
+                })
+                .collect();
             registry.entries.push(BlockEntry {
                 definition: definition.clone(),
                 first_state,
                 state_count,
                 fields,
                 values,
+                light_transport,
                 default_state,
             });
             registry.state_count += u32::from(state_count);
@@ -291,6 +307,15 @@ impl BlockStateRegistry {
         let width = entry.fields.len();
         let offset = usize::from(state.0 - entry.first_state) * width;
         entry.values.get(offset..offset + width)
+    }
+
+    /// Effective optics in constant time. Empty and unknown states return None.
+    pub fn light_transport(&self, state: BlockStateId) -> Option<LightTransport> {
+        let entry = self.entry_of(state)?;
+        entry
+            .light_transport
+            .get(usize::from(state.0 - entry.first_state))
+            .copied()
     }
 
     /// Conservative face coverage of a state.

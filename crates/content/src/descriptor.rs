@@ -539,6 +539,8 @@ pub struct StateProfile {
     /// Exact replacement of both support masks. `None` inherits the definition;
     /// `Some(FaceSupport::NONE)` explicitly denies every category on every face.
     pub face_support: Option<FaceSupport>,
+    /// Exact optical replacement. None inherits; zero explicitly disables emission.
+    pub light_transport: Option<LightTransport>,
 }
 
 /// Light absorption and emission values for the content definition.

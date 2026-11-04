@@ -636,6 +636,24 @@ fn validate_block(
         fields.sort_by(|left, right| left.id.cmp(&right.id));
         let mut seen = BTreeSet::new();
         for profile in &block.state_overrides {
+            if let Some(light) = profile.light_transport {
+                for (field, value) in [
+                    (
+                        "state_overrides.light_transport.absorption",
+                        light.absorption,
+                    ),
+                    ("state_overrides.light_transport.emission", light.emission),
+                ] {
+                    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                        diagnostics.push(diagnostic(
+                            source.clone(),
+                            block.id.clone(),
+                            field,
+                            "value must be finite and between 0 and 1",
+                        ));
+                    }
+                }
+            }
             if let Some(support) = profile.face_support
                 && let Err(message) = support.validate()
             {
@@ -1132,6 +1150,7 @@ fn authority_digest(
     }
     hash_state_profiles(&mut writer, blocks, false);
     hash_face_support(&mut writer, blocks);
+    hash_state_optics(&mut writer, blocks);
     writer.finish()
 }
 
@@ -1171,6 +1190,39 @@ fn hash_face_support(writer: &mut CanonicalWriter, blocks: &BTreeMap<ContentKey,
             }
             writer.u8(support.attachment);
             writer.u8(support.structural);
+        }
+    }
+}
+
+/// Optional authority extension; absent declarations preserve historical identities.
+fn hash_state_optics(writer: &mut CanonicalWriter, blocks: &BTreeMap<ContentKey, BlockDefinition>) {
+    let selected: Vec<_> = blocks
+        .values()
+        .filter_map(|block| {
+            let profiles: Vec<_> = block
+                .state_overrides
+                .iter()
+                .filter_map(|profile| profile.light_transport.map(|light| (profile, light)))
+                .collect();
+            (!profiles.is_empty()).then_some((block, profiles))
+        })
+        .collect();
+    if selected.is_empty() {
+        return;
+    }
+    writer.u8(0xf3);
+    writer.u32(1);
+    writer.u32(selected.len() as u32);
+    for (block, profiles) in selected {
+        writer.key(&block.id);
+        writer.u32(profiles.len() as u32);
+        for (profile, light) in profiles {
+            writer.u32(profile.values.len() as u32);
+            for value in &profile.values {
+                writer.u32(u32::from(*value));
+            }
+            writer.u32(light.absorption.to_bits());
+            writer.u32(light.emission.to_bits());
         }
     }
 }

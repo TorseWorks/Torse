@@ -572,6 +572,7 @@ fn support_masks_and_exact_override_states_are_validated() {
         selection_shape: None,
         occlusion: None,
         face_support: Some(FaceSupport::NONE),
+        light_transport: None,
     };
     slab.value.state_overrides.push(invalid.clone());
     invalid.values = slab.value.state_overrides[0].values.clone();

@@ -11,6 +11,9 @@ pub mod presets;
 #[cfg(test)]
 mod compiler_tests;
 
+#[cfg(test)]
+mod state_optics_tests;
+
 pub use builtin::m0_fixture_pack;
 pub use compiler::{
     CONTENT_FORMAT_VERSION, CompiledContent, ContentDiagnostic, ContentPack, MAX_FINITE_STATES,
