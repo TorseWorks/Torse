@@ -92,6 +92,77 @@ fn level(
 }
 const TARGET: SectionPos = SectionPos::new(0, 0, 0);
 
+#[test]
+fn state_optics_switch_off_and_reload_invalidate_native_light() {
+    use torse_content::LightTransport;
+    let mut pack = m0_fixture_pack();
+    let block = &mut pack
+        .blocks
+        .iter_mut()
+        .find(|b| !b.value.state_overrides.is_empty())
+        .unwrap()
+        .value;
+    let key = block.id.clone();
+    block.light_transport = LightTransport {
+        absorption: 0.0,
+        emission: 1.0,
+    };
+    let off_values = block.state_overrides[0].values.clone();
+    let on_values = block.state_overrides[1].values.clone();
+    block.state_overrides[0].light_transport = Some(LightTransport {
+        absorption: 0.0,
+        emission: 0.0,
+    });
+    let registry = BlockStateRegistry::build(&compile(pack).unwrap()).unwrap();
+    let off = registry.state_of(&key, &off_values).unwrap();
+    let on = registry.state_of(&key, &on_values).unwrap();
+    let mut store = store(BlockStateId::EMPTY);
+    let pos = BlockPos::new(8, 8, 8);
+    let mut cache = LightCache::new(binding(), 1, 1_000_000).unwrap();
+    store.edit(pos, on).unwrap();
+    cache
+        .publish(
+            calculate(&store, &registry, TARGET, 4096),
+            &store,
+            &registry,
+        )
+        .unwrap();
+    assert_eq!(level(&cache, &store, &registry, 8, 8, 8), 15);
+    assert_eq!(level(&cache, &store, &registry, 9, 8, 8), 14);
+    store.edit(pos, off).unwrap();
+    assert_eq!(
+        cache.sample(binding(), &store, &registry, pos),
+        LightQuery::Pending
+    );
+    cache
+        .publish(
+            calculate(&store, &registry, TARGET, 4096),
+            &store,
+            &registry,
+        )
+        .unwrap();
+    assert_eq!(level(&cache, &store, &registry, 9, 8, 8), 0);
+    store.unload(TARGET).unwrap();
+    assert_eq!(
+        cache.sample(binding(), &store, &registry, pos),
+        LightQuery::Pending
+    );
+    load(&mut store, TARGET, BlockStateId::EMPTY);
+    store.edit(pos, on).unwrap();
+    assert_eq!(
+        cache.sample(binding(), &store, &registry, pos),
+        LightQuery::Pending
+    );
+    cache
+        .publish(
+            calculate(&store, &registry, TARGET, 4096),
+            &store,
+            &registry,
+        )
+        .unwrap();
+    assert_eq!(level(&cache, &store, &registry, 9, 8, 8), 14);
+}
+
 fn sky(store: &SectionStore, registry: &BlockStateRegistry) -> LightSection {
     let mut job = LightJob::prepare_sky(binding(), store, registry, TARGET, limits()).unwrap();
     for _ in 0..1000 {

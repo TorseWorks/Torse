@@ -3,7 +3,7 @@
 //! Author files such as locale text stay outside the hot path. `cook` turns a
 //! compiled content pack, image identities, and locale maps into one table.
 //! Image bytes stay in the asset catalog; this table stores their guid.
-//! Authority rows cover occlusion and collision. Presentation rows cover
+//! Authority rows cover occlusion, support, optics and collision. Presentation rows cover
 //! material slots, image identities, and locale text. The two digests move
 //! independently.
 
@@ -13,10 +13,12 @@ use sha2::{Digest as ShaDigest, Sha256};
 use torse_types::{AssetGuid, ContentKey, Digest, valid_asset_path};
 
 use crate::compiler::{CompiledContent, MAX_FINITE_STATES};
-use crate::descriptor::{AlphaMode, BoxBounds, Face, FaceSupport, Shape, StateProfile};
+use crate::descriptor::{
+    AlphaMode, BoxBounds, Face, FaceSupport, LightTransport, Shape, StateProfile,
+};
 
-const MAGIC: &[u8; 8] = b"TCOOK003";
-const VERSION: u32 = 3;
+const MAGIC: &[u8; 8] = b"TCOOK004";
+const VERSION: u32 = 4;
 
 /// Limits checked before allocating tables or accepting a count from a file.
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +82,8 @@ pub struct CookedState {
     pub occlusion: u8,
     /// Effective independent support predicates for this state.
     pub face_support: FaceSupport,
+    /// Effective authority optics after state inheritance.
+    pub light_transport: LightTransport,
     /// Authoritative collision shape, if any.
     pub collision: Option<Shape>,
     /// Dense material slot for each face, in `-x, +x, -y, +y, -z, +z` order.
@@ -94,7 +98,7 @@ pub struct CookedTables {
     /// Full compiler compatibility identities, separate from table checksums.
     pub content_authority_digest: Digest,
     pub content_presentation_digest: Digest,
-    /// Digest of occlusion and collision rows.
+    /// Digest of authority state rows, including effective optics.
     pub authority_digest: Digest,
     /// Digest of material slots, image identities, and locale text.
     pub presentation_digest: Digest,
@@ -300,6 +304,9 @@ pub fn cook(
                 values,
                 occlusion,
                 face_support,
+                light_transport: profile
+                    .and_then(|p| p.light_transport)
+                    .unwrap_or(block.light_transport),
                 collision,
                 materials,
                 overlays,
@@ -421,6 +428,17 @@ fn validate_tables(tables: &CookedTables, limits: CookLimits) -> Result<usize, C
             return Err(invalid("occlusion mask exceeds six faces"));
         }
         state.face_support.validate().map_err(&invalid)?;
+        if [
+            state.light_transport.absorption,
+            state.light_transport.emission,
+        ]
+        .iter()
+        .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+        {
+            return Err(invalid(
+                "light transport must be finite and between 0 and 1",
+            ));
+        }
         if let Some(shape) = &state.collision {
             if matches!(shape, Shape::Model(_)) {
                 return Err(CookError::VisualCollision(state.block.clone()));
@@ -450,6 +468,7 @@ fn validate_tables(tables: &CookedTables, limits: CookLimits) -> Result<usize, C
             + 4
             + 1
             + 2
+            + 8
             + 24
             + 6
             + state.overlays.iter().filter(|slot| slot.is_some()).count() * 4;
@@ -578,6 +597,8 @@ fn encode_unchecked(tables: &CookedTables) -> Vec<u8> {
         out.push(state.occlusion);
         out.push(state.face_support.attachment);
         out.push(state.face_support.structural);
+        push_u32(&mut out, state.light_transport.absorption.to_bits());
+        push_u32(&mut out, state.light_transport.emission.to_bits());
         push_shape(&mut out, state.collision.as_ref());
         for material in &state.materials {
             push_u32(&mut out, *material);
@@ -646,7 +667,7 @@ pub fn read_cooked_with_limits(
     presentation.copy_from_slice(cursor.bytes_exact(32)?);
     let content_authority_digest = Digest(cursor.array()?);
     let content_presentation_digest = Digest(cursor.array()?);
-    let state_count = cursor.count(45, std::mem::size_of::<CookedState>())?;
+    let state_count = cursor.count(53, std::mem::size_of::<CookedState>())?;
     if state_count > usize::from(u16::MAX) {
         return Err(CookError::Limit);
     }
@@ -667,6 +688,10 @@ pub fn read_cooked_with_limits(
         face_support
             .validate()
             .map_err(|message| CookError::Invalid(message.into()))?;
+        let light_transport = LightTransport {
+            absorption: f32::from_bits(cursor.u32()?),
+            emission: f32::from_bits(cursor.u32()?),
+        };
         let collision = cursor.shape()?;
         let mut materials = [0; 6];
         for slot in &mut materials {
@@ -686,6 +711,7 @@ pub fn read_cooked_with_limits(
             values,
             occlusion,
             face_support,
+            light_transport,
             collision,
             materials,
             overlays,
@@ -798,7 +824,7 @@ fn matching_profile<'a>(profiles: &'a [StateProfile], values: &[u16]) -> Option<
 
 fn digest_authority(tables: &CookedTables) -> Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"torse-cooked-authority-v3");
+    hasher.update(b"torse-cooked-authority-v4");
     hasher.update(tables.content_authority_digest.0);
     hasher.update((tables.states.len() as u64).to_le_bytes());
     for state in &tables.states {
@@ -810,6 +836,8 @@ fn digest_authority(tables: &CookedTables) -> Digest {
         }
         hasher.update([state.occlusion]);
         hasher.update([state.face_support.attachment, state.face_support.structural]);
+        hasher.update(state.light_transport.absorption.to_bits().to_le_bytes());
+        hasher.update(state.light_transport.emission.to_bits().to_le_bytes());
         let mut encoded = Vec::new();
         push_shape(&mut encoded, state.collision.as_ref());
         hasher.update(encoded);
@@ -1025,11 +1053,11 @@ mod tests {
     use crate::{compile, m0_fixture_pack};
 
     #[test]
-    fn empty_v3_file_has_fixed_bytes_and_older_versions_are_rejected() {
+    fn empty_v4_file_has_fixed_bytes_and_older_versions_are_rejected() {
         // Fixed vector independent of the encoder and digest helpers.
-        let authority = "083573c550968d2c75612d105439827ae0b482349c5d7ae80ca81bc4f97ca8b0";
+        let authority = "25d0e703109b9ec54c0713e4316a8d24da31499048134cf759a885f123ea5dd4";
         let presentation = "c26506fcffa61995ba5577d7d97ab9776149f0e9d7a342122102c63000d2b372";
-        let mut bytes = b"TCOOK003\x03\x00\x00\x00".to_vec();
+        let mut bytes = b"TCOOK004\x04\x00\x00\x00".to_vec();
         for hex in [authority, presentation] {
             bytes.extend(
                 (0..hex.len())
@@ -1042,7 +1070,7 @@ mod tests {
         let tables = read_cooked(&bytes).unwrap();
         assert!(tables.states.is_empty());
         assert_eq!(write_cooked(&tables).unwrap(), bytes);
-        for version in [1, 2] {
+        for version in [1, 2, 3] {
             bytes[7] = b'0' + version;
             bytes[8] = version;
             assert_eq!(read_cooked(&bytes), Err(CookError::Header));

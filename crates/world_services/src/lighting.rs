@@ -323,16 +323,13 @@ impl LightJob {
                         direct_absorption = 0;
                     }
                     TerrainQuery::Ready(state) => {
-                        let definition = registry
-                            .definition(state)
+                        let light = registry
+                            .light_transport(state)
                             .ok_or_else(|| Fault::invalid_data("unregistered lighting state"))?;
-                        self.absorption[index] = (definition.light_transport.absorption * 15.0)
-                            .ceil()
-                            .clamp(1.0, 15.0)
-                            as u8;
-                        let level = (definition.light_transport.emission * 15.0).round() as u8;
-                        direct_absorption =
-                            (definition.light_transport.absorption * 15.0).ceil() as u8;
+                        self.absorption[index] =
+                            (light.absorption * 15.0).ceil().clamp(1.0, 15.0) as u8;
+                        let level = (light.emission * 15.0).round() as u8;
+                        direct_absorption = (light.absorption * 15.0).ceil() as u8;
                         self.levels[index] = if self.sky { 0 } else { level };
                         if level > 0 && !self.sky {
                             self.push(level, index)?;

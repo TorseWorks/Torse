@@ -7,11 +7,13 @@ const WORK: usize = 4096;
 impl Lighting {
     fn emission(scene: &Scene, pos: BlockPos) -> u8 {
         match scene.authority.store().query(pos) {
-            TerrainQuery::Ready(state) => {
-                scene.authority.registry().definition(state).map_or(0, |d| {
-                    (d.light_transport.emission * 15.0).round().clamp(0.0, 15.0) as u8
-                })
-            }
+            TerrainQuery::Ready(state) => scene
+                .authority
+                .registry()
+                .light_transport(state)
+                .map_or(0, |light| {
+                    (light.emission * 15.0).round().clamp(0.0, 15.0) as u8
+                }),
             _ => 0,
         }
     }
@@ -86,11 +88,11 @@ impl Lighting {
     fn absorption(scene: &Scene, pos: BlockPos) -> Option<u8> {
         match scene.authority.store().query(pos) {
             TerrainQuery::Ready(state) if state.is_empty() => Some(0),
-            TerrainQuery::Ready(state) => scene.authority.registry().definition(state).map(|d| {
-                (d.light_transport.absorption * 15.0)
-                    .ceil()
-                    .clamp(0.0, 15.0) as u8
-            }),
+            TerrainQuery::Ready(state) => scene
+                .authority
+                .registry()
+                .light_transport(state)
+                .map(|light| (light.absorption * 15.0).ceil().clamp(0.0, 15.0) as u8),
             _ => None,
         }
     }
@@ -204,5 +206,60 @@ impl Lighting {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_optics_drive_preview_emission_absorption_and_direct_sky() {
+        let mut pack = content_pack();
+        let block = pack
+            .blocks
+            .iter_mut()
+            .find(|b| b.value.id == key("base:glass_slab"))
+            .unwrap();
+        let values: Vec<_> = block
+            .value
+            .state_overrides
+            .iter()
+            .take(2)
+            .map(|p| p.values.clone())
+            .collect();
+        block.value.light_transport = torse_content::LightTransport {
+            absorption: 0.0,
+            emission: 0.0,
+        };
+        for (i, profile) in block.value.state_overrides.iter_mut().take(2).enumerate() {
+            profile.light_transport = Some(torse_content::LightTransport {
+                absorption: if i == 0 { 1.0 } else { 0.0 },
+                emission: if i == 0 { 1.0 } else { 0.0 },
+            });
+        }
+        let mut scene = super::super::tests::scene_from_pack(pack);
+        let states: Vec<_> = values
+            .iter()
+            .map(|v| {
+                scene
+                    .authority
+                    .registry()
+                    .state_of(&key("base:glass_slab"), v)
+                    .unwrap()
+            })
+            .collect();
+        let source = BlockPos::new(8, 15, 8);
+        scene.enable_lighting().unwrap();
+        for (state, expected) in [(states[0], 15), (states[1], 0)] {
+            scene.authority.store_mut().edit(source, state).unwrap();
+            assert_eq!(Lighting::emission(&scene, source), expected);
+            assert_eq!(Lighting::absorption(&scene, source), Some(expected));
+            let lighting = scene.lighting.as_ref().unwrap();
+            assert_eq!(
+                lighting.view(&scene).sky(&scene, BlockPos::new(8, 14, 8)),
+                15 - expected
+            );
+        }
     }
 }

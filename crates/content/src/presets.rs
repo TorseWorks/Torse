@@ -71,6 +71,7 @@ fn apply_slab(block: &mut BlockDefinition, schema: ContentKey, tag: &str, axes: 
                 selection_shape: Some(shape),
                 occlusion: Some(0),
                 face_support: None,
+                light_transport: None,
             }
         })
         .collect();
