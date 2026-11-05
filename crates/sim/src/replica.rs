@@ -103,6 +103,34 @@ pub struct ReplicaSource {
 }
 
 impl ReplicaSource {
+    /// Aggregate existing bounded subscription ledgers, without encoding or cloning payloads.
+    pub fn queue_diagnostics(
+        &self,
+        config: &torse_types::QueueDiagnostics,
+    ) -> torse_types::Diagnostic<torse_types::ReplicaQueues> {
+        use torse_types::{Diagnostic, ReplicaQueues, Unavailable};
+        if let Err(reason) = config.check::<ReplicaQueues>() {
+            return Diagnostic::Unavailable(reason);
+        }
+        let total = self.subscriptions.values().try_fold(
+            ReplicaQueues {
+                subscriptions: self.subscriptions.len() as u64,
+                ..ReplicaQueues::default()
+            },
+            |total, sub| {
+                Some(ReplicaQueues {
+                    subscriptions: total.subscriptions,
+                    batches: total.batches.checked_add(sub.queue.len() as u64)?,
+                    items: total.items.checked_add(sub.queued.items)?,
+                    logical_bytes: total.logical_bytes.checked_add(sub.queued.bytes)?,
+                })
+            },
+        );
+        match total {
+            Some(total) => Diagnostic::Available(total),
+            None => Diagnostic::Unavailable(Unavailable::Overflow),
+        }
+    }
     /// Connect before opening subscriptions; live payloads keep their own reservations.
     pub fn attach_memory(&mut self, memory: torse_types::MemoryPool) -> Result<(), Fault> {
         if self.memory.is_some() || !self.subscriptions.is_empty() {

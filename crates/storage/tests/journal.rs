@@ -15,6 +15,88 @@ fn memory() -> Memory {
     Memory::memory(binding(), baseline(), TestCodec::new(), config(), 65536).unwrap()
 }
 
+fn available<T>(value: Diagnostic<T>) -> T {
+    match value {
+        Diagnostic::Available(value) => value,
+        Diagnostic::Unavailable(reason) => panic!("{reason:?}"),
+    }
+}
+
+#[test]
+fn queue_diagnostics_track_staging_cancellation_acceptance_and_failed_durability() {
+    let enabled = QueueDiagnostics::enabled(4096).unwrap();
+    let mut journal = Journal::<TestModel, _, _>::with_backend(
+        binding(),
+        baseline(),
+        TestCodec::new(),
+        config(),
+        FaultyBackend {
+            fail_sync_call: Some(1),
+            ..FaultyBackend::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        journal.queue_diagnostics(&QueueDiagnostics::default()),
+        Diagnostic::Unavailable(Unavailable::NotEnabled)
+    );
+    assert_eq!(
+        journal.queue_diagnostics(&QueueDiagnostics::enabled(1).unwrap()),
+        Diagnostic::Unavailable(Unavailable::BudgetUnavailable)
+    );
+    let token = journal.try_stage(&commit(1)).unwrap();
+    let staged = available(journal.queue_diagnostics(&enabled));
+    assert_eq!(
+        (
+            staged.reserved_records,
+            staged.reserved_encoded_bytes,
+            staged.accepted
+        ),
+        (1, encoded(&commit(1)).len() as u64, baseline())
+    );
+    drop(token);
+    assert_eq!(
+        available(journal.queue_diagnostics(&enabled)).reserved_records,
+        0
+    );
+    let token = journal.try_stage(&commit(1)).unwrap();
+    journal.accept(token).unwrap();
+    assert_eq!(
+        available(journal.queue_diagnostics(&enabled)).accepted,
+        cursor(1)
+    );
+    assert_eq!(journal.durability().through.0, 0);
+    for _ in 0..1000 {
+        assert_eq!(
+            available(journal.queue_diagnostics(&enabled)).reserved_records,
+            1
+        );
+    }
+    assert_eq!(
+        (journal.backend().append_calls, journal.backend().sync_calls),
+        (0, 0)
+    );
+    assert!(journal.flush_through(cursor(1)).is_err());
+    let failed = available(journal.queue_diagnostics(&enabled));
+    assert_eq!(
+        (
+            failed.reserved_records,
+            failed.reserved_encoded_bytes,
+            failed.accepted
+        ),
+        (0, 0, cursor(1))
+    );
+    assert_eq!(
+        journal.durability().through.0,
+        0,
+        "observation must not confirm failed sync"
+    );
+    assert_eq!(
+        (journal.backend().append_calls, journal.backend().sync_calls),
+        (1, 1)
+    );
+}
+
 #[test]
 fn stage_and_accept_perform_no_io_and_only_sync_advances_durability() {
     let mut journal = Journal::<TestModel, _, _>::with_backend(

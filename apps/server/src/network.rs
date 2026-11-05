@@ -247,6 +247,55 @@ pub struct NetworkHub<T> {
     control: Option<control::ControlPlane>,
 }
 impl<T: Transport> NetworkHub<T> {
+    /// Sequential registry observation, including closed entries until normal reaping.
+    pub fn queue_diagnostics(
+        &self,
+        config: &torse_types::QueueDiagnostics,
+    ) -> torse_types::Diagnostic<torse_types::HubQueues> {
+        use torse_types::{Diagnostic, HubQueues, Unavailable};
+        if let Err(reason) = config.check::<HubQueues>() {
+            return Diagnostic::Unavailable(reason);
+        }
+        let waiting = self
+            .peers
+            .values()
+            .try_fold(0u64, |sum, peer| sum.checked_add(peer.waiting.len() as u64));
+        match waiting {
+            Some(waiting_requests) => Diagnostic::Available(HubQueues {
+                connections: self.peers.len() as u64,
+                waiting_requests,
+            }),
+            None => Diagnostic::Unavailable(Unavailable::Overflow),
+        }
+    }
+
+    /// Read one existing connection without retaining history, credentials or message bodies.
+    pub fn peer_queue_diagnostics(
+        &self,
+        id: u128,
+        config: &torse_types::QueueDiagnostics,
+    ) -> torse_types::Diagnostic<Option<torse_types::PeerQueues>> {
+        use torse_types::{Diagnostic, PeerQueues, RequestQueue, Unavailable};
+        if let Err(reason) = config.check::<Option<PeerQueues>>() {
+            return Diagnostic::Unavailable(reason);
+        }
+        Diagnostic::Available(self.peers.get(&id).map(|peer| {
+            PeerQueues {
+                waiting_requests: RequestQueue {
+                    records: peer.waiting.len() as u64,
+                    bytes: Diagnostic::Unavailable(Unavailable::NotCollected),
+                },
+                subscriptions: peer.subscriptions.len() as u64,
+                control: peer
+                    .control_link
+                    .as_ref()
+                    .map_or(Diagnostic::Unavailable(Unavailable::NotSupported), |link| {
+                        Diagnostic::Available(link.queue_usage())
+                    }),
+                transport: peer.transport.queue_diagnostics(config),
+            }
+        }))
+    }
     pub fn new(binding: Binding, limits: NetworkLimits) -> Result<Self, Fault> {
         if limits.frames_per_poll == 0
             || limits.movement_inputs == 0

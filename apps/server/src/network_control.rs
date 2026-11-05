@@ -77,6 +77,12 @@ enum Admit {
 }
 
 impl PeerLink {
+    pub(super) fn queue_usage(&self) -> torse_types::RequestQueue {
+        torse_types::RequestQueue {
+            records: self.queue.len() as u64,
+            bytes: torse_types::Diagnostic::Available(self.bytes),
+        }
+    }
     fn new(tick: Tick) -> Self {
         Self {
             // This becomes true only after ControlReady is accepted by the

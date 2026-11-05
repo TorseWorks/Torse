@@ -24,6 +24,17 @@ use crate::{FileBackend, JournalBackend, MemoryBackend, RecoveryReport, segments
 /// Neither staging nor acceptance performs file I/O. External success notifications wait
 /// for `flush_through`; dropping a token cancels only its storage reservation.
 pub trait CommitJournal<M: AuthorityData> {
+    /// Sequential read of existing ledgers, without I/O, allocation or new accounting.
+    /// Custom journals report unsupported by default.
+    fn queue_diagnostics(
+        &self,
+        config: &torse_types::QueueDiagnostics,
+    ) -> torse_types::Diagnostic<torse_types::JournalQueues> {
+        if let Err(reason) = config.check::<torse_types::JournalQueues>() {
+            return torse_types::Diagnostic::Unavailable(reason);
+        }
+        torse_types::Diagnostic::Unavailable(torse_types::Unavailable::NotSupported)
+    }
     /// Implementation-owned reservation; the concrete token must not implement Clone or Copy.
     type Staged;
 
@@ -575,6 +586,24 @@ impl<M: AuthorityData, C: StorageCodec<M>, B: JournalBackend> CommitJournal<M>
         // keep the last known durable prefix and permanently stop this storage instance.
         self.durable = DurableSeq(target.seq.0);
         Ok(self.durability())
+    }
+
+    fn queue_diagnostics(
+        &self,
+        config: &torse_types::QueueDiagnostics,
+    ) -> torse_types::Diagnostic<torse_types::JournalQueues> {
+        if let Err(reason) = config.check::<torse_types::JournalQueues>() {
+            return torse_types::Diagnostic::Unavailable(reason);
+        }
+        let (records, bytes) = self.pending_usage();
+        torse_types::Diagnostic::Available(torse_types::JournalQueues {
+            reserved_records: u64::from(records),
+            reserved_encoded_bytes: bytes,
+            accepted: CommitCursor {
+                world: self.binding.world,
+                seq: self.accepted,
+            },
+        })
     }
 
     fn durability(&self) -> Durability {

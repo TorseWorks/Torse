@@ -6,6 +6,16 @@
 
 主程序通过`--memory-mib N`设置共享逻辑内存上限，默认512MiB。世界、执行、存储、订阅、传输和并行工作使用同一MemoryPool；预算不足暂停可重试工作，提交序号保持不变，关闭控制消息保留专用空间。库宿主在恢复后、注册会话前调用`Server::attach_memory`，并使用`NetworkHub::with_memory`。预留口径、失败释放及不包含的内存范围见[共享内存记录](../../benchmarks/archive/performance/M6-shared-memory.md)。
 
+## 队列与进度诊断
+
+库宿主向`Server::queue_diagnostics`、`NetworkHub::queue_diagnostics`或`peer_queue_diagnostics`传入`torse_types::QueueDiagnostics`读取已有账目。默认配置返回`NotEnabled`；显式使用`QueueDiagnostics::enabled(4096)?`启用一次读取，参数限制返回值的固定尺寸，包含外层`Diagnostic`，合法范围为1字节至1MiB。尺寸不足返回`BudgetUnavailable`。这些接口不分配快照缓冲、不保存历史、不增加生产路径计数器或时钟；调用方保留的副本、序列化和导出内存由调用方管理，不属于内核预留。
+
+服务端快照包含待处理请求数、剩余冻结任务数、已调度事件数、复制订阅/批次/items/逻辑字节账、日志已接纳和暂存预留，以及published、accepted、durable进度。请求没有现成字节账，返回`NotCollected`；日志预留包含尚未接纳的暂存令牌，不能视为全都已持久。复制字节沿用保守的自有负载成本，不代表线缆字节或进程内存。定制权威、Journal和Transport未实现观察接口时返回`NotSupported`，未知值不填零。
+
+NetworkHub按已有连接ID读取单个连接，汇总连接数包含尚待正常回收的关闭条目；不建立诊断连接表。连接快照包含待确认请求数、订阅数、已有控制消息负载账和传输队列。各对象依次取样，不能作为跨对象原子切面；共享内存传输尝试加锁，竞争时返回`Busy`而不等待。接口只观察，不poll、不消费、不刷盘。生产Journal与ExecutionHost复用现有读接口；自定义适配器须遵守相同只读约定。
+
+本批不提供Socket实际I/O、驻留时间、累计值、峰值或历史；传输字节口径及TLS边界见[连接与状态复制](../../crates/net/README.md)。
+
 | 文件 | 职责 |
 |---|---|
 | [authority.rs](src/authority.rs) | 服务端本地权威、准备项、独立恢复和订阅失效适配接口 |

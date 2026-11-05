@@ -13,6 +13,170 @@ use torse_sim::{OrderingKey, Phase, SystemSpec, Transaction, WorldAuthority};
 use torse_types::*;
 use torse_world::*;
 
+#[allow(dead_code)]
+#[path = "../examples/serial_baseline/workload.rs"]
+mod diagnostic_state;
+
+fn observed<T>(value: Diagnostic<T>) -> T {
+    match value {
+        Diagnostic::Available(value) => value,
+        Diagnostic::Unavailable(reason) => panic!("diagnostics unavailable: {reason:?}"),
+    }
+}
+
+#[test]
+fn queue_diagnostics_preserve_execution_and_track_replica_lifecycle() {
+    let observed_dir = Directory::new();
+    let plain_dir = Directory::new();
+    let mut measured = create(&observed_dir, rules(Rc::new(Cell::new(0))));
+    let mut plain = create(&plain_dir, rules(Rc::new(Cell::new(0))));
+    let config = QueueDiagnostics::enabled(4096).unwrap();
+    assert_eq!(
+        measured.queue_diagnostics(&QueueDiagnostics::default()),
+        Diagnostic::Unavailable(Unavailable::NotEnabled)
+    );
+    assert_eq!(
+        measured.queue_diagnostics(&QueueDiagnostics::enabled(1).unwrap()),
+        Diagnostic::Unavailable(Unavailable::BudgetUnavailable)
+    );
+    let mut subscriptions = Vec::new();
+    for server in [&mut measured, &mut plain] {
+        session(server);
+        subscriptions.push(
+            server
+                .open_replica(SessionId(1), base::scope(), base::budget())
+                .unwrap()
+                .subscription,
+        );
+        assert!(matches!(
+            server.submit(request(server, 1, transfer())),
+            Admission::Queued { .. }
+        ));
+    }
+    let queued = observed(measured.queue_diagnostics(&config));
+    let authority = observed(queued.authority);
+    assert_eq!(authority.requests.records, 1);
+    assert_eq!(
+        authority.requests.bytes,
+        Diagnostic::Unavailable(Unavailable::NotCollected)
+    );
+    assert_eq!(observed(authority.replicas).subscriptions, 1);
+    assert_eq!(queued.progress.published.seq.0, 0);
+    let mut saw_frozen = false;
+    for _ in 0..128 {
+        measured.drive_one(&mut NoReplicas).unwrap();
+        let snapshot = observed(measured.queue_diagnostics(&config));
+        saw_frozen |= observed(snapshot.authority).frozen_tasks > 0;
+        assert_eq!(
+            snapshot.progress.published,
+            observed(snapshot.progress.accepted)
+        );
+        assert_eq!(
+            snapshot.progress.published.seq.0,
+            snapshot.progress.durable.through.0
+        );
+        if measured.authority().unwrap().at_tick_boundary() {
+            break;
+        }
+    }
+    assert!(saw_frozen);
+    assert!(measured.authority().unwrap().at_tick_boundary());
+    assert_eq!(
+        observed(observed(measured.queue_diagnostics(&config)).authority).scheduled_events,
+        1
+    );
+    tick(&mut plain);
+    assert_eq!(
+        diagnostic_state::state_bytes(measured.authority().unwrap()).unwrap(),
+        diagnostic_state::state_bytes(plain.authority().unwrap()).unwrap()
+    );
+    let replicas =
+        observed(observed(observed(measured.queue_diagnostics(&config)).authority).replicas);
+    assert!(replicas.batches > 0 && replicas.items > 0 && replicas.logical_bytes > 0);
+    for (server, subscription) in [
+        (&mut measured, subscriptions[0]),
+        (&mut plain, subscriptions[1]),
+    ] {
+        assert!(
+            !server
+                .take_replica(subscription, base::budget())
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let drained =
+        observed(observed(observed(measured.queue_diagnostics(&config)).authority).replicas);
+    assert_eq!(
+        (drained.batches, drained.items, drained.logical_bytes),
+        (0, 0, 0)
+    );
+    for (server, subscription) in [
+        (&mut measured, subscriptions[0]),
+        (&mut plain, subscriptions[1]),
+    ] {
+        assert_eq!(server.disconnect(SessionId(1)).unwrap(), vec![subscription]);
+    }
+    assert_eq!(
+        observed(observed(observed(measured.queue_diagnostics(&config)).authority).replicas),
+        ReplicaQueues::default()
+    );
+    drop(measured);
+    drop(plain);
+    assert_eq!(
+        std::fs::read(observed_dir.0.join("journal.log")).unwrap(),
+        std::fs::read(plain_dir.0.join("journal.log")).unwrap()
+    );
+}
+
+#[test]
+fn queue_diagnostics_follow_hub_revoke_and_reconnect_without_draining() {
+    let dir = Directory::new();
+    let mut server = create(&dir, Vec::new());
+    let mut hub = NetworkHub::new(server.binding(), base::network_limits()).unwrap();
+    let config = QueueDiagnostics::enabled(4096).unwrap();
+    assert_eq!(
+        hub.queue_diagnostics(&QueueDiagnostics::default()),
+        Diagnostic::Unavailable(Unavailable::NotEnabled)
+    );
+    let (id, mut client) = add(&mut hub, &server, actor());
+    hello(&mut client, server.binding());
+    hub.poll(&mut server).unwrap();
+    assert_eq!(observed(hub.queue_diagnostics(&config)).connections, 1);
+    let before = observed(hub.peer_queue_diagnostics(id, &config)).unwrap();
+    assert!(observed(before.transport).outgoing.records > 0);
+    for _ in 0..1000 {
+        assert_eq!(
+            observed(hub.peer_queue_diagnostics(id, &config)),
+            Some(before)
+        );
+    }
+    assert!(!receive(&mut client).is_empty());
+    send(
+        &mut client,
+        ClientMessage::Subscribe {
+            sections: base::scope().sections.into_iter().collect(),
+        },
+    );
+    hub.poll(&mut server).unwrap();
+    assert_eq!(
+        observed(hub.peer_queue_diagnostics(id, &config))
+            .unwrap()
+            .subscriptions,
+        1
+    );
+    hub.revoke(&mut server, id).unwrap();
+    assert_eq!(observed(hub.peer_queue_diagnostics(id, &config)), None);
+    assert_eq!(observed(hub.queue_diagnostics(&config)).connections, 0);
+    let (replacement, _client) = add(&mut hub, &server, actor());
+    assert_ne!(replacement, id);
+    assert_eq!(
+        observed(hub.peer_queue_diagnostics(replacement, &config))
+            .unwrap()
+            .subscriptions,
+        0
+    );
+}
+
 fn key(v: &str) -> ContentKey {
     base::key(v)
 }

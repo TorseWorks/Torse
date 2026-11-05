@@ -1249,6 +1249,22 @@ fn pruned_windows(before: &[Window], after: &[Window]) -> bool {
 }
 
 impl HostAuthority for ExecutionHost {
+    fn queue_diagnostics(&self, config: &QueueDiagnostics) -> Diagnostic<AuthorityQueues> {
+        if let Err(reason) = config.check::<AuthorityQueues>() {
+            return Diagnostic::Unavailable(reason);
+        }
+        Diagnostic::Available(AuthorityQueues {
+            requests: RequestQueue {
+                records: self.pending.len() as u64,
+                bytes: Diagnostic::Unavailable(Unavailable::NotCollected),
+            },
+            frozen_tasks: self.runtime.work.as_ref().map_or(0, |work| {
+                work.tasks.len().saturating_sub(work.next as usize) as u64
+            }),
+            scheduled_events: self.runtime.events.len() as u64,
+            replicas: self.source.queue_diagnostics(config),
+        })
+    }
     type Model = ExecutionModel;
     type Prepared = ExecutionPrepared;
     fn binding(&self) -> Binding {

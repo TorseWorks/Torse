@@ -15,6 +15,8 @@ TcpTransport提供双向TLS，证书及应用协议验证完成后才报告对�
 
 MemoryTransport和TcpTransport都提供独立close，清空尚未发送的数据。NetworkHub还限制连接、空闲Tick、请求与订阅，按宿主PeerPolicy绑定权限；权威ExecutionHost负责持久请求去重。应用协议3保留握手后Ping，客户端每10秒发送，默认空闲上限仍为60秒。心跳由应用连接层驱动。
 
+`Transport::queue_diagnostics`默认关闭，传入显式`QueueDiagnostics`读取固定尺寸值，定制传输默认返回`NotSupported`。MemoryTransport报告两端共享队列的负载字节，分别try_lock，竞争返回`Busy`；两次取样不保证原子性。TCP已完成入站帧按负载计字节，未完成输入单独报告，出站沿用已有剩余帧字节账（含尚未写出的长度前缀），不再次扣减部分写偏移。TLS沿用应用层明文帧账，已经交给TLS的内部缓冲、密文记录和Socket收发字节不在此范围。观察不驱动poll或握手，也不消费帧；关闭和正常排空后沿用现有队列状态，不提供累计流量或驻留时间。预算与进度语义见[服务端](../../apps/server/README.md#队列与进度诊断)。
+
 ReplicaMirror先校验完整新状态再替换，拒绝错误Binding、重复/缺失ReplicaSeq、无效字典、Section尺寸或实体位置。连接关闭后应用应丢弃镜像并重新获取基线，不能继续使用旧权限状态。
 
 端到端见[执行与网络记录](../../benchmarks/archive/network/B6-B7-execution-network.md)及[权威移动](../../benchmarks/archive/network/M5-authoritative-movement.md)。用户策略、移动和持久确认由应用层装配；当前使用固定内容和有限范围，UDP、多通道仍待接入。

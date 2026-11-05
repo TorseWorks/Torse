@@ -10,7 +10,13 @@ use core::fmt;
 mod asset;
 pub use asset::{AssetGuid, valid_asset_path};
 
+mod diagnostics;
 mod identity;
+pub use diagnostics::{
+    AuthorityQueues, Diagnostic, FrameQueue, HubQueues, JournalQueues, PeerQueues, QueueByteKind,
+    QueueDiagnostics, QueueProgress, ReplicaQueues, RequestQueue, ServerQueues, TransportQueues,
+    Unavailable,
+};
 mod lifecycle;
 mod memory;
 mod memory_pool;

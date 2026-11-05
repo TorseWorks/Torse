@@ -3,6 +3,9 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
+use torse_types::{
+    Diagnostic, FrameQueue, QueueByteKind, QueueDiagnostics, TransportQueues, Unavailable,
+};
 use torse_types::{EvictionRank, Fault, FaultCode, MemoryClass, MemoryLease, MemoryPool};
 #[derive(Clone, Copy, Debug)]
 pub struct TransportLimits {
@@ -32,6 +35,15 @@ impl TransportLimits {
     }
 }
 pub trait Transport {
+    /// Observe existing buffers only. Implementations must not poll, encode or perform I/O.
+    /// Custom adapters remain source-compatible and explicitly unsupported by default.
+    /// Read existing queues without I/O, allocation, consumption or blocking waits.
+    fn queue_diagnostics(&self, config: &QueueDiagnostics) -> Diagnostic<TransportQueues> {
+        if let Err(reason) = config.check::<TransportQueues>() {
+            return Diagnostic::Unavailable(reason);
+        }
+        Diagnostic::Unavailable(Unavailable::NotSupported)
+    }
     fn security(&self) -> crate::tls::TransportSecurity {
         crate::tls::TransportSecurity::Unprotected
     }
@@ -89,6 +101,40 @@ impl MemoryTransport {
     }
 }
 impl Transport for MemoryTransport {
+    fn queue_diagnostics(&self, config: &QueueDiagnostics) -> Diagnostic<TransportQueues> {
+        if let Err(reason) = config.check::<TransportQueues>() {
+            return Diagnostic::Unavailable(reason);
+        }
+        // Never wait while observing a shared queue; locks are taken separately.
+        let (input, input_closed) = match self.input.try_lock() {
+            Ok(q) => (
+                FrameQueue {
+                    records: q.frames.len() as u64,
+                    bytes: q.bytes as u64,
+                    byte_kind: QueueByteKind::Payload,
+                },
+                q.closed,
+            ),
+            Err(_) => return Diagnostic::Unavailable(Unavailable::Busy),
+        };
+        let (output, output_closed) = match self.output.try_lock() {
+            Ok(q) => (
+                FrameQueue {
+                    records: q.frames.len() as u64,
+                    bytes: q.bytes as u64,
+                    byte_kind: QueueByteKind::Payload,
+                },
+                q.closed,
+            ),
+            Err(_) => return Diagnostic::Unavailable(Unavailable::Busy),
+        };
+        Diagnostic::Available(TransportQueues {
+            incoming: input,
+            incomplete_frame_bytes: 0,
+            outgoing: output,
+            closed: input_closed || output_closed,
+        })
+    }
     fn attach_memory(&mut self, pool: MemoryPool) -> Result<(), Fault> {
         if self.memory.is_some() {
             return Err(Fault::invalid_data("transport memory already attached"));
@@ -290,6 +336,25 @@ fn io_fault(e: std::io::Error) -> Fault {
     Fault::new(FaultCode::InvalidState, format!("transport I/O: {e}"))
 }
 impl Transport for TcpTransport {
+    fn queue_diagnostics(&self, config: &QueueDiagnostics) -> Diagnostic<TransportQueues> {
+        if let Err(reason) = config.check::<TransportQueues>() {
+            return Diagnostic::Unavailable(reason);
+        }
+        Diagnostic::Available(TransportQueues {
+            incoming: FrameQueue {
+                records: self.ready.len() as u64,
+                bytes: self.ready_bytes as u64,
+                byte_kind: QueueByteKind::Payload,
+            },
+            incomplete_frame_bytes: self.input.len() as u64,
+            outgoing: FrameQueue {
+                records: self.output.len() as u64,
+                bytes: self.queued as u64,
+                byte_kind: QueueByteKind::FramedRemaining,
+            },
+            closed: self.closed,
+        })
+    }
     fn security(&self) -> crate::tls::TransportSecurity {
         self.tls.as_ref().map_or(
             crate::tls::TransportSecurity::Unprotected,
@@ -376,6 +441,25 @@ impl Drop for TcpTransport {
 mod memory_tests {
     use super::*;
     use torse_types::MemoryBudget;
+    #[test]
+    fn diagnostics_do_not_wait_for_locked_shared_queues() {
+        let limits = TransportLimits {
+            frame: 64,
+            queued_frames: 4,
+            queued_bytes: 256,
+            poll_bytes: 64,
+        };
+        let (transport, _) = MemoryTransport::pair(limits).unwrap();
+        let _guard = transport.input.lock().unwrap();
+        assert_eq!(
+            transport.queue_diagnostics(&QueueDiagnostics::default()),
+            Diagnostic::Unavailable(Unavailable::NotEnabled)
+        );
+        assert_eq!(
+            transport.queue_diagnostics(&QueueDiagnostics::enabled(4096).unwrap()),
+            Diagnostic::Unavailable(Unavailable::Busy)
+        );
+    }
     #[test]
     fn transport_reservations_cover_queue_lifetimes_and_close() {
         let limits = TransportLimits {
