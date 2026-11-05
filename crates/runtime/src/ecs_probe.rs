@@ -150,12 +150,7 @@ fn run_probe(
             Health(100),
         ));
     }
-    let mut schedule = Schedule::default();
-    schedule.set_executor_kind(match executor {
-        EcsProbeExecutor::SingleThreaded => ExecutorKind::SingleThreaded,
-        EcsProbeExecutor::MultiThreaded => ExecutorKind::MultiThreaded,
-    });
-    schedule.add_systems((integrate, regenerate));
+    let mut schedule = probe_schedule(executor);
     schedule
         .initialize(&mut world)
         .expect("fixed probe schedule is valid");
@@ -206,6 +201,16 @@ fn run_probe(
     )
 }
 
+fn probe_schedule(executor: EcsProbeExecutor) -> Schedule {
+    let mut schedule = Schedule::default();
+    schedule.set_executor_kind(match executor {
+        EcsProbeExecutor::SingleThreaded => ExecutorKind::SingleThreaded,
+        EcsProbeExecutor::MultiThreaded => ExecutorKind::MultiThreaded,
+    });
+    schedule.add_systems((integrate, regenerate));
+    schedule
+}
+
 fn count_mismatches(results: &[EntityResult], entities: usize, ticks: u32) -> usize {
     results
         .iter()
@@ -228,6 +233,40 @@ fn expected_result(index: usize, ticks: u32) -> EntityResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_executor_can_run_disjoint_systems_concurrently() {
+        // Each system must observe the other's start before it can finish.
+        // A bounded receive fails a serial regression without deadlocking CI.
+        run_ecs_probe_with_executor(0, 0, EcsProbeExecutor::MultiThreaded);
+        let (a_started, a_seen) = std::sync::mpsc::sync_channel(1);
+        let (b_started, b_seen) = std::sync::mpsc::sync_channel(1);
+        let a_seen = Mutex::new(a_seen);
+        let b_seen = Mutex::new(b_seen);
+        let mut world = World::new();
+        world.insert_resource(Observation::default());
+        let mut schedule = probe_schedule(EcsProbeExecutor::MultiThreaded);
+        assert_eq!(schedule.get_executor_kind(), ExecutorKind::MultiThreaded);
+        schedule.add_systems((
+            move || {
+                a_started.send(()).unwrap();
+                b_seen
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            },
+            move || {
+                b_started.send(()).unwrap();
+                a_seen
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            },
+        ));
+        schedule.run(&mut world);
+    }
 
     #[test]
     fn verification_detects_equal_sum_corruption_and_missing_entities() {
