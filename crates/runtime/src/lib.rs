@@ -14,4 +14,4 @@ pub use scoped::run_scoped;
 mod ecs_probe;
 
 #[cfg(feature = "ecs-probe")]
-pub use ecs_probe::{EcsProbeReport, run_ecs_probe};
+pub use ecs_probe::{EcsProbeExecutor, EcsProbeReport, run_ecs_probe, run_ecs_probe_with_executor};

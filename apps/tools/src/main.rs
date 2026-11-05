@@ -204,11 +204,28 @@ fn m1_scenario() -> ExitCode {
 fn ecs_probe() -> ExitCode {
     // This workload is large enough to exercise query traversal and scheduling,
     // but it is a correctness/smoke probe rather than a benchmark.
-    let report = torse_runtime::run_ecs_probe(10_000, 100);
-    println!("entities={}", report.entities);
-    println!("ticks={}", report.ticks);
-    println!("elapsed={:?}", report.elapsed);
-    println!("checksum={}", report.checksum);
+    for executor in [
+        torse_runtime::EcsProbeExecutor::SingleThreaded,
+        torse_runtime::EcsProbeExecutor::MultiThreaded,
+    ] {
+        let report = torse_runtime::run_ecs_probe_with_executor(10_000, 100, executor);
+        println!("executor={:?}", report.executor);
+        println!("entities={}", report.entities);
+        println!("ticks={}", report.ticks);
+        println!("pool_threads={}", report.pool_threads);
+        println!("observed_threads={}", report.observed_threads);
+        println!(
+            "observed_non_caller_threads={}",
+            report.observed_non_caller_threads
+        );
+        println!("peak_concurrent_systems={}", report.peak_concurrent_systems);
+        println!("instrumented_elapsed={:?}", report.elapsed);
+        println!("checksum={}", report.checksum);
+        println!("mismatched_entities={}", report.mismatched_entities);
+        if report.mismatched_entities != 0 {
+            return ExitCode::FAILURE;
+        }
+    }
     ExitCode::SUCCESS
 }
 

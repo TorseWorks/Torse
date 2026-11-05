@@ -40,6 +40,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace --all-targets
+      - name: Standalone ECS scheduler verification
+        run: |
+          cargo clippy -p torse-runtime --features ecs-probe --all-targets --locked -- -D warnings
+          cargo test -p torse-runtime --features ecs-probe --locked
+          cargo run -p torse-tools --features ecs-probe --locked -- ecs-probe
       - name: Repeat CPU cancellation and background result tests
         shell: bash
         run: |

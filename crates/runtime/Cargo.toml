@@ -6,8 +6,9 @@ publish.workspace = true
 license.workspace = true
 
 [features]
-ecs-probe = ["dep:bevy_ecs"]
+ecs-probe = ["dep:bevy_ecs", "dep:bevy_tasks"]
 
 [dependencies]
 torse-types = { path = "../types" }
-bevy_ecs = { version = "=0.18.1", optional = true }
+bevy_ecs = { version = "=0.18.1", features = ["multi_threaded"], optional = true }
+bevy_tasks = { version = "=0.18.1", features = ["multi_threaded"], optional = true }

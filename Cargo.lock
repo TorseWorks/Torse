@@ -371,6 +371,7 @@ dependencies = [
  "async-task",
  "atomic-waker",
  "bevy_platform",
+ "concurrent-queue",
  "crossbeam-queue",
  "derive_more",
  "futures-lite",
@@ -1053,6 +1054,7 @@ version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
+ "parking",
  "pin-project-lite",
 ]
 
@@ -3224,6 +3226,7 @@ name = "torse-runtime"
 version = "0.1.0"
 dependencies = [
  "bevy_ecs",
+ "bevy_tasks",
  "torse-types",
 ]
 
