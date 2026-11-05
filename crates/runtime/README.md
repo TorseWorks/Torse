@@ -50,6 +50,10 @@ if let Some(result) = job.try_take() {
 
 该接口不暴露阻塞等待结果的方法。工作线程不执行磁盘、网络操作，也不等待同池子任务；生成与网格适配器按高度行或切片检查取消。执行器不强制终止任意原生代码。
 
-生成与网格接入有界执行器的取消、背压与结果失效验证见[记录](../../benchmarks/archive/performance/M6-bounded-executor.md)。ECS实验仍通过ecs-probe特性启用。
+生成与网格接入有界执行器的取消、背压与结果失效验证见[记录](../../benchmarks/archive/performance/M6-bounded-executor.md)。ECS实验通过`ecs-probe`特性启用；运行`cargo run -p torse-tools --features ecs-probe -- ecs-probe`会分别执行显式串行和多线程调度，并逐实体核对位置、速度、生命值与稳定序号。原有`run_ecs_probe`入口保留为显式串行参考。
+
+实验输出区分配置的线程池大小、实际参与的线程数、非调用线程数和系统重叠峰值。多线程模式在Bevy全局计算池尚未初始化时创建两个工作线程，否则沿用既有池大小；池随进程存活，不按每次调用重建。零Tick时没有系统执行，线程观测为零；空世界仍执行系统。调度器可以让多个系统先后运行，不能仅凭配置为多线程就宣称发生了重叠。
+
+计时包含线程记录与原子计数开销，不含世界构造、调度初始化和结果核对；它仅用于正确性smoke，不提供性能收益结论。该实验不接入权威世界、权限、事务、日志或恢复流程，也不表示这些能力已经ECS化。
 
 `Executor::with_memory`可与世界、复制和资源共用MemoryPool，任务槽和输入、输出峰值均参与同一总量校验。`Job::try_take_charged`将完成结果的原预留转入指定分类，分类暂满时保留结果供重试；`try_take`仍由调用方自行负责结果的常驻预算。两端主程序装配及范围见[共享内存记录](../../benchmarks/archive/performance/M6-shared-memory.md)。
