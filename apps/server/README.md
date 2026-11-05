@@ -326,4 +326,3 @@ append on rotation, and its sync calls the directory helper (an OS directory syn
 currently a no-op on other platforms). Those paths need separate observation; this result
 does not justify removing any barrier. Cache, scheduler and filesystem variability remain
 part of the measurement; report repeated-process dispersion rather than a stable speedup.
-
