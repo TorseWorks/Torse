@@ -19,6 +19,16 @@ pub trait PreparedChange {
 /// `publish` errors are terminal invariant failures, never recoverable gameplay rejection.
 /// The adapter remains responsible for bounded domain queues and complete world capture.
 pub trait HostAuthority: Sized {
+    /// Observe existing ledgers without I/O, clocks, allocation or state changes.
+    fn queue_diagnostics(
+        &self,
+        config: &torse_types::QueueDiagnostics,
+    ) -> torse_types::Diagnostic<torse_types::AuthorityQueues> {
+        if let Err(reason) = config.check::<torse_types::AuthorityQueues>() {
+            return torse_types::Diagnostic::Unavailable(reason);
+        }
+        torse_types::Diagnostic::Unavailable(torse_types::Unavailable::NotSupported)
+    }
     type Model: AuthorityData;
     type Prepared: PreparedChange<Model = Self::Model>;
 

@@ -7,6 +7,39 @@ use std::sync::Arc;
 use torse_net::{TcpTransport, Transport, TransportLimits, tls::*};
 use torse_types::{MemoryBudget, MemoryPool};
 
+#[test]
+fn queue_diagnostics_report_application_frames_before_tls_acceptance() {
+    use torse_types::{Diagnostic, QueueByteKind, QueueDiagnostics};
+    let fixture = Fixture::temporary();
+    let (mut server, mut client) = pair(&fixture, "alice", "localhost");
+    assert!(ready(&mut server, &mut client));
+    let config = QueueDiagnostics::enabled(4096).unwrap();
+    client.send(vec![7; 16]).unwrap();
+    for _ in 0..1000 {
+        let Diagnostic::Available(usage) = client.queue_diagnostics(&config) else {
+            panic!("application queue unavailable")
+        };
+        assert_eq!(usage.outgoing.records, 1);
+        assert_eq!(usage.outgoing.bytes, 20);
+        assert_eq!(usage.outgoing.byte_kind, QueueByteKind::FramedRemaining);
+    }
+    let mut received = None;
+    for _ in 0..10_000 {
+        client.poll().unwrap();
+        server.poll().unwrap();
+        received = server.receive().unwrap();
+        if received.is_some() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(received, Some(vec![7; 16]));
+    let Diagnostic::Available(usage) = client.queue_diagnostics(&config) else {
+        panic!("application queue unavailable")
+    };
+    assert_eq!(usage.outgoing.bytes, 0);
+}
+
 fn configs(
     fixture: &Fixture,
     user: &str,

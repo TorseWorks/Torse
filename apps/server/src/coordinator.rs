@@ -183,6 +183,31 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         self.flush
     }
 
+    /// Fixed-size observations only; no I/O, allocation, clocks or cross-object atomicity.
+    pub fn queue_diagnostics(
+        &self,
+        config: &torse_types::QueueDiagnostics,
+    ) -> torse_types::Diagnostic<torse_types::ServerQueues> {
+        use torse_types::{Diagnostic, QueueProgress, ServerQueues};
+        if let Err(reason) = config.check::<ServerQueues>() {
+            return Diagnostic::Unavailable(reason);
+        }
+        let journal = self.journal.queue_diagnostics(config);
+        let accepted = match journal {
+            Diagnostic::Available(value) => Diagnostic::Available(value.accepted),
+            Diagnostic::Unavailable(reason) => Diagnostic::Unavailable(reason),
+        };
+        Diagnostic::Available(ServerQueues {
+            authority: self.authority.queue_diagnostics(config),
+            journal,
+            progress: QueueProgress {
+                published: self.authority.cursor(),
+                accepted,
+                durable: self.journal.durability(),
+            },
+        })
+    }
+
     /// Trusted transport/session validation belongs to B7. This boundary additionally
     /// rejects other worlds and previous runs before invoking the authority adapter.
     pub fn submit(&mut self, request: ModelRequest<A::Model>) -> Admission {

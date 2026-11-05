@@ -6,6 +6,34 @@ use support::*;
 use torse_server::*;
 use torse_types::*;
 
+#[test]
+fn queue_diagnostics_keep_custom_adapter_gaps_explicit() {
+    let fixture = fixture();
+    fixture.control.reset();
+    let Diagnostic::Available(snapshot) = fixture
+        .server
+        .queue_diagnostics(&QueueDiagnostics::enabled(4096).unwrap())
+    else {
+        panic!("server snapshot unavailable")
+    };
+    assert_eq!(
+        snapshot.authority,
+        Diagnostic::Unavailable(Unavailable::NotSupported)
+    );
+    assert_eq!(
+        snapshot.journal,
+        Diagnostic::Unavailable(Unavailable::NotSupported)
+    );
+    assert_eq!(
+        snapshot.progress.accepted,
+        Diagnostic::Unavailable(Unavailable::NotSupported)
+    );
+    assert_eq!(snapshot.progress.published.seq, CommitSeq(0));
+    assert_eq!(snapshot.progress.durable.through, DurableSeq(0));
+    // Existing progress remains readable without asking an adapter to flush or prepare.
+    assert!(fixture.control.trace.borrow().is_empty());
+}
+
 fn admit(fixture: &mut Fixture, sequence: u64, target: u64, closes: bool) {
     let binding = fixture.server.authority().unwrap().binding();
     assert!(matches!(
