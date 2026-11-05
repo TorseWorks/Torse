@@ -1,0 +1,21 @@
+{
+  "command": [
+    "release/examples/flush_baseline.exe",
+    "--output",
+    ".work\\flush-repeat-20261105\\run-01-memory-off",
+    "--backend",
+    "memory",
+    "--ticks",
+    "30",
+    "--warmup",
+    "5",
+    "--unmeasured"
+  ],
+  "exit_code": 0,
+  "executable_sha256": "6742489b769e8796a1b00417daea2a030852611392bbae4c36beba95df274ea3",
+  "states": {
+    "empty": "387792f19c68f152f455b8620c8b2283bfbc2018e27c61a4560c628323fd5b1a",
+    "light": "a26934bcb05b3de80684758857b1b34db94219ee40ac26186f7e14f017c1114e",
+    "entities": "667318a52a5614a5a2b6d2f5dfdc29704035da95dc19e6cf4d1bae5140c8d9d4"
+  }
+}

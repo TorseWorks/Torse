@@ -326,3 +326,29 @@ append on rotation, and its sync calls the directory helper (an OS directory syn
 currently a no-op on other platforms). Those paths need separate observation; this result
 does not justify removing any barrier. Cache, scheduler and filesystem variability remain
 part of the measurement; report repeated-process dispersion rather than a stable speedup.
+
+Recorded run [20261105]: [raw samples and per-process summary](../../benchmarks/archive/flush/20261105/summary.csv),
+[build and environment identity](../../benchmarks/archive/flush/20261105/environment.json).
+Twelve independent release processes all exited zero, with 1080 measured ticks total.
+Each backend/mode has three independent repetitions; all final-state SHA256 values agree
+within a case, and all file cases reopen successfully. The instrumented process means were:
+
+| Case | Memory tick ms, range of three means | File tick ms, range of three means | Requests / backend syncs per tick |
+|---|---:|---:|---:|
+| No business edits | 0.0263–0.0308 | 2.8361–2.9213 | 12 / 12 |
+| One block edit | 0.0452–0.0668 | 3.0653–3.2528 | 13 / 13 |
+| Sixteen entity moves | 0.2553–0.2874 | 7.3308–9.2279 | 28 / 28 |
+
+Already-covered hits were zero in every measured tick. Each tick includes six frozen
+phase batches and six phase advances, plus the business task records. These are different
+commit positions, not repeated flushes of the same durable prefix. The covered-target
+regression separately proves that repeated already-durable requests perform no backend sync.
+The observed counts alone do not justify coalescing barriers or changing when success is
+confirmed. No optimization was implemented.
+
+File synchronization occupied approximately 91–96% of the instrumented process mean tick
+times, including adapter observation overhead. The measured environment was Rust 1.93.1,
+Windows 11 build 26200 and NTFS; affinity and power were uncontrolled and caches were not
+evicted. These numbers apply only to this fixed experiment. Per-process instrumented-minus-
+uninstrumented mean differences ranged from -0.6683ms to +0.6543ms across file cases. They
+do not establish stable observer overhead or any speedup. CPU time was not separately sampled.

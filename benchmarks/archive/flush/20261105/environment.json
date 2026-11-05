@@ -1,0 +1,31 @@
+{
+  "format": 1,
+  "revision": "5bc61d4a3cef2d556289e85569fee57394aac6c4",
+  "source_status": [],
+  "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "logical_cpus": 32,
+  "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+  "executable_sha256": "6742489b769e8796a1b00417daea2a030852611392bbae4c36beba95df274ea3",
+  "build_command": [
+    "cargo",
+    "build",
+    "--release",
+    "--locked",
+    "-p",
+    "torse-server",
+    "--example",
+    "flush_baseline"
+  ],
+  "argv": [
+    "apps/server/examples/flush_baseline/repeat.py",
+    "--output",
+    "benchmarks/archive/flush/20261105",
+    "--work",
+    ".work/flush-repeat-20261105"
+  ],
+  "instrument_scope": "example-local unsegmented file adapter; production Journal and ExecutionHost",
+  "cache": "not evicted",
+  "affinity": "inherited",
+  "power_and_temperature": "uncontrolled; not sampled"
+}
