@@ -283,3 +283,47 @@ GenerationIdentity在`generation.bin`保存生成器内容键、正整数版本�
 ## 实体碰撞体
 
 core:schema/collider提供实体轴对齐碰撞盒或关闭碰撞的声明。EntityCollider保存以百万分之一格表示的半尺寸，移动与放置共用声明，字段按普通组件进入日志、检查点、分区页和公开复制。创建时可设置初始声明，后续修改由core:module/physics来源提交，并复核最终位置和地形。无声明对象保留兼容行为，验证及限制见[实体碰撞体](../../benchmarks/archive/mods/M4-entity-colliders.md)。
+
+## Durable flush experiment
+
+`cargo run --release --locked -p torse-server --example flush_baseline -- --output .work/flush-one --backend file`
+runs three fixed serial cases: no business edits, one block edit per tick, and sixteen
+independent entity movements per tick. The public bootstrap content, normal ExecutionHost,
+production Journal encoder/queue, default budgets and default one-record commit batches
+are retained. Initial assembly, checkpoint creation, warm-up, verification, recovery and
+CSV export are outside each complete `drive_tick` timing. Samples use fixed preallocated
+storage (at most 1000 ticks per case). Each file case reopens through the production file
+server and verifies the complete recovered state.
+
+For three alternating independent release processes per backend and measurement mode:
+
+```sh
+python apps/server/examples/flush_baseline/repeat.py --output .work/flush-results --work .work/flush-worlds
+```
+
+The runner refuses existing directories, retains per-tick CSV, process commands, exit
+codes, binary SHA256 and final-state SHA256, and reports per-process nearest-rank
+percentiles. Measurement-enabled and disabled final states and file journal bytes must
+agree. Each child has a 600-second timeout. Working worlds remain under `--work`; only
+text measurements go under `--output`. Instrumentation-disabled counters are unavailable
+(empty CSV cells), rather than measured zeros. Memory sync makes no crash-persistence promise.
+
+`flush_requests` counts coordinator calls; `durable_hits` counts successful already-covered
+targets; `backend_sync_calls` counts actual adapter sync invocations. The file adapter calls
+`File::sync_all` for every new durable prefix. `append_records/bytes` count successful
+complete framed records; `file_write_calls/written_bytes` count returned file-write results,
+including partial writes. File API calls do not prove device-level flush counts.
+`append_ns` and `sync_ns` are disjoint children of `flush_ns`, which is contained in
+`tick_ns`; these columns must not be added to their parents. Adapter observer bookkeeping
+also contributes to the enclosing time. Freeze, advance and task counts explain the
+durability work even in the absence of business edits. Invalid/failing runs exit nonzero
+and must not be treated as completed timing samples.
+
+The file adapter is explicitly **unsegmented**, equivalent to the legacy FileBackend write
+and synchronization operations. It does not measure segmented rotation, reclamation,
+checkpoint publication or directory synchronization. SegmentWriter may synchronize during
+append on rotation, and its sync calls the directory helper (an OS directory sync on Unix;
+currently a no-op on other platforms). Those paths need separate observation; this result
+does not justify removing any barrier. Cache, scheduler and filesystem variability remain
+part of the measurement; report repeated-process dispersion rather than a stable speedup.
+
