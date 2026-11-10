@@ -1,0 +1,12 @@
+{
+  "build": "fd2b084",
+  "binary_sha256": "565af81373ff9e0e6e14e68f7290ce26e995bb650fa9d4ec94af76add8987137",
+  "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "cpu": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+  "logical_cpus": 32,
+  "fixture_pages": 24,
+  "journal_pending_records": 4,
+  "io_reservation_bytes": 805306368,
+  "scope": "production file server; fixed terrain-only fixture; backend sync not instrumented"
+}

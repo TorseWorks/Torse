@@ -199,6 +199,102 @@ fn check_reference(
 impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
     Server<ExecutionHost, J, S>
 {
+    /// Hold the mutable host borrow until every published page is durable. Invalid
+    /// input ends this batch after confirming its earlier prefix; storage errors
+    /// fail the host and require recovery, just like the single-record barrier.
+    pub(crate) fn apply_residency_batch(
+        &mut self,
+        pages: &SectionPages,
+        completed: Vec<crate::residency::Completed>,
+        sink: &mut impl InvalidationSink,
+    ) -> Result<
+        (
+            crate::residency::ResidencyBatchReport,
+            Vec<crate::residency::Completed>,
+        ),
+        Fault,
+    > {
+        use crate::coordinator::PublishedStep;
+        use crate::residency::ResidencyBatchReport;
+        self.authority()?;
+        let start = self.authority.cursor();
+        let allocator = self.authority.world().entities().next_entity_id();
+        let mut report = ResidencyBatchReport {
+            committed: Vec::new(),
+            durability: self.journal.durability(),
+            blocked: None,
+            failure: None,
+        };
+        let mut pending = completed.into_iter();
+        let mut retry = Vec::new();
+        while let Some(mut completed) = pending.next() {
+            let pos = completed.page.sections[0].pos;
+            if completed.fresh {
+                if completed.page.meta.cursor != start
+                    || completed.page.next_entity_id != allocator
+                    || !completed.page.entities.is_empty()
+                {
+                    report.failure = Some((pos, Fault::invalid_data("stale generated batch page")));
+                    break;
+                }
+                // The worker generated terrain-only pages at the same starting
+                // cursor. Rebase only across this call's own accepted prefix;
+                // external changes above still force fresh generation.
+                completed.page.meta = torse_sim::streaming::page_meta(self.authority.world());
+                match pages.digest(&completed.page) {
+                    Ok(digest) => completed.digest = digest,
+                    Err(error) => {
+                        report.failure = Some((pos, error));
+                        break;
+                    }
+                }
+            }
+            let change = SectionChange {
+                reference: reference(&completed.page, completed.digest),
+                page: completed.page,
+                load: completed.load,
+                fresh: completed.fresh,
+            };
+            match self.authority.prepare_residency(change) {
+                Ok(prepared) => self.authority.section_pending = Some(prepared),
+                Err(error) => {
+                    report.failure = Some((pos, error));
+                    break;
+                }
+            }
+            match self.publish_one(sink, None)? {
+                PublishedStep::Published(_) => report.committed.push(pos),
+                PublishedStep::Blocked(error, prepared) => {
+                    let change = prepared.record.changes.section.expect("residency record");
+                    retry.push(crate::residency::Completed {
+                        page: change.page,
+                        digest: change.reference.digest,
+                        load: change.load,
+                        fresh: change.fresh,
+                    });
+                    retry.extend(pending);
+                    // Retain decoded pages under the existing I/O reservation.
+                    // Only this call's own prefix may move their generation cut.
+                    for page in &mut retry {
+                        if page.fresh && page.page.meta.cursor == start {
+                            page.page.meta =
+                                torse_sim::streaming::page_meta(self.authority.world());
+                        }
+                    }
+                    report.blocked = Some(error);
+                    break;
+                }
+                PublishedStep::Idle => {
+                    return Err(self.fail(Fault::invalid_data("residency preparation disappeared")));
+                }
+            }
+        }
+        if !report.committed.is_empty() {
+            report.durability = self.flush_to(self.authority.cursor())?;
+        }
+        Ok((report, retry))
+    }
+
     pub(crate) fn apply_residency_page(
         &mut self,
         page: Snapshot,

@@ -48,6 +48,18 @@ pub enum ResidencyProgress {
     CapacityBlocked,
     Unavailable(SectionPos),
     Published(CommitStep),
+    Batch(ResidencyBatchReport),
+}
+
+/// An explicit durable prefix. Uncommitted desired pages are selected again on
+/// the next poll. A fatal journal error instead returns Err and stops the host;
+/// only reopening can establish the surviving complete log prefix.
+#[derive(Debug)]
+pub struct ResidencyBatchReport {
+    pub committed: Vec<SectionPos>,
+    pub durability: Durability,
+    pub blocked: Option<StageError>,
+    pub failure: Option<(SectionPos, Fault)>,
 }
 
 enum Request {
@@ -55,15 +67,15 @@ enum Request {
     Load(SectionPos, Digest),
     Generate(SectionPos, GenerationContext),
 }
-struct Completed {
-    page: Snapshot,
-    digest: Digest,
-    load: bool,
-    fresh: bool,
+pub(crate) struct Completed {
+    pub(crate) page: Snapshot,
+    pub(crate) digest: Digest,
+    pub(crate) load: bool,
+    pub(crate) fresh: bool,
 }
 struct Worker {
-    sender: Option<mpsc::SyncSender<Request>>,
-    receiver: mpsc::Receiver<Result<Completed, Fault>>,
+    sender: Option<mpsc::SyncSender<Vec<Request>>>,
+    receiver: mpsc::Receiver<Vec<(SectionPos, Result<Completed, Fault>)>>,
     handle: Option<JoinHandle<()>>,
 }
 impl Drop for Worker {
@@ -80,73 +92,85 @@ impl Worker {
         pages: SectionPages,
         generator: Option<Arc<dyn GenerationSource>>,
     ) -> Result<Self, Fault> {
-        let (sender, requests) = mpsc::sync_channel(1);
+        let (sender, requests) = mpsc::sync_channel::<Vec<Request>>(1);
         let (results, receiver) = mpsc::sync_channel(1);
         let handle = thread::Builder::new()
             .name("torse-page-io".into())
             .spawn(move || {
-                while let Ok(request) = requests.recv() {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                        || -> Result<Completed, Fault> {
-                            match request {
-                                Request::Save(page) => {
-                                    let digest = pages.put(&page)?;
-                                    Ok(Completed {
-                                        page,
-                                        digest,
-                                        load: false,
-                                        fresh: false,
-                                    })
-                                }
-                                Request::Load(pos, digest) => {
-                                    let page = pages.get(digest)?;
-                                    if page.sections[0].pos != pos {
-                                        return Err(Fault::invalid_data(
-                                            "loaded page position mismatch",
-                                        ));
+                while let Ok(batch) = requests.recv() {
+                    let mut completed = Vec::with_capacity(batch.len());
+                    for request in batch {
+                        let pos = match &request {
+                            Request::Save(page) => page.sections[0].pos,
+                            Request::Load(pos, _) | Request::Generate(pos, _) => *pos,
+                        };
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || -> Result<Completed, Fault> {
+                                match request {
+                                    Request::Save(page) => {
+                                        let digest = pages.put(&page)?;
+                                        Ok(Completed {
+                                            page,
+                                            digest,
+                                            load: false,
+                                            fresh: false,
+                                        })
                                     }
-                                    Ok(Completed {
-                                        page,
-                                        digest,
-                                        load: true,
-                                        fresh: false,
-                                    })
-                                }
-                                Request::Generate(pos, context) => {
-                                    let source = generator.as_ref().ok_or_else(|| {
-                                        Fault::invalid_data("generation source missing")
-                                    })?;
-                                    let page = source.generate(context, pos)?;
-                                    if page.meta != context.meta
-                                        || page.side != context.side
-                                        || page.bounds != context.bounds
-                                        || page.next_entity_id != context.next_entity_id
-                                        || !page.entities.is_empty()
-                                        || page.sections.len() != 1
-                                        || page.sections[0].pos != pos
-                                    {
-                                        return Err(Fault::invalid_data(
-                                            "generated page does not match requested context",
-                                        ));
+                                    Request::Load(pos, digest) => {
+                                        let page = pages.get(digest)?;
+                                        if page.sections[0].pos != pos {
+                                            return Err(Fault::invalid_data(
+                                                "loaded page position mismatch",
+                                            ));
+                                        }
+                                        Ok(Completed {
+                                            page,
+                                            digest,
+                                            load: true,
+                                            fresh: false,
+                                        })
                                     }
-                                    let digest = pages.digest(&page)?;
-                                    Ok(Completed {
-                                        page,
-                                        digest,
-                                        load: true,
-                                        fresh: true,
-                                    })
+                                    Request::Generate(pos, context) => {
+                                        let source = generator.as_ref().ok_or_else(|| {
+                                            Fault::invalid_data("generation source missing")
+                                        })?;
+                                        let page = source.generate(context, pos)?;
+                                        if page.meta != context.meta
+                                            || page.side != context.side
+                                            || page.bounds != context.bounds
+                                            || page.next_entity_id != context.next_entity_id
+                                            || !page.entities.is_empty()
+                                            || page.sections.len() != 1
+                                            || page.sections[0].pos != pos
+                                        {
+                                            return Err(Fault::invalid_data(
+                                                "generated page does not match requested context",
+                                            ));
+                                        }
+                                        let digest = pages.digest(&page)?;
+                                        Ok(Completed {
+                                            page,
+                                            digest,
+                                            load: true,
+                                            fresh: true,
+                                        })
+                                    }
                                 }
-                            }
-                        },
-                    ))
-                    .unwrap_or_else(|_| {
-                        Err(Fault::new(
-                            FaultCode::InvalidState,
-                            "page I/O worker panicked",
+                            },
                         ))
-                    });
-                    if results.send(result).is_err() {
+                        .unwrap_or_else(|_| {
+                            Err(Fault::new(
+                                FaultCode::InvalidState,
+                                "page I/O worker panicked",
+                            ))
+                        });
+                        let failed = result.is_err();
+                        completed.push((pos, result));
+                        if failed {
+                            break;
+                        }
+                    }
+                    if results.send(completed).is_err() {
                         break;
                     }
                 }
@@ -170,6 +194,8 @@ pub(crate) struct ResidencyScheduler {
     worker: Worker,
     busy: bool,
     ready: Option<Completed>,
+    batch_ready: Vec<(SectionPos, Result<Completed, Fault>)>,
+    batch_pages: usize,
     memory: Option<MemoryLease>,
 }
 
@@ -213,6 +239,8 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
             worker,
             busy: false,
             ready: None,
+            batch_ready: Vec::new(),
+            batch_pages: 1,
             memory: None,
         });
         Ok(())
@@ -237,8 +265,29 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         self.residency.as_ref().map(|scheduler| &scheduler.desired)
     }
 
-    /// At most one publication or one dispatch per call; never waits for a page operation.
-    /// An I/O failure leaves authority unchanged and permits the next call to retry.
+    /// Opt into at most 1024 prepared load/install pages per dispatch and durable
+    /// batch. max_io_bytes still caps the entire batch, including worker results.
+    /// Configure only when idle; default remains the original one-page path.
+    pub fn set_residency_batch_pages(&mut self, pages: usize) -> Result<(), Fault> {
+        self.authority()?;
+        if !(1..=1024).contains(&pages) {
+            return Err(Fault::invalid_data("residency batch pages must be 1..1024"));
+        }
+        let scheduler = self
+            .residency
+            .as_mut()
+            .ok_or_else(|| Fault::invalid_data("residency is not configured"))?;
+        if !scheduler.is_idle() {
+            return Err(Fault::invalid_data("page I/O is in flight"));
+        }
+        scheduler.batch_pages = pages;
+        Ok(())
+    }
+
+    /// One bounded dispatch or publication batch per call. Page reads/decoding
+    /// never block this call; accepting ready pages waits for its final durable
+    /// barrier. Default is one page. Page preparation failures are retryable;
+    /// journal write/sync failures stop the host and require recovery.
     pub fn poll_residency(
         &mut self,
         sink: &mut impl InvalidationSink,
@@ -272,7 +321,7 @@ fn interests(
 
 impl ResidencyScheduler {
     pub(crate) fn is_idle(&self) -> bool {
-        !self.busy && self.ready.is_none()
+        !self.busy && self.ready.is_none() && self.batch_ready.is_empty()
     }
     fn poll<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>(
         &mut self,
@@ -302,13 +351,17 @@ impl ResidencyScheduler {
         }
         if self.busy {
             match self.worker.receiver.try_recv() {
-                Ok(result) => {
+                Ok(mut results) => {
                     self.busy = false;
-                    match result {
-                        Ok(completed) => self.ready = Some(completed),
-                        Err(error) => {
-                            self.memory = None;
-                            return Err(error);
+                    if self.batch_pages > 1 {
+                        self.batch_ready = results;
+                    } else {
+                        match results.pop().expect("nonempty worker response").1 {
+                            Ok(completed) => self.ready = Some(completed),
+                            Err(error) => {
+                                self.memory = None;
+                                return Err(error);
+                            }
                         }
                     }
                 }
@@ -322,6 +375,51 @@ impl ResidencyScheduler {
                     ));
                 }
             }
+        }
+        if !self.batch_ready.is_empty() {
+            if !server.authority.residency_ready(false) {
+                return Ok(ResidencyProgress::Pending);
+            }
+            let mut ready = Vec::new();
+            let mut failure = None;
+            for (pos, result) in std::mem::take(&mut self.batch_ready) {
+                match result {
+                    Ok(page) => {
+                        let pos = page.page.sections[0].pos;
+                        if (page.load && required.contains(&pos))
+                            || (!page.load && !required.contains(&pos) && !tickets.global)
+                        {
+                            ready.push(page);
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some((pos, error));
+                        break;
+                    }
+                }
+            }
+            let applied = server.apply_residency_batch(&self.pages, ready, sink);
+            if applied.is_err() {
+                self.memory = None;
+            }
+            let (mut report, retry) = applied?;
+            self.batch_ready = retry
+                .into_iter()
+                .map(|page| (page.page.sections[0].pos, Ok(page)))
+                .collect();
+            // The ordered worker stops at its first error. The next poll retries
+            // desired missing pages; earlier successful pages are already durable.
+            if let Some((pos, error)) = failure {
+                if !self.batch_ready.is_empty() {
+                    self.batch_ready.push((pos, Err(error)));
+                } else if report.failure.is_none() && report.blocked.is_none() {
+                    report.failure = Some((pos, error));
+                }
+            }
+            if self.batch_ready.is_empty() {
+                self.memory = None;
+            }
+            return Ok(ResidencyProgress::Batch(report));
         }
         if let Some(completed) = self.ready.take() {
             let pos = completed.page.sections[0].pos;
@@ -377,6 +475,18 @@ impl ResidencyScheduler {
         if charge > self.config.max_io_bytes {
             return Ok(ResidencyProgress::BudgetBlocked);
         }
+        let page_count = self
+            .batch_pages
+            .min((self.config.max_io_bytes / charge) as usize)
+            .min(
+                self.config
+                    .max_resident
+                    .saturating_sub(server.authority.world().store().len())
+                    .max(1),
+            );
+        let charge = charge
+            .checked_mul(page_count as u64)
+            .ok_or_else(|| Fault::resource_limit("batch page reservation overflow"))?;
         let memory = if let Some(pool) = server.authority.memory_pool() {
             match pool.reserve(MemoryClass::Codec, charge, EvictionRank::Pinned) {
                 Ok(lease) => Some(lease),
@@ -425,11 +535,38 @@ impl ResidencyScheduler {
             } else {
                 return Ok(ResidencyProgress::Idle);
             };
+        let loading = matches!(&request, Request::Load(..) | Request::Generate(..));
+        let mut batch = vec![request];
+        if loading {
+            for pos in required
+                .iter()
+                .filter(|pos| world.store().section(**pos).is_none())
+                .skip(1)
+                .take(page_count.saturating_sub(1))
+                .copied()
+            {
+                if let Some(page) = server.authority.parked_sections().get(&pos) {
+                    batch.push(Request::Load(pos, page.digest));
+                } else if self.generator.is_some() {
+                    batch.push(Request::Generate(
+                        pos,
+                        GenerationContext {
+                            meta: torse_sim::streaming::page_meta(world),
+                            side: world.store().side(),
+                            bounds: world.store().bounds(),
+                            next_entity_id: world.entities().next_entity_id(),
+                        },
+                    ));
+                } else {
+                    break;
+                }
+            }
+        }
         self.worker
             .sender
             .as_ref()
             .expect("live worker")
-            .try_send(request)
+            .try_send(batch)
             .map_err(|_| Fault::new(FaultCode::StorageUnavailable, "page I/O queue unavailable"))?;
         self.busy = true;
         self.memory = memory;
