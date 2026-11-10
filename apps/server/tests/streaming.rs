@@ -1,5 +1,8 @@
 //! Persistent section residency, entity identity, replica control, and page integrity.
+#[path = "support/streaming.rs"]
+mod fixture;
 mod support;
+use fixture::*;
 use support::Directory;
 use torse_codec::{StorageCodec, wire, wire::Wire};
 use torse_server::{bootstrap as base, execution::*, section_pages::SectionPages, *};
@@ -311,12 +314,6 @@ fn real_process_exit_before_and_after_unload_recovers_only_durable_residency() {
     }
 }
 
-fn pages(dir: &Directory) -> SectionPages {
-    let root = dir.0.join("sections");
-    std::fs::create_dir_all(&root).unwrap();
-    SectionPages::new(root, base::budget(), base::codec_limits(), 64).unwrap()
-}
-
 #[test]
 fn page_collection_traces_parked_checkpoints_and_replay_before_removing_orphans() {
     let dir = Directory::new();
@@ -387,71 +384,7 @@ fn page_collection_validates_every_root_and_filename_before_any_deletion() {
     assert_eq!(pages.collect(&BTreeSet::new()).unwrap().removed_pages, 1);
     assert_eq!(pages.collect(&BTreeSet::new()).unwrap().removed_pages, 0);
 }
-fn create(dir: &Directory) -> base::Files {
-    let (mut world, actions) = base::world().unwrap();
-    let schemas = world.schemas().clone();
-    let handle = world.entities().iter().next().unwrap().0;
-    world
-        .entities_mut()
-        .components_mut(handle)
-        .unwrap()
-        .insert(
-            &schemas,
-            &collider_schema(),
-            EntityCollider::Box {
-                half: [300_000, 900_000, 300_000],
-            }
-            .fields(),
-        )
-        .unwrap();
-    let compatibility = world.coordinator().compatibility();
-    base::Files::create_file(
-        dir.acquire(),
-        compatibility,
-        base::Codec::new(base::codec_limits()).unwrap(),
-        base::file_policy(),
-        |binding| {
-            ExecutionHost::new(
-                binding,
-                world,
-                actions,
-                Vec::new(),
-                base::execution_limits(),
-            )
-        },
-    )
-    .unwrap()
-}
-fn open(dir: &Directory, pages: SectionPages) -> Result<base::Files, Fault> {
-    let (world, actions) = base::world().unwrap();
-    base::Files::open_file(
-        dir.acquire(),
-        world.coordinator().compatibility(),
-        base::Codec::new(base::codec_limits()).unwrap(),
-        base::file_policy(),
-        |binding| {
-            Ok(ExecutionRecovery::new(
-                binding,
-                world.registry(),
-                world.schemas(),
-                actions,
-                Vec::new(),
-                base::execution_limits(),
-            )
-            .with_section_pages(pages))
-        },
-    )
-}
-fn generated(world: &WorldAuthority, pos: SectionPos) -> Snapshot {
-    let mut page = world
-        .capture_section(SectionPos::ZERO, base::budget())
-        .unwrap();
-    page.sections[0].pos = pos;
-    page.sections[0].cells = SnapshotCells::Uniform(BlockStateId::EMPTY);
-    page.entities.clear();
-    page.states.clear();
-    page
-}
+
 fn durable(step: CommitStep) {
     assert!(matches!(step, CommitStep::Durable(_)));
 }
@@ -602,14 +535,8 @@ fn generated_entities_allocate_atomically_and_survive_journal_and_page_recovery(
     let pages = pages(&dir);
     let mut server = create(&dir);
     let pos = SectionPos::new(2, 0, 0);
-    let mut page = generated(server.authority().unwrap().world(), pos);
-    let next = page.next_entity_id;
-    page.entities.push(SnapshotEntity {
-        id: EntityId(next),
-        position_bits: Position::new(33.5, 1.5, 1.5).to_bits(),
-        components: Vec::new(),
-    });
-    page.next_entity_id = next + 1;
+    let page = generated_with_entity(server.authority().unwrap().world(), pos);
+    let next = page.entities[0].id.0;
     let mut invalid = page.clone();
     invalid.entities[0].id = EntityId(next - 1);
     assert!(

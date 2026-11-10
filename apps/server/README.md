@@ -158,7 +158,7 @@ NetworkHub通过应用协议版本5接收意图，可信actor由PeerPolicy和会
 
 权威线程在发布每页前重新核对当前意向、停放引用、修订与实体身份。已解码但暂存槽不足的剩余页保留在原预留内，下次poll继续，避免重读；每次调用最多处理已配置的页数，在日志容量允许时共用一次耐久屏障。默认单页仍返回Published；显式批量返回Batch，其中committed列出已确认分区、durability为该前缀进度，blocked或failure给出终止原因。损坏或过期准备结果可由后续意向重新选择；日志写入或sync错误停止宿主，须重新打开恢复实际完整日志前缀，不能原地重试或宣称整批回滚。
 
-后台生成仍只接受不带实体的地形页。生成游标若因外部提交过期则重试；同一批次自身接受的前缀允许更新页的生成切面，再重算摘要，继续沿用原有逐页校验和恢复格式。带新实体的可信安装继续使用`install_section`。页面准备不阻塞poll，但接受已准备页会等待该批耐久确认；较大批次可能推迟首批可用时间，不能承诺所有延迟同时改善。
+后台生成仍只接受不带实体的地形页。生成游标若因外部提交过期则重试；同一批次自身接受的前缀允许更新页的生成切面，再重算摘要，继续沿用原有逐页校验和恢复格式。带新实体的可信安装可使用单页`install_section`或下述可信批量入口。页面准备不阻塞poll，但接受已准备页会等待该批耐久确认；较大批次可能推迟首批可用时间，不能承诺所有延迟同时改善。
 
 `cargo run --release -p torse-server --example residency_baseline --locked -- .work/residency-run`复用公开文件夹具，对照24次`install_section`/`reload_section`与批量调度，输出同步请求、首批/全部可用时间、最长调用及状态和日志一致性结果。可加`--batch-first`交替顺序。backend_sync_calls留空，表示未测实际后端同步；请求次数不解释为磁盘操作次数。测试覆盖24页、字节预算缩批、兴趣改变、过期结果、损坏页、部分append与sync失败恢复。
 
@@ -172,6 +172,18 @@ NetworkHub通过应用协议版本5接收意图，可信actor由PeerPolicy和会
 | 批量重载 | 3.464至4.884 | 4.882至7.149 | 0.327至0.842 |
 
 本夹具中批量减少全量等待，但重载首批延迟明显增加，因为Worker先准备整个派发批次。最长调用区间重叠，不宣称普遍改善尾延迟；复杂地形、带实体生成、冷缓存、其他平台和硬件断电不在测量范围。重跑入口为`python apps/server/examples/residency_baseline/repeat.py --binary <release-example> --output <new-archive> --work <new-fixtures> --build <build-commit>`；原始大状态和日志保留在work目录，归档只保存样本、环境与校验哈希。
+
+## 带实体的可信批量安装
+
+宿主预先准备的页面可通过`begin_section_installs(pages, snapshots, SectionInstallLimits { max_pages, max_bytes })`创建安装批次，再重复调用`install_sections(&mut batch, sink)`。页数上限为1至1024；字节预算覆盖保留输入及工作缓冲的保守逻辑计费，共享MemoryPool会在构造前预留该上限，随批次句柄释放。它不是实际RSS测量。所有输入必须来自当前同一生成切面且位置不重复，后台GenerationSource仍只支持无实体地形，不隐式改变后台调度契约。
+
+输入快照中的实体ID解释为各自页内的非零有序临时符号。每页提交前，权威线程从当前分配器续号，重写实体及嵌套List/Record中的页内引用，再按原有内容、组件、位置和驻留规则校验。输入的next_entity_id不是最终编号来源；跨页或指向既有实体的引用暂不支持并明确拒绝。成功返回的InstalledSection含提交游标和临时ID到持久ID的映射。
+
+日志容量可缩短单次接受前缀；成功调用共享一次耐久屏障，返回installed、durability、remaining及blocked/failure。日志背压保留未接受的原始页，重试时重新依据当前分配器准备，不消耗ID；非法页终止在该页，先确认此前前缀。批次外的权威提交或运行代数改变返回ResetRequired，宿主须明确放弃旧批次并重新准备。into_remaining可取回未接受输入，其后生命周期和预算归调用方。
+
+append/sync失败停止宿主。batch.accepted列出已被内存权威接受的页，batch.durability仅代表最近成功确认的耐久水位；失败时不能把accepted全当作已耐久，也不能假定未确认部分全部回滚。必须重新打开目录，按实际完整日志前缀恢复页面与实体分配器，不把旧句柄接到新宿主上重试。测试覆盖24页背压续传、非法页前缀、外部推进、内存预留释放、部分append、sync确认失败，以及确认4页后强制终止子进程再续传。未进行硬件断电验收，不改变存档或协议格式。
+
+公开streaming实体夹具的六个独立release进程交替执行两种顺序，24页、每页1实体。逐页/批量同步请求为24/6，总确认耗时区间为6.112–9.017/1.885–2.614毫秒，中位为6.999/2.274毫秒；批量总耗时包含句柄构造和输入预检。Windows 26200、Rust 1.93.1、日志暂存上限4条，批次逻辑预算8MiB，未附加共享MemoryPool。完整状态、实体编号、日志字节及重开结果一致，跨进程哈希相同。未测后端真实sync调用，不推广到复杂组件、冷缓存或其他硬件。样本见[可信安装归档](../../benchmarks/archive/residency/trusted-20261110/environment.json)，入口为`cargo build --release -p torse-server --example trusted_install_baseline --locked`及`python apps/server/examples/trusted_install_baseline/repeat.py --binary <release-example> --output <new-archive> --work <new-fixtures> --build <build-commit>`。
 
 ## 联网玩家
 

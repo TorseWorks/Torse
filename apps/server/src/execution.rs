@@ -28,6 +28,8 @@ use runtime_budget::RuntimeBudget;
 #[path = "prevalidation.rs"]
 mod prevalidation;
 pub use prevalidation::{PrevalidationConfig, PrevalidationStats};
+#[path = "installs.rs"]
+pub mod installs;
 #[path = "execution_memory.rs"]
 mod memory;
 #[path = "player_control.rs"]
