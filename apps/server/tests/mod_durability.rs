@@ -1005,7 +1005,7 @@ fn ui_connect(
 fn ui_view(mirror: &ReplicaMirror, machine: EntityId) -> Option<MachineView> {
     MachineView::rebuild(&machine_ui(), machine, |id, schema| {
         mirror
-            .state
+            .state()
             .entities
             .iter()
             .find(|entity| entity.id == id)?
@@ -1049,7 +1049,7 @@ fn machine_ui_two_clients_authorization_dedup_and_new_baseline() {
     assert!(ui_view(&private, machine).is_none());
     assert!(
         private
-            .state
+            .state()
             .entities
             .iter()
             .all(|entity| entity.components.is_empty())
