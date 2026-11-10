@@ -1,6 +1,6 @@
 {
-  "build": "e5f666ad2b678a1e844f7763cd3e7bf3f82be572",
-  "binary_sha256": "ffcc9238389262446873ee7ae245c17bd962c97ea6d896d4dd0ecde4aa1eea8c",
+  "build": "eb7ba3c159a5c665e73cfc47d6b14074761fc013",
+  "binary_sha256": "b9a748edbdca69d8e7c0793b4b085d2feb7ddcb8734f3c53696e4b92c42fc490",
   "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
   "platform": "Windows-11-10.0.26200-SP0",
   "cpu": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
