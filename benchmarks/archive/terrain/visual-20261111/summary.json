@@ -1,0 +1,41 @@
+{
+  "first_ready_ns": {
+    "median": 223850.0,
+    "p95": 445100,
+    "max": 656900
+  },
+  "all_ready_ns": {
+    "median": 223950.0,
+    "p95": 1393200,
+    "max": 2090600
+  },
+  "max_poll_ns": {
+    "median": 11100.0,
+    "p95": 53300,
+    "max": 174700
+  },
+  "transport_bytes": {
+    "median": 9222.0,
+    "p95": 67568,
+    "max": 67568
+  },
+  "server_cache_bytes": {
+    "median": 100424.0,
+    "p95": 100424,
+    "max": 100424
+  },
+  "server_reserved_bytes": {
+    "median": 34221056.0,
+    "p95": 34221056,
+    "max": 34221056
+  },
+  "client_cache_bytes": {
+    "median": 101448.0,
+    "p95": 101448,
+    "max": 101448
+  },
+  "samples": 210,
+  "processes": 6,
+  "coverage": "8/8 all steps",
+  "simulation_sections": 2
+}

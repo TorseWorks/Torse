@@ -2308,10 +2308,10 @@ mod tests {
         let camera = crate::camera::Camera::new([40., 16., 24.], [40., 0., 8.]);
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.work/visual-gpu");
         std::fs::create_dir_all(&dir).unwrap();
-        let start = std::time::Instant::now();
         renderer.render(camera.view_projection(1.), camera.eye);
         let before = dir.join("before.png");
         renderer.save_png(before.to_str().unwrap()).unwrap();
+        let start = std::time::Instant::now();
         scene.try_apply_display(&near, &terrain, [pos]).unwrap();
         scene.refresh_meshes();
         let (vertices, indices) = scene.section_geometry(pos).unwrap();
@@ -2319,6 +2319,7 @@ mod tests {
         assert!(renderer.render(camera.view_projection(1.), camera.eye));
         let after = dir.join("after.png");
         renderer.save_png(after.to_str().unwrap()).unwrap();
+        let ready = start.elapsed();
         let a = torse_assets::texture::Atlas::decode(&std::fs::read(before).unwrap()).unwrap();
         let b = torse_assets::texture::Atlas::decode(&std::fs::read(after).unwrap()).unwrap();
         assert!(
@@ -2330,8 +2331,8 @@ mod tests {
                 > 100
         );
         println!(
-            "display mesh to offscreen readback ms={:.4}",
-            start.elapsed().as_secs_f64() * 1000.
+            "display apply, mesh, upload, offscreen readback and PNG write ms={:.4}",
+            ready.as_secs_f64() * 1000.
         );
     }
 
