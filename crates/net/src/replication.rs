@@ -84,11 +84,29 @@ impl ReplicaMirror {
         &mut self,
         batch: WorldReplicaBatch,
     ) -> Result<Vec<torse_world::PresentationEvent>, Fault> {
+        self.apply_ordered(batch, false)
+    }
+
+    /// Scope changes advance ReplicaSeq even at an unchanged world cursor.
+    /// They never replay presentation effects or relax ordinary edit ordering.
+    pub fn apply_interest(&mut self, batch: WorldReplicaBatch) -> Result<(), Fault> {
+        if !batch.changes.presentation.is_empty() {
+            return Err(invalid());
+        }
+        self.apply_ordered(batch, true).map(|_| ())
+    }
+
+    fn apply_ordered(
+        &mut self,
+        batch: WorldReplicaBatch,
+        interest: bool,
+    ) -> Result<Vec<torse_world::PresentationEvent>, Fault> {
         if batch.binding != self.binding
             || batch.subscription != self.subscription
             || batch.seq.0 != self.seq.0.checked_add(1).ok_or_else(invalid)?
             || batch.through.world != self.binding.world
-            || batch.through.seq <= self.through.seq
+            || batch.through.seq < self.through.seq
+            || (!interest && batch.through.seq == self.through.seq)
         {
             return Err(invalid());
         }

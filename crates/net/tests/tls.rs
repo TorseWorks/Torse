@@ -15,6 +15,7 @@ fn queue_diagnostics_report_application_frames_before_tls_acceptance() {
     assert!(ready(&mut server, &mut client));
     let config = QueueDiagnostics::enabled(4096).unwrap();
     client.send(vec![7; 16]).unwrap();
+    assert!(!client.output_idle());
     for _ in 0..1000 {
         let Diagnostic::Available(usage) = client.queue_diagnostics(&config) else {
             panic!("application queue unavailable")

@@ -19,6 +19,7 @@ use crate::action::{ActionTarget, ActorContext};
 use crate::{CommitFault, PrepareError, PreparedChange, Publication, Transaction, WorldAuthority};
 
 mod incremental;
+mod interest;
 use incremental::{Dirty, ProjectionCache};
 
 /// Host-approved interest. Terrain and entity presence are public within this
@@ -103,6 +104,58 @@ pub struct ReplicaSource {
 }
 
 impl ReplicaSource {
+    /// An incremental interest cut requires a live projection with no unconsumed
+    /// source batches. Hosts must reset or close if downstream output is unsafe.
+    pub fn can_change_interest(&self, viewer: Viewer) -> bool {
+        self.subscriptions
+            .values()
+            .filter(|sub| sub.viewer == viewer)
+            .all(|sub| sub.state.is_some() && sub.queue.is_empty())
+    }
+
+    /// Preserve subscription IDs and sequence normal edits and interest cuts on
+    /// the same ReplicaSeq stream. A failed multi-subscription update invalidates
+    /// every projection for this viewer; hosts must clear downstream output.
+    pub fn change_interest(
+        &mut self,
+        viewer: Viewer,
+        actor: ActorContext,
+        scope: ReplicaScope,
+        budget: OutputBudget,
+    ) -> Result<Vec<WorldReplicaBatch>, Fault> {
+        if scope.sections.len() > self.limits.max_sections {
+            return Err(Fault::resource_limit("replica interest capacity"));
+        }
+        if !self.can_change_interest(viewer) {
+            return Err(reset_required());
+        }
+        let through = CommitCursor {
+            world: self.world.world(),
+            seq: self.world.seq(),
+        };
+        let result: Result<Vec<WorldReplicaBatch>, Fault> = self
+            .subscriptions
+            .iter_mut()
+            .filter(|(_, sub)| sub.viewer == viewer)
+            .map(|(id, sub)| {
+                interest::change(
+                    &self.world,
+                    self.binding,
+                    self.limits,
+                    SubscriptionId(*id),
+                    through,
+                    sub,
+                    actor.clone(),
+                    scope.clone(),
+                    budget,
+                )
+            })
+            .collect();
+        if result.is_err() {
+            self.invalidate_viewer(viewer);
+        }
+        result
+    }
     /// Aggregate existing bounded subscription ledgers, without encoding or cloning payloads.
     pub fn queue_diagnostics(
         &self,
@@ -610,6 +663,17 @@ fn project(
     scope: &ReplicaScope,
     budget: OutputBudget,
 ) -> Result<ReplicaSnapshot, Fault> {
+    project_sections(world, actor, scope, &scope.sections, budget)
+}
+
+/// The entity range remains complete; only selected terrain is captured.
+fn project_sections(
+    world: &WorldAuthority,
+    actor: &ActorContext,
+    scope: &ReplicaScope,
+    terrain: &BTreeSet<SectionPos>,
+    budget: OutputBudget,
+) -> Result<ReplicaSnapshot, Fault> {
     let mut cost = Cost::default();
     cost.entries::<WorldReplicaSeed>(1)?;
     // Scratch follows the actual registry; enumerate only observed symbols,
@@ -627,7 +691,7 @@ fn project(
         Ok(())
     };
     // Borrow-only preflight. Inaccessible sections stay absent, never become air.
-    for &pos in &scope.sections {
+    for &pos in terrain {
         if !readable(world, pos) {
             continue;
         }
@@ -699,8 +763,7 @@ fn project(
             values: world.registry().state_values(id).unwrap_or(&[]).to_vec(),
         })
         .collect();
-    let sections = scope
-        .sections
+    let sections = terrain
         .iter()
         .copied()
         .filter(|pos| readable(world, *pos))

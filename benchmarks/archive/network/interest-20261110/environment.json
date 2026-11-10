@@ -1,0 +1,11 @@
+{
+  "build": "da1853afaccdc4c47bf410cfe2af971903d7fb60",
+  "binary_sha256": "28caf87399ab2d18ea0b99b0027a1fde7c492df4adce5ffd1f33860b3e9bdc83",
+  "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "cpu": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+  "logical_cpus": 32,
+  "sections": 256,
+  "overlap": 224,
+  "scope": "file-backed fixed world, memory transport; encoded bodies exclude TCP/TLS framing; host call excludes mirror validation"
+}

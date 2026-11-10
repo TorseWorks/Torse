@@ -88,6 +88,52 @@ impl<T: Transport> NetworkHub<T> {
         if peer.follow_ready {
             return Ok(());
         }
+        let scope = peer.follow_scope.as_ref().expect("selected follow scope");
+        let all_ready = scope.sections.iter().all(|pos| {
+            server
+                .authority()
+                .expect("live server")
+                .world()
+                .store()
+                .section(*pos)
+                .is_some()
+        });
+        if all_ready && !peer.subscriptions.is_empty() {
+            // The approved grants are unchanged during movement. Send preceding
+            // ordinary updates in order, then the same-stream interest cut.
+            let mut continuous = true;
+            for id in peer.subscriptions.iter().copied().collect::<Vec<_>>() {
+                match server.take_replica(SubscriptionId(id), limits.budget) {
+                    Ok(batches) => {
+                        for batch in batches {
+                            Self::send(peer, ServerMessage::Batch(batch), limits)?;
+                        }
+                    }
+                    Err(error) if error.code == FaultCode::ResetRequired => {
+                        continuous = false;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let scope = peer
+                .follow_scope
+                .as_ref()
+                .expect("selected follow scope")
+                .clone();
+            if continuous {
+                for batch in server.change_session_interest(
+                    viewer.session,
+                    peer.policy.actor.clone(),
+                    scope,
+                    limits.budget,
+                )? {
+                    Self::send(peer, ServerMessage::Interest(batch), limits)?;
+                }
+                peer.follow_ready = true;
+                return Ok(());
+            }
+        }
         // Retire the old projection before the residency union can evict it.
         // A failed seed retains the new intention and never replays movement.
         for old in std::mem::take(&mut peer.subscriptions) {

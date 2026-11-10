@@ -416,7 +416,7 @@ fn rejected_scope_replacement_retains_authority_and_live_replica_queues() {
 }
 
 #[test]
-fn network_scope_replacement_reseeds_and_keeps_the_session_alive() {
+fn network_scope_replacement_updates_interest_and_keeps_the_session_alive() {
     use torse_sim::replica::ReplicaScope;
     let dir = Directory::new();
     let mut server = create(&dir, Vec::new());
@@ -432,7 +432,8 @@ fn network_scope_replacement_reseeds_and_keeps_the_session_alive() {
         },
     );
     hub.poll(&mut server).unwrap();
-    let old = seed(receive(&mut client));
+    let mut fresh = seed(receive(&mut client));
+    let old_subscription = fresh.subscription;
     let far = ReplicaScope {
         sections: [SectionPos::new(1, 0, 0)].into(),
     };
@@ -445,16 +446,25 @@ fn network_scope_replacement_reseeds_and_keeps_the_session_alive() {
         },
     )
     .unwrap();
-    let fresh = seed(receive(&mut client));
-    assert_ne!(fresh.subscription, old.subscription);
+    let batch = receive(&mut client)
+        .into_iter()
+        .find_map(|message| {
+            if let ServerMessage::Interest(batch) = message {
+                Some(batch)
+            } else {
+                None
+            }
+        })
+        .expect("interest increment");
+    assert_eq!(batch.subscription, old_subscription);
+    fresh.apply_interest(batch).unwrap();
     assert_eq!(fresh.state.sections.len(), 1);
     assert!(fresh.state.entities.is_empty());
-    assert_eq!(
+    assert!(
         server
-            .take_replica(old.subscription, base::budget())
-            .unwrap_err()
-            .code,
-        FaultCode::ResetRequired
+            .take_replica(old_subscription, base::budget())
+            .unwrap()
+            .is_empty()
     );
     let oversized = ReplicaScope {
         sections: (0..5).map(|x| SectionPos::new(x, 0, 0)).collect(),
@@ -923,6 +933,10 @@ fn heartbeat_before_hello_and_old_or_future_protocols_cannot_hold_a_peer_slot() 
             compatibility: server.binding().compatibility,
         },
         ClientMessage::Hello {
+            version: 4,
+            compatibility: server.binding().compatibility,
+        },
+        ClientMessage::Hello {
             version: PROTOCOL_VERSION + 1,
             compatibility: server.binding().compatibility,
         },
@@ -946,7 +960,7 @@ fn heartbeat_before_hello_and_old_or_future_protocols_cannot_hold_a_peer_slot() 
 
 #[test]
 fn heartbeat_tag_appends_to_wire_v1_and_idle_timing_has_three_interval_margin() {
-    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(PROTOCOL_VERSION, 5);
     let mut bytes = Vec::new();
     wire::encode(
         &ClientMessage::Ping,

@@ -6,6 +6,16 @@
 
 主程序通过`--memory-mib N`设置共享逻辑内存上限，默认512MiB。世界、执行、存储、订阅、传输和并行工作使用同一MemoryPool；预算不足暂停可重试工作，提交序号保持不变，关闭控制消息保留专用空间。库宿主在恢复后、注册会话前调用`Server::attach_memory`，并使用`NetworkHub::with_memory`。预留口径、失败释放及不包含的内存范围见[共享内存记录](../../benchmarks/archive/performance/M6-shared-memory.md)。
 
+## 兴趣范围增量
+
+应用协议5的`Interest`与普通`Batch`共享订阅序号，允许在同一耐久游标连续切换。保留区域的未变地形直接复用，进入区域与实体字段按当前授权投影；重复、缺失、乱序更新返回`ResetRequired`。初次订阅和`NetworkHub::reset_policy`继续发送完整`Seed`。传输未排空时修改策略会关闭连接并要求重连，详情见[协议格式](../../crates/protocol/FORMAT.md#兴趣范围切换)。客户端与服务端须同时升级，不改变存档格式。
+
+公开文件夹具比较256分区、224分区重叠窗口，六个独立release进程交替执行两种顺序，共72次切换。每次客户端镜像都与新生成的完整授权快照逐项相等，两条路径和各进程的状态字节哈希一致。完整Seed每次包含256页及224页交集地形，Interest只包含32页进入地形，交集地形载荷为零。
+
+Windows 26200、Rust 1.93.1上，Seed正文为138208–138551字节，Interest为1856–2167字节。宿主切换调用耗时分别为0.273–0.451毫秒（中位0.346）与0.046–0.136毫秒（中位0.063）。该固定、热缓存夹具包含少量实体和非空地形；内存传输测量不含TCP/TLS帧头、Socket I/O、客户端应用和完整快照对照耗时，不代表复杂实体或冷缓存负载。
+
+原始样本、环境与状态哈希见[测量归档](../../benchmarks/archive/network/interest-20261110/environment.json)。重跑：`cargo build --release -p torse-server --example interest_baseline --locked`，随后`python apps/server/examples/interest_baseline/repeat.py --binary <release-example> --output <new-archive> --work <new-fixtures> --build <build-commit>`。大状态字节只保留在work目录，归档保存样本和哈希。
+
 ## 队列与进度诊断
 
 库宿主向`Server::queue_diagnostics`、`NetworkHub::queue_diagnostics`或`peer_queue_diagnostics`传入`torse_types::QueueDiagnostics`读取已有账目。默认配置返回`NotEnabled`；显式使用`QueueDiagnostics::enabled(4096)?`启用一次读取，参数限制返回值的固定尺寸，包含外层`Diagnostic`，合法范围为1字节至1MiB。尺寸不足返回`BudgetUnavailable`。这些接口不分配快照缓冲、不保存历史、不增加生产路径计数器或时钟；调用方保留的副本、序列化和导出内存由调用方管理，不属于内核预留。
@@ -47,7 +57,7 @@ NetworkHub按已有连接ID读取单个连接，汇总连接数包含尚待正�
 
 `--players N --follow-radius R`按玩家已持久提交的位置更新水平兴趣窗口，`R`范围为0到64；省略`--follow-radius`时保留原固定订阅行为。API使用`NetworkHub::enable_player_follow`，必须在接纳连接前启用，并先装配服务端驻留调度器。窗口始终是用户批准范围的子集，按距离选择垂直分区并受数量上限约束，不扩大actor权限或用户授权。
 
-范围变化后，网络层替换会话的兴趣范围、重建基线，并把需要的分区合并到驻留意向。预算或来源暂时不可用时等待后续轮询。没有绑定玩家的观察者仍使用显式订阅。默认演示仅在已有有限世界中运行，不会因窗口移动而自动注册无限地形生成器。
+范围变化后，已驻留窗口通过Interest保留订阅身份，只传进入分区、移除记录和受影响实体；需要加载新分区时重建基线，并把需要的分区合并到驻留意向。预算或来源暂时不可用时等待后续轮询。没有绑定玩家的观察者仍使用显式订阅。默认演示仅在已有有限世界中运行，不会因窗口移动而自动注册无限地形生成器。
 
 ## 串行计时
 
@@ -124,7 +134,7 @@ cargo test -p torse-server --test event_budget --locked
 
 WorkPlan支持携带TransactionGroup。Mod机器自有状态与库存规划器返回的事务按来源组成一个任务，连同新唤醒共同预留、发布和刷盘。冻结任务保存稳定成员，恢复不重跑已规划或已结算的Guest。库存拒绝保留机器完成前的进度，不登记该计划的新唤醒；陷阱重试次数由持久事件载荷记录，停机以没有后续唤醒表示。ModStats只供诊断，不影响恢复后的执行。验证见[Mod原子执行](../../benchmarks/archive/mods/M4-mod-atomic.md)。
 
-持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本3、读版本1至3，快照写版本2、读版本1和2，应用协议为版本3。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。主程序仍使用有限范围，显式装卸接口另见下文，未进行硬件断电验收。
+持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本3、读版本1至3，快照写版本2、读版本1和2，应用协议为版本5。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。主程序仍使用有限范围，显式装卸接口另见下文，未进行硬件断电验收。
 
 ## 运行态与批量刷盘
 
@@ -138,7 +148,7 @@ Server的Tick驱动默认每批1条，可用`set_commit_batch_limit`设置1到10
 
 复现对照与故障验证见[运行态与批量提交](../../benchmarks/archive/performance/M6-runtime-commit.md)。当前简单事务的并行预验证实验未显示收益，因此继续使用串行事务准备与发布。
 
-NetworkHub通过应用协议版本3接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线、增量及移动确认都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权镜像、编辑请求、独立移动输入和预测校正。双向TLS与按用户授权已接入，明文演示限制在回环地址。
+NetworkHub通过应用协议版本5接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线、增量及移动确认都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权镜像、编辑请求、独立移动输入和预测校正。双向TLS与按用户授权已接入，明文演示限制在回环地址。
 
 ## 批量驻留
 
@@ -169,7 +179,7 @@ NetworkHub通过应用协议版本3接收意图，可信actor由PeerPolicy和会
 
 服务端每50毫秒最多结算一步，水平速度4.3格每秒，重力28格每平方秒，起跳速度8.4格每秒，终端下落速度64格每秒。方向归一化，客户端时间提示不改变步长；静默输入继续重力，结算拒绝保持原位并要求校正。碰撞体和地形读取冻结为前置条件，位置和垂直速度在同一事务中提交。断线、运行代数变化及批准范围收缩会在冻结任务提交前再校验。
 
-输入、传输、执行任务和回执分别受各自预算限制，存储阻塞不会推进输入确认水位，刷盘失败会关闭输出入口。授权范围更新复用`replace_policy`重建基线，玩家移动序号继续递增。参数、限制及复现结果见[权威移动验证](../../benchmarks/archive/network/M5-authoritative-movement.md)。
+输入、传输、执行任务和回执分别受各自预算限制，存储阻塞不会推进输入确认水位，刷盘失败会关闭输出入口。授权范围更新复用`replace_policy`，空闲连接及已排空的源投影使用增量；显式`reset_policy`或源投影失效使用完整基线。待发传输数据会触发关闭并要求重连，防止撤权后发送旧授权数据。玩家移动序号继续递增。参数、限制及复现结果见[权威移动验证](../../benchmarks/archive/network/M5-authoritative-movement.md)。
 
 ## 本地世界示例
 

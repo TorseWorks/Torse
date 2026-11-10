@@ -4,10 +4,10 @@ use torse_world::{BlockStateId, Section};
 
 #[derive(Default)]
 pub(super) struct ProjectionCache {
-    valid: bool,
-    cost: Cost,
-    states: Cost,
-    counts: BTreeMap<BlockStateId, u64>,
+    pub(super) valid: bool,
+    pub(super) cost: Cost,
+    pub(super) states: Cost,
+    pub(super) counts: BTreeMap<BlockStateId, u64>,
 }
 impl ProjectionCache {
     pub(super) fn new(snapshot: &ReplicaSnapshot) -> Result<Self, Fault> {

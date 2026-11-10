@@ -35,6 +35,11 @@ impl TransportLimits {
     }
 }
 pub trait Transport {
+    /// No retained application/TLS output remains. Bytes already accepted by
+    /// the socket or peer are outside this cut. Unknown adapters return false.
+    fn output_idle(&self) -> bool {
+        false
+    }
     /// Observe existing buffers only. Implementations must not poll, encode or perform I/O.
     /// Custom adapters remain source-compatible and explicitly unsupported by default.
     /// Read existing queues without I/O, allocation, consumption or blocking waits.
@@ -101,6 +106,11 @@ impl MemoryTransport {
     }
 }
 impl Transport for MemoryTransport {
+    fn output_idle(&self) -> bool {
+        self.output
+            .try_lock()
+            .is_ok_and(|q| !q.closed && q.frames.is_empty())
+    }
     fn queue_diagnostics(&self, config: &QueueDiagnostics) -> Diagnostic<TransportQueues> {
         if let Err(reason) = config.check::<TransportQueues>() {
             return Diagnostic::Unavailable(reason);
@@ -336,6 +346,15 @@ fn io_fault(e: std::io::Error) -> Fault {
     Fault::new(FaultCode::InvalidState, format!("transport I/O: {e}"))
 }
 impl Transport for TcpTransport {
+    fn output_idle(&self) -> bool {
+        !self.closed
+            && self.output.is_empty()
+            && self.offset == 0
+            && self
+                .tls
+                .as_ref()
+                .is_none_or(|tls| !tls.connection.wants_write())
+    }
     fn queue_diagnostics(&self, config: &QueueDiagnostics) -> Diagnostic<TransportQueues> {
         if let Err(reason) = config.check::<TransportQueues>() {
             return Diagnostic::Unavailable(reason);
