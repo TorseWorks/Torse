@@ -76,12 +76,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if mode == "seed" { (256, 224) } else { (32, 0) }
             );
             assert_eq!(
-                mirror.state,
-                fixture::reference(&mut server, fixture::actor(), fixture::scope(start))
+                mirror.state(),
+                &fixture::reference(&mut server, fixture::actor(), fixture::scope(start))
             );
             let mut state = Vec::new();
             wire::encode(
-                &mirror.state,
+                mirror.state(),
                 &mut state,
                 base::budget(),
                 base::codec_limits(),

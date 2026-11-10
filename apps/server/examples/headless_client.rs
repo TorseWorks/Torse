@@ -75,22 +75,22 @@ fn run() -> Result<(), Fault> {
                     println!(
                         "baseline={} sections={} entities={} component_sets={}",
                         replica.through.seq.0,
-                        replica.state.sections.len(),
-                        replica.state.entities.len(),
+                        replica.state().sections.len(),
+                        replica.state().entities.len(),
                         replica
-                            .state
+                            .state()
                             .entities
                             .iter()
                             .map(|e| e.components.len())
                             .sum::<usize>()
                     );
-                    for entity in &replica.state.entities {
+                    for entity in &replica.state().entities {
                         if let Some(view) = torse_mod_api::ui::MachineView::rebuild(
                             &torse_mod_api::ui::machine(),
                             entity.id,
                             |id, schema| {
                                 replica
-                                    .state
+                                    .state()
                                     .entities
                                     .iter()
                                     .find(|e| e.id == id)?

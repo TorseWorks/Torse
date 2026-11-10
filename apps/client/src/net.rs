@@ -127,7 +127,7 @@ impl<T: Transport> Connection<T> {
         Ok(())
     }
     pub fn snapshot(&self) -> Option<&ReplicaSnapshot> {
-        self.mirror.as_ref().map(|mirror| &mirror.state)
+        self.mirror.as_ref().map(ReplicaMirror::state)
     }
 
     /// Start the handshake with the shared content compatibility.
@@ -555,19 +555,21 @@ mod tests {
                 content_digest: Digest([0; 32]),
             },
         };
-        connection.mirror = Some(ReplicaMirror {
-            binding,
-            subscription: SubscriptionId(7),
-            through: CommitCursor::initial(binding.world),
-            seq: ReplicaSeq(0),
-            state: ReplicaSnapshot {
-                side: 16,
-                bounds: torse_world::WorldBounds::new(0, 32).unwrap(),
-                states: Vec::new(),
-                sections: Vec::new(),
-                entities: Vec::new(),
-            },
-        });
+        connection.mirror = Some(
+            ReplicaMirror::from_seed(torse_sim::replica::WorldReplicaSeed {
+                binding,
+                subscription: SubscriptionId(7),
+                baseline: CommitCursor::initial(binding.world),
+                state: ReplicaSnapshot {
+                    side: 16,
+                    bounds: torse_world::WorldBounds::new(0, 32).unwrap(),
+                    states: Vec::new(),
+                    sections: Vec::new(),
+                    entities: Vec::new(),
+                },
+            })
+            .unwrap(),
+        );
         connection.subscribe(vec![SectionPos::ZERO]).unwrap();
         assert!(matches!(
             wire::decode::<ClientMessage>(
