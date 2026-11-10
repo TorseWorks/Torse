@@ -19,13 +19,7 @@ fn copy_batch(
     }
 }
 fn copy_mirror(mirror: &torse_net::ReplicaMirror) -> torse_net::ReplicaMirror {
-    torse_net::ReplicaMirror {
-        binding: mirror.binding,
-        subscription: mirror.subscription,
-        through: mirror.through,
-        seq: mirror.seq,
-        state: mirror.state.clone(),
-    }
+    mirror.clone()
 }
 
 #[test]
@@ -80,12 +74,15 @@ fn overlap_256_sections_preserves_224_terrain_payloads_and_matches_full_snapshot
             missing.apply_interest(gap).unwrap_err().code,
             FaultCode::ResetRequired
         );
-        assert_eq!(missing.state, before.state);
+        assert_eq!(missing.state(), before.state());
         mirror.apply_interest(copy_batch(&batch)).unwrap();
         let after = copy_mirror(&mirror);
         assert!(mirror.apply_interest(batch).is_err());
-        assert_eq!(mirror.state, after.state);
-        assert_eq!(mirror.state, reference(&mut server, actor(), scope(start)));
+        assert_eq!(mirror.state(), after.state());
+        assert_eq!(
+            mirror.state(),
+            &reference(&mut server, actor(), scope(start))
+        );
     }
 }
 
@@ -121,7 +118,7 @@ fn tightening_grants_with_pending_transport_output_closes_and_purges() {
     use torse_net::Transport;
     assert!(client.receive().is_err());
     let (_, _fresh_client, fresh, _) = attach(&mut hub, &mut server, scope(0));
-    assert_eq!(fresh.state.sections.len(), 256);
+    assert_eq!(fresh.state().sections.len(), 256);
 }
 
 #[test]
@@ -169,7 +166,7 @@ fn ordinary_scope_change_defers_pending_output_then_applies_once() {
     );
     assert!(drain(&mut client).0.is_empty());
     assert_eq!(mirror.seq, seq);
-    assert_eq!(mirror.state, reference(&mut server, actor(), scope(0)));
+    assert_eq!(mirror.state(), &reference(&mut server, actor(), scope(0)));
 }
 
 #[test]
@@ -218,7 +215,7 @@ fn ordinary_change_waits_for_source_edits_and_rejects_invalid_projections() {
         panic!("ordered interest")
     };
     mirror.apply_interest(batch).unwrap();
-    assert_eq!(mirror.state, reference(&mut server, actor(), scope(32)));
+    assert_eq!(mirror.state(), &reference(&mut server, actor(), scope(32)));
     server
         .change_session_interest(
             SessionId(1),
@@ -249,7 +246,7 @@ fn ordinary_edits_and_interest_cuts_share_sequence_and_recheck_retained_entity_g
     let (mut hub, id, mut client, mut mirror, _) = connect(&mut server, scope(0));
     assert!(
         mirror
-            .state
+            .state()
             .entities
             .iter()
             .any(|entity| !entity.components.is_empty())
@@ -289,7 +286,7 @@ fn ordinary_edits_and_interest_cuts_share_sequence_and_recheck_retained_entity_g
         }
     }
     assert!(saw_edit);
-    assert_eq!(mirror.state, reference(&mut server, actor(), scope(0)));
+    assert_eq!(mirror.state(), &reference(&mut server, actor(), scope(0)));
     hub.replace_policy(
         &mut server,
         id,
@@ -312,7 +309,7 @@ fn ordinary_edits_and_interest_cuts_share_sequence_and_recheck_retained_entity_g
         );
         mirror.apply_interest(batch).unwrap();
     }
-    assert_eq!(mirror.state, reference(&mut server, actor(), scope(32)));
+    assert_eq!(mirror.state(), &reference(&mut server, actor(), scope(32)));
     let denied = torse_sim::action::ActorContext::new(base::key("test:observer"));
     hub.replace_policy(
         &mut server,
@@ -331,12 +328,12 @@ fn ordinary_edits_and_interest_cuts_share_sequence_and_recheck_retained_entity_g
     }
     assert!(
         mirror
-            .state
+            .state()
             .entities
             .iter()
             .all(|entity| entity.components.is_empty())
     );
-    assert_eq!(mirror.state, reference(&mut server, denied, scope(0)));
+    assert_eq!(mirror.state(), &reference(&mut server, denied, scope(0)));
 }
 
 #[test]

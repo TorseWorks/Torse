@@ -458,8 +458,8 @@ fn network_scope_replacement_updates_interest_and_keeps_the_session_alive() {
         .expect("interest increment");
     assert_eq!(batch.subscription, old_subscription);
     fresh.apply_interest(batch).unwrap();
-    assert_eq!(fresh.state.sections.len(), 1);
-    assert!(fresh.state.entities.is_empty());
+    assert_eq!(fresh.state().sections.len(), 1);
+    assert!(fresh.state().entities.is_empty());
     assert!(
         server
             .take_replica(old_subscription, base::budget())
@@ -1016,7 +1016,7 @@ fn two_clients_share_durable_authority_without_leaking_inventory() {
     let observer_mirror = seed(receive(&mut observer));
     assert!(
         observer_mirror
-            .state
+            .state()
             .entities
             .iter()
             .all(|e| e.components.is_empty())
@@ -1085,7 +1085,7 @@ fn two_clients_share_durable_authority_without_leaking_inventory() {
     assert_eq!(results, 2);
     assert_eq!(
         mirror
-            .state
+            .state()
             .entities
             .iter()
             .find(|e| e.id == EntityId(2))
@@ -1163,7 +1163,13 @@ fn revoke_purges_already_queued_transport_frames_and_reconnect_gets_new_seed() {
     hub.poll(&mut server).unwrap();
     let fresh = seed(receive(&mut replacement));
     assert_ne!(old.subscription, fresh.subscription);
-    assert!(fresh.state.entities.iter().all(|e| e.components.is_empty()));
+    assert!(
+        fresh
+            .state()
+            .entities
+            .iter()
+            .all(|e| e.components.is_empty())
+    );
     assert_eq!(fresh.through.seq.0, server.durability().through.0);
 }
 
@@ -1711,11 +1717,11 @@ fn two_real_tcp_clients_receive_atomic_public_and_authorized_deltas() {
         }
     }
     assert_eq!(successes, 2);
-    assert_eq!(owner.state.sections, observer.state.sections);
+    assert_eq!(owner.state().sections, observer.state().sections);
     assert!(owner.seq.0 > observer.seq.0);
     assert!(
         observer
-            .state
+            .state()
             .entities
             .iter()
             .all(|e| e.components.is_empty())

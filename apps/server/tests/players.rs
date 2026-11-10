@@ -471,7 +471,7 @@ fn two_players_publish_collision_resolved_moves_with_independent_input_sequences
         }
         assert_eq!(
             mirror
-                .state
+                .state()
                 .entities
                 .iter()
                 .find(|e| e.id == EntityId(3))
@@ -481,7 +481,7 @@ fn two_players_publish_collision_resolved_moves_with_independent_input_sequences
         );
         assert_eq!(
             mirror
-                .state
+                .state()
                 .entities
                 .iter()
                 .find(|e| e.id == EntityId(4))
