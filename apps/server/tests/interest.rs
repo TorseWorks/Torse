@@ -125,6 +125,122 @@ fn tightening_grants_with_pending_transport_output_closes_and_purges() {
 }
 
 #[test]
+fn ordinary_scope_change_defers_pending_output_then_applies_once() {
+    let dir = Directory::new();
+    let mut server = create(&dir);
+    let (mut hub, id, mut client, mut mirror, _) = connect(&mut server, scope(0));
+    hub.replace_policy(
+        &mut server,
+        id,
+        PeerPolicy {
+            actor: actor(),
+            scope: scope(32),
+        },
+    )
+    .unwrap();
+    // Leave the preceding cut queued; the next movement must not revoke it.
+    for _ in 0..3 {
+        assert_eq!(
+            hub.try_change_interest(&mut server, id, scope(0)).unwrap(),
+            InterestUpdate::Deferred
+        );
+        assert!(hub.contains(id));
+    }
+    let messages = drain(&mut client).0;
+    assert_eq!(messages.len(), 1);
+    let ServerMessage::Interest(batch) = messages.into_iter().next().unwrap() else {
+        panic!("preceding cut")
+    };
+    mirror.apply_interest(batch).unwrap();
+    assert_eq!(
+        hub.try_change_interest(&mut server, id, scope(0)).unwrap(),
+        InterestUpdate::Applied
+    );
+    let messages = drain(&mut client).0;
+    assert_eq!(messages.len(), 1);
+    let ServerMessage::Interest(batch) = messages.into_iter().next().unwrap() else {
+        panic!("retried cut")
+    };
+    mirror.apply_interest(batch).unwrap();
+    let seq = mirror.seq;
+    assert_eq!(
+        hub.try_change_interest(&mut server, id, scope(0)).unwrap(),
+        InterestUpdate::Applied
+    );
+    assert!(drain(&mut client).0.is_empty());
+    assert_eq!(mirror.seq, seq);
+    assert_eq!(mirror.state, reference(&mut server, actor(), scope(0)));
+}
+
+#[test]
+fn ordinary_change_waits_for_source_edits_and_rejects_invalid_projections() {
+    use torse_sim::{action::ActionTarget, durable::Call};
+    use torse_world::ComponentValue;
+    let dir = Directory::new();
+    let mut server = create(&dir);
+    let (mut hub, id, mut client, mut mirror, _) = connect(&mut server, scope(0));
+    send(
+        &mut client,
+        ClientMessage::Request {
+            seq: RequestSeq(1),
+            call: Call {
+                action: base::key("world:action/place"),
+                version: 1,
+                target: ActionTarget::Block(BlockPos::new(640, 1, 1)),
+                parameters: [(
+                    base::key("world:field/block"),
+                    ComponentValue::Content(base::key("base:stone")),
+                )]
+                .into(),
+            },
+        },
+    );
+    hub.poll(&mut server).unwrap();
+    drain(&mut client);
+    server.drive_tick(&mut hub, 1024).unwrap();
+    assert_eq!(
+        hub.try_change_interest(&mut server, id, scope(32)).unwrap(),
+        InterestUpdate::Deferred
+    );
+    hub.poll(&mut server).unwrap();
+    for message in drain(&mut client).0 {
+        if let ServerMessage::Batch(batch) = message {
+            mirror.apply(batch).unwrap();
+        }
+    }
+    assert_eq!(
+        hub.try_change_interest(&mut server, id, scope(32)).unwrap(),
+        InterestUpdate::Applied
+    );
+    let messages = drain(&mut client).0;
+    assert_eq!(messages.len(), 1);
+    let ServerMessage::Interest(batch) = messages.into_iter().next().unwrap() else {
+        panic!("ordered interest")
+    };
+    mirror.apply_interest(batch).unwrap();
+    assert_eq!(mirror.state, reference(&mut server, actor(), scope(32)));
+    server
+        .change_session_interest(
+            SessionId(1),
+            actor(),
+            scope(0),
+            OutputBudget {
+                max_items: 1,
+                max_bytes: 1,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        hub.try_change_interest(&mut server, id, scope(0))
+            .unwrap_err()
+            .code,
+        FaultCode::ResetRequired
+    );
+    assert!(hub.contains(id));
+    assert!(drain(&mut client).0.is_empty());
+}
+
+#[test]
 fn ordinary_edits_and_interest_cuts_share_sequence_and_recheck_retained_entity_grants() {
     use torse_sim::{action::ActionTarget, durable::Call};
     use torse_world::ComponentValue;
@@ -298,6 +414,11 @@ fn pending_source_edit_falls_back_to_a_complete_current_seed() {
             .unwrap()
             .can_change_interest(SessionId(1))
     );
+    assert_eq!(
+        hub.try_change_interest(&mut server, id, scope(32)).unwrap(),
+        InterestUpdate::Deferred
+    );
+    assert!(drain(&mut client).0.is_empty());
     hub.replace_policy(
         &mut server,
         id,

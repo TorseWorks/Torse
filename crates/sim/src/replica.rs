@@ -107,10 +107,23 @@ impl ReplicaSource {
     /// An incremental interest cut requires a live projection with no unconsumed
     /// source batches. Hosts must reset or close if downstream output is unsafe.
     pub fn can_change_interest(&self, viewer: Viewer) -> bool {
-        self.subscriptions
+        matches!(self.interest_ready(viewer), Ok(true))
+    }
+
+    /// Distinguish drainable source backlog from a projection requiring reset.
+    pub fn interest_ready(&self, viewer: Viewer) -> Result<bool, Fault> {
+        let mut ready = true;
+        for sub in self
+            .subscriptions
             .values()
             .filter(|sub| sub.viewer == viewer)
-            .all(|sub| sub.state.is_some() && sub.queue.is_empty())
+        {
+            if sub.state.is_none() {
+                return Err(reset_required());
+            }
+            ready &= sub.queue.is_empty();
+        }
+        Ok(ready)
     }
 
     /// Preserve subscription IDs and sequence normal edits and interest cuts on
