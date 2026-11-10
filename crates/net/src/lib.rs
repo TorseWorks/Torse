@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 pub mod replication;
 pub mod session;
+pub mod terrain;
 pub mod tls;
 pub mod transport;
 pub use replication::ReplicaMirror;

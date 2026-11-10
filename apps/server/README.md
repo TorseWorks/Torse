@@ -1,5 +1,17 @@
 # 服务端
 
+## 独立地形显示范围
+
+`NetworkHub::enable_visual_interest`为连接设置不可变的只读批准范围、显示范围、中心与`VisualTerrainLimits`，初次近景订阅后交付。`set_visual_interest`在批准范围内移动，`refresh_visual_interest`重试缺失、损坏或预算拒绝的来源。库入口默认关闭，主程序不自动扩大视野。
+
+已驻留页从耐久权威投影，非驻留页由每连接一个有界工作线程读取已有`SectionPages`，不触发装载、生成或模拟。只发送地形及所用状态，不发送实体、组件、分配器或运行状态。发送前重查来源标记和意向代数。批准收紧须撤销连接；身份切换关闭已启用显示的连接。关闭等待当前文件读取退出，不提供操作系统I/O取消。
+
+限制显示页数、缓存、I/O、批次字节与每次页数；共享MemoryPool在启用前预留缓存、I/O、三份批次工作空间和控制元数据。`visual_terrain_diagnostics`报告逻辑缓存和固定预留，不代表RSS。缓存不足时优先保留近中心页，其余明确返回Budget，避免循环逐出重读。客户端默认4096页、64MiB，可在首条Terrain前设置预算。场景与GPU另受自身预算约束。
+
+协议6增加Terrain流，双方须同时升级，存档不变，见[格式](../../crates/protocol/FORMAT.md)。客户端将远景接入派生场景、网格和上传，近景覆盖远景，独立显示不修改权威复制镜像。
+
+`cargo run --release -p torse-server --example visual_terrain_baseline -- NEW_OUTPUT_DIRECTORY`使用公共文件夹具测量24个已保存稠密分区，2个模拟驻留分区与8页显示窗的直行、掉头和回访。CSV记录CPU镜像首批/全批可用时间、最长poll、传输字节和逻辑内存；不等同于显示器呈现时间或RSS。回归另覆盖近景切换、恢复、损坏修复、积压和内存释放。
+
 包名：`torse-server`。提供权威世界的持久执行、文件恢复、授权网络和可选Mod装配，可在无GPU环境中运行。主程序通过ExecutionHost驱动阶段任务，WorldHost保留可信本地事务示例。范围与证据见[执行与网络验证](../../benchmarks/archive/network/B6-B7-execution-network.md)。
 
 明文演示只允许回环地址。对外监听必须配置`--tls-cert`、`--tls-key`、`--client-ca`和`--users`，按验证后的证书指纹选择用户权限、范围和玩家，不能叠加全局演示授权。重复登录、错误或过期凭据及重放的拒绝语义见[用户认证与连接策略](../../benchmarks/archive/network/M5-user-authentication.md)。
@@ -136,7 +148,7 @@ cargo test -p torse-server --test event_budget --locked
 
 WorkPlan支持携带TransactionGroup。Mod机器自有状态与库存规划器返回的事务按来源组成一个任务，连同新唤醒共同预留、发布和刷盘。冻结任务保存稳定成员，恢复不重跑已规划或已结算的Guest。库存拒绝保留机器完成前的进度，不登记该计划的新唤醒；陷阱重试次数由持久事件载荷记录，停机以没有后续唤醒表示。ModStats只供诊断，不影响恢复后的执行。验证见[Mod原子执行](../../benchmarks/archive/mods/M4-mod-atomic.md)。
 
-持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本3、读版本1至3，快照写版本2、读版本1和2，应用协议为版本5。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。主程序仍使用有限范围，显式装卸接口另见下文，未进行硬件断电验收。
+持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本3、读版本1至3，快照写版本2、读版本1和2，应用协议为版本6。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。主程序仍使用有限范围，显式装卸接口另见下文，未进行硬件断电验收。
 
 ## 运行态与批量刷盘
 
@@ -150,7 +162,7 @@ Server的Tick驱动默认每批1条，可用`set_commit_batch_limit`设置1到10
 
 复现对照与故障验证见[运行态与批量提交](../../benchmarks/archive/performance/M6-runtime-commit.md)。当前简单事务的并行预验证实验未显示收益，因此继续使用串行事务准备与发布。
 
-NetworkHub通过应用协议版本5接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线、增量及移动确认都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权镜像、编辑请求、独立移动输入和预测校正。双向TLS与按用户授权已接入，明文演示限制在回环地址。
+NetworkHub通过应用协议版本6接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线、增量及移动确认都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权镜像、编辑请求、独立移动输入和预测校正。双向TLS与按用户授权已接入，明文演示限制在回环地址。
 
 ## 批量驻留
 

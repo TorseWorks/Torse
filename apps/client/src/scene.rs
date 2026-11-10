@@ -2227,6 +2227,114 @@ mod tests {
         assert_eq!(scene.sections().len(), 2);
     }
 
+    fn display_fixture() -> (Scene, ReplicaSnapshot, torse_net::terrain::TerrainMirror) {
+        use torse_net::terrain::{TerrainLimits, TerrainMirror};
+        use torse_types::*;
+        let near = replica_snapshot();
+        let scene = Scene::from_snapshot(&near).unwrap();
+        let binding = Binding {
+            world: WorldId(7),
+            epoch: WorldEpoch(1),
+            compatibility: Scene::compatibility().unwrap(),
+        };
+        let at = CommitCursor::initial(binding.world);
+        let mut terrain = TerrainMirror::new(
+            binding,
+            16,
+            near.bounds,
+            TerrainLimits {
+                max_sections: 8,
+                max_bytes: 1024 * 1024,
+            },
+            None,
+        )
+        .unwrap();
+        let mut far = near.clone();
+        far.entities.clear();
+        far.sections = vec![stone_layer_section(SectionPos::new(2, 0, 0))];
+        terrain
+            .apply(TerrainUpdate {
+                binding,
+                generation: 1,
+                seq: 1,
+                through: at,
+                reset: Some(TerrainReset {
+                    sections: vec![SectionPos::new(2, 0, 0)],
+                    retained: vec![],
+                }),
+                pages: vec![TerrainPage {
+                    at,
+                    digest: Digest([1; 32]),
+                    terrain: far,
+                }],
+                unavailable: vec![],
+            })
+            .unwrap();
+        (scene, near, terrain)
+    }
+    #[test]
+    fn display_pages_build_meshes_without_entities_and_near_terrain_wins() {
+        let (mut scene, mut near, terrain) = display_fixture();
+        let pos = SectionPos::new(2, 0, 0);
+        assert!(scene.try_apply_display(&near, &terrain, [pos]).unwrap());
+        assert_eq!(scene.authority().entities().len(), 1);
+        assert_eq!(near.sections.len(), 2);
+        assert_eq!(scene.refresh_meshes().len(), 3);
+        assert!(scene.section_geometry(pos).is_some());
+        near.sections.push(SnapshotSection {
+            pos,
+            cells: SnapshotCells::Uniform(BlockStateId::EMPTY),
+        });
+        scene
+            .try_apply_changes(&ReplicaChanges {
+                states: near.states.clone(),
+                sections: vec![near.sections[2].clone()],
+                removed_sections: vec![],
+                entities: vec![],
+                removed_entities: vec![],
+                presentation: vec![],
+            })
+            .unwrap();
+        scene.try_apply_display(&near, &terrain, [pos]).unwrap();
+        assert!(!query(&scene, BlockPos::new(33, 0, 1)));
+    }
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn display_page_mesh_reaches_the_gpu_and_offscreen_readback() {
+        let (mut scene, near, terrain) = display_fixture();
+        let pos = SectionPos::new(2, 0, 0);
+        let mut renderer = crate::renderer::Renderer::new(128, 128).unwrap();
+        renderer.set_palette(scene.palette());
+        let camera = crate::camera::Camera::new([40., 16., 24.], [40., 0., 8.]);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.work/visual-gpu");
+        std::fs::create_dir_all(&dir).unwrap();
+        let start = std::time::Instant::now();
+        renderer.render(camera.view_projection(1.), camera.eye);
+        let before = dir.join("before.png");
+        renderer.save_png(before.to_str().unwrap()).unwrap();
+        scene.try_apply_display(&near, &terrain, [pos]).unwrap();
+        scene.refresh_meshes();
+        let (vertices, indices) = scene.section_geometry(pos).unwrap();
+        assert!(renderer.upload_section(pos, &Scene::vertex_bytes(&vertices), &indices));
+        assert!(renderer.render(camera.view_projection(1.), camera.eye));
+        let after = dir.join("after.png");
+        renderer.save_png(after.to_str().unwrap()).unwrap();
+        let a = torse_assets::texture::Atlas::decode(&std::fs::read(before).unwrap()).unwrap();
+        let b = torse_assets::texture::Atlas::decode(&std::fs::read(after).unwrap()).unwrap();
+        assert!(
+            a.pixels()
+                .chunks_exact(4)
+                .zip(b.pixels().chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count()
+                > 100
+        );
+        println!(
+            "display mesh to offscreen readback ms={:.4}",
+            start.elapsed().as_secs_f64() * 1000.
+        );
+    }
+
     #[test]
     fn both_geometry_paths_preserve_vertical_section_offsets() {
         let mut snapshot = replica_snapshot();

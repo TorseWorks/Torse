@@ -301,6 +301,9 @@ impl<S: Wire> Wire for CommitRecord<S> {
         })
     }
 }
+#[path = "terrain_wire.rs"]
+mod terrain;
+
 impl<S: Wire> Wire for torse_types::ReplicaSeed<S> {
     fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
         self.binding.write(e)?;

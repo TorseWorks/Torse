@@ -63,6 +63,9 @@ impl ReplicaMirror {
     pub fn state(&self) -> &ReplicaSnapshot {
         &self.state
     }
+    pub fn into_state(self) -> ReplicaSnapshot {
+        self.state
+    }
     pub fn from_seed(seed: WorldReplicaSeed) -> Result<Self, Fault> {
         if seed.subscription.0 == 0
             || seed.binding.world != seed.baseline.world

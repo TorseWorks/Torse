@@ -23,6 +23,8 @@ mod memory_pool;
 pub use memory_pool::{MemoryLease, MemoryPool, MemoryUsage};
 mod replication;
 mod spatial;
+mod terrain;
+pub use terrain::{TerrainPage, TerrainReset, TerrainUnavailable, TerrainUpdate};
 mod validation;
 
 #[cfg(test)]

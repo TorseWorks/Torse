@@ -20,6 +20,8 @@ mod control;
 mod interest;
 #[path = "network_player.rs"]
 mod player;
+#[path = "network_visual.rs"]
+mod visual;
 pub use control::{ControlBudget, ControlDispatch, ControlPolicy};
 pub use interest::PlayerFollow;
 
@@ -242,6 +244,7 @@ pub struct PeerPolicy {
     pub scope: ReplicaScope,
 }
 struct Peer<T> {
+    visual: Option<crate::visual::VisualSession>,
     user: Option<ContentKey>,
     player: Option<player::Control>,
     transport: T,
@@ -424,6 +427,7 @@ impl<T: Transport> NetworkHub<T> {
                 memory,
                 follow_scope: None,
                 follow_ready: false,
+                visual: None,
                 control_link: None,
             },
         );
@@ -574,6 +578,15 @@ impl<T: Transport> NetworkHub<T> {
             .ok_or_else(|| Fault::invalid_data("unknown peer"))?;
         if peer.closed {
             return Err(Fault::invalid_data("closed peer"));
+        }
+        if peer.visual.is_some() && peer.policy.actor.principal() != policy.actor.principal() {
+            peer.closed = true;
+            peer.transport.close();
+            self.cleanup(server)?;
+            return Err(Fault::new(
+                FaultCode::ResetRequired,
+                "display approval principal changed",
+            ));
         }
         if peer
             .user
@@ -1069,6 +1082,7 @@ impl<T: Transport> NetworkHub<T> {
                             Self::send(peer, ServerMessage::Batch(batch), self.limits)?;
                         }
                     }
+                    Self::poll_visual(peer, server, self.limits)?;
                 }
                 peer.transport.poll()
             })();
