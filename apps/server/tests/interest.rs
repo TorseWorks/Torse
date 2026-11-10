@@ -166,7 +166,7 @@ fn ordinary_scope_change_defers_pending_output_then_applies_once() {
     );
     assert!(drain(&mut client).0.is_empty());
     assert_eq!(mirror.seq, seq);
-    assert_eq!(mirror.state, reference(&mut server, actor(), scope(0)));
+    assert_eq!(mirror.state(), &reference(&mut server, actor(), scope(0)));
 }
 
 #[test]
@@ -215,7 +215,7 @@ fn ordinary_change_waits_for_source_edits_and_rejects_invalid_projections() {
         panic!("ordered interest")
     };
     mirror.apply_interest(batch).unwrap();
-    assert_eq!(mirror.state, reference(&mut server, actor(), scope(32)));
+    assert_eq!(mirror.state(), &reference(&mut server, actor(), scope(32)));
     server
         .change_session_interest(
             SessionId(1),
