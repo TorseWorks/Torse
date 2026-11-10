@@ -265,6 +265,37 @@ impl Scene {
             .map_err(|error| error.to_string())?;
         Ok(true)
     }
+    /// Apply display-only pages to the derived scene. Near terrain always wins;
+    /// entities and the connection's authoritative mirror remain untouched.
+    pub fn try_apply_display(
+        &mut self,
+        near: &ReplicaSnapshot,
+        terrain: &torse_net::terrain::TerrainMirror,
+        positions: impl IntoIterator<Item = SectionPos>,
+    ) -> Result<bool, String> {
+        for pos in positions {
+            if near.sections.iter().any(|s| s.pos == pos) {
+                continue;
+            }
+            let page = terrain.page(pos);
+            let changes = ReplicaChanges {
+                states: page.map_or_else(Vec::new, |p| p.states.clone()),
+                sections: page.map_or_else(Vec::new, |p| p.sections.clone()),
+                removed_sections: if page.is_none() {
+                    vec![pos]
+                } else {
+                    Vec::new()
+                },
+                entities: Vec::new(),
+                removed_entities: Vec::new(),
+                presentation: Vec::new(),
+            };
+            if !self.try_apply_changes(&changes)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

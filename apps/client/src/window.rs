@@ -1330,6 +1330,17 @@ impl WindowApp {
                     self.invalidate_network_scene();
                     return Ok(());
                 }
+                if let Some(connection) = self.net.as_ref()
+                    && let Some(terrain) = connection.terrain()
+                    && !scene.try_apply_display(
+                        connection.snapshot().expect("increment baseline"),
+                        terrain,
+                        changes.removed_sections.iter().copied(),
+                    )?
+                {
+                    self.invalidate_network_scene();
+                    return Ok(());
+                }
                 if let Some(connection) = self.net.as_mut() {
                     connection
                         .refresh_player(scene.authority())
@@ -1339,6 +1350,19 @@ impl WindowApp {
                     {
                         scene.view_player(id);
                     }
+                }
+            }
+            NetEvent::Terrain(changes) => {
+                if !self.rebuild_network
+                    && let Some((connection, scene)) = self.net.as_ref().zip(self.scene.as_mut())
+                    && let Some(terrain) = connection.terrain()
+                    && !scene.try_apply_display(
+                        connection.snapshot().expect("terrain baseline"),
+                        terrain,
+                        changes.changed.into_iter().chain(changes.removed),
+                    )?
+                {
+                    self.invalidate_network_scene();
                 }
             }
             NetEvent::Player(_update) => {
@@ -1403,6 +1427,11 @@ impl WindowApp {
             Err(error) if error.code == torse_types::FaultCode::ResourceLimit => return Ok(()),
             Err(error) => return Err(error.to_string()),
         };
+        if let Some(terrain) = self.net.as_ref().and_then(crate::net::Connection::terrain)
+            && !scene.try_apply_display(snapshot, terrain, terrain.desired().iter().copied())?
+        {
+            return Ok(());
+        }
         scene.enable_background(crate::scene::background_config())?;
         scene.enable_lighting()?;
         if let Some(connection) = self.net.as_mut() {
@@ -1884,7 +1913,11 @@ impl ApplicationHandler for WindowApp {
                     }
                 };
             let handshake = connection
-                .attach_memory(self.memory.clone())
+                .set_terrain_limits(torse_net::terrain::TerrainLimits {
+                    max_sections: 4096,
+                    max_bytes: (self.config.memory_mib * 1024 * 1024 / 8).min(64 * 1024 * 1024),
+                })
+                .and_then(|()| connection.attach_memory(self.memory.clone()))
                 .and_then(|()| connection.hello(compatibility))
                 .and_then(|()| {
                     connection.subscribe(

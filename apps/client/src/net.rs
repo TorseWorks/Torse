@@ -8,6 +8,7 @@
 use std::time::Instant;
 use torse_codec::CodecLimits;
 use torse_codec::wire;
+use torse_net::terrain::{TerrainChanges, TerrainLimits, TerrainMirror};
 use torse_net::{ReplicaMirror, Transport};
 use torse_protocol::PROTOCOL_VERSION;
 use torse_sim::replica::{ReplicaChanges, ReplicaSnapshot};
@@ -37,6 +38,7 @@ pub enum NetEvent {
     Baseline(ReplicaSnapshot),
     /// One increment was validated and applied to the mirror.
     Increment(ReplicaChanges),
+    Terrain(TerrainChanges),
     /// Admission for a submitted request.
     Admitted {
         seq: RequestSeq,
@@ -61,6 +63,8 @@ pub struct Connection<T: Transport> {
     prediction: prediction::Prediction,
     transport: T,
     mirror: Option<ReplicaMirror>,
+    terrain: Option<TerrainMirror>,
+    terrain_limits: TerrainLimits,
     subscription_pending: bool,
     request_seq: u64,
     budget: OutputBudget,
@@ -78,6 +82,11 @@ impl<T: Transport> Connection<T> {
             prediction: Default::default(),
             transport,
             mirror: None,
+            terrain: None,
+            terrain_limits: TerrainLimits {
+                max_sections: 4096,
+                max_bytes: 64 * 1024 * 1024,
+            },
             subscription_pending: false,
             request_seq: 0,
             budget: OutputBudget {
@@ -128,6 +137,21 @@ impl<T: Transport> Connection<T> {
     }
     pub fn snapshot(&self) -> Option<&ReplicaSnapshot> {
         self.mirror.as_ref().map(ReplicaMirror::state)
+    }
+    pub fn terrain(&self) -> Option<&TerrainMirror> {
+        self.terrain.as_ref()
+    }
+    /// Configure before the first display update; changing a live cache requires reconnecting.
+    pub fn set_terrain_limits(&mut self, limits: TerrainLimits) -> Result<(), Fault> {
+        if self.terrain.is_some()
+            || limits.max_sections == 0
+            || limits.max_sections > 16384
+            || limits.max_bytes < 4096
+        {
+            return Err(Fault::invalid_data("invalid display cache configuration"));
+        }
+        self.terrain_limits = limits;
+        Ok(())
     }
 
     /// Start the handshake with the shared content compatibility.
@@ -266,6 +290,9 @@ impl<T: Transport> Connection<T> {
                 // Clone the snapshot first; from_seed consumes the envelope.
                 let snapshot = seed.state.clone();
                 let mirror = ReplicaMirror::from_seed(seed)?;
+                if let Some(terrain) = self.terrain.as_mut() {
+                    terrain.observe_snapshot(mirror.state(), mirror.through);
+                }
                 self.mirror = Some(mirror);
                 self.subscription_pending = false;
                 self.retired = None;
@@ -279,16 +306,54 @@ impl<T: Transport> Connection<T> {
                     .as_mut()
                     .ok_or_else(|| Fault::invalid_data("batch before baseline"))?;
                 changes.presentation = mirror.apply_with_presentation(batch)?;
+                if let Some(terrain) = self.terrain.as_mut() {
+                    terrain.observe_authority(&changes, mirror.through);
+                }
                 let _ = seq;
                 Ok(Some(NetEvent::Increment(changes)))
             }
             ServerMessage::Interest(batch) => {
                 let changes = batch.changes.clone();
-                self.mirror
+                let mirror = self
+                    .mirror
                     .as_mut()
-                    .ok_or_else(|| Fault::invalid_data("interest before baseline"))?
-                    .apply_interest(batch)?;
+                    .ok_or_else(|| Fault::invalid_data("interest before baseline"))?;
+                mirror.apply_interest(batch)?;
+                if let Some(terrain) = self.terrain.as_mut() {
+                    terrain.observe_authority(&changes, mirror.through);
+                }
                 Ok(Some(NetEvent::Increment(changes)))
+            }
+            ServerMessage::Terrain(update) => {
+                let near = self
+                    .mirror
+                    .as_ref()
+                    .ok_or_else(|| Fault::invalid_data("terrain before baseline"))?;
+                if update.binding != near.binding {
+                    return Err(Fault::new(
+                        FaultCode::ResetRequired,
+                        "terrain binding mismatch",
+                    ));
+                }
+                if self.terrain.is_none() {
+                    let mut terrain = TerrainMirror::new(
+                        near.binding,
+                        near.state().side,
+                        near.state().bounds,
+                        self.terrain_limits,
+                        self.memory.as_ref().map(MemoryLease::pool).cloned(),
+                    )?;
+                    let changes = terrain.apply(update)?;
+                    terrain.observe_snapshot(near.state(), near.through);
+                    self.terrain = Some(terrain);
+                    return Ok(Some(NetEvent::Terrain(changes)));
+                }
+                let changes = self
+                    .terrain
+                    .as_mut()
+                    .expect("terrain initialized")
+                    .apply(update)?;
+                Ok(Some(NetEvent::Terrain(changes)))
             }
             ServerMessage::Admission { seq, admission } => {
                 let rejected = match admission {
@@ -427,6 +492,90 @@ fn codec_limits() -> CodecLimits {
 mod tests {
     use super::*;
     use torse_net::{MemoryTransport, TransportLimits};
+
+    #[test]
+    fn terrain_wire_delivery_keeps_the_near_mirror_and_rejects_replayed_updates() {
+        use torse_types::*;
+        use torse_world::*;
+        let (client, mut server) = MemoryTransport::pair(default_limits()).unwrap();
+        let mut connection = Connection::new(client);
+        connection
+            .set_terrain_limits(TerrainLimits {
+                max_sections: 8,
+                max_bytes: 1024 * 1024,
+            })
+            .unwrap();
+        let binding = Binding {
+            world: WorldId(7),
+            epoch: WorldEpoch(1),
+            compatibility: crate::scene::Scene::compatibility().unwrap(),
+        };
+        let at = CommitCursor::initial(binding.world);
+        let near = ReplicaSnapshot {
+            side: 16,
+            bounds: WorldBounds::new(0, 32).unwrap(),
+            states: vec![],
+            sections: vec![SnapshotSection {
+                pos: SectionPos::ZERO,
+                cells: SnapshotCells::Uniform(BlockStateId::EMPTY),
+            }],
+            entities: vec![],
+        };
+        connection
+            .handle(
+                ServerMessage::Seed(torse_sim::replica::WorldReplicaSeed {
+                    binding,
+                    subscription: SubscriptionId(1),
+                    baseline: at,
+                    state: near.clone(),
+                }),
+                Instant::now(),
+            )
+            .unwrap();
+        let pos = SectionPos::new(2, 0, 0);
+        let mut far = near.clone();
+        far.sections[0].pos = pos;
+        let update = TerrainUpdate {
+            binding,
+            generation: 1,
+            seq: 1,
+            through: at,
+            reset: Some(TerrainReset {
+                sections: vec![pos],
+                retained: vec![],
+            }),
+            pages: vec![TerrainPage {
+                at,
+                digest: Digest([1; 32]),
+                terrain: far.clone(),
+            }],
+            unavailable: vec![],
+        };
+        let mut bytes = Vec::new();
+        wire::encode(
+            &ServerMessage::Terrain(update.clone()),
+            &mut bytes,
+            connection.budget,
+            connection.limits,
+        )
+        .unwrap();
+        server.send(bytes).unwrap();
+        assert!(matches!(
+            connection.poll().unwrap()[0].event,
+            NetEvent::Terrain(_)
+        ));
+        assert_eq!(connection.snapshot(), Some(&near));
+        assert_eq!(connection.terrain().unwrap().page(pos), Some(&far));
+        assert_eq!(
+            connection
+                .handle(ServerMessage::Terrain(update), Instant::now())
+                .unwrap_err()
+                .code,
+            FaultCode::ResetRequired
+        );
+        assert_eq!(connection.snapshot(), Some(&near));
+        assert_eq!(connection.terrain().unwrap().page(pos), Some(&far));
+    }
 
     #[test]
     fn decode_pressure_retains_frames_and_events_hold_temporary_reservations() {

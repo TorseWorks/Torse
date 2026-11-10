@@ -1,0 +1,13 @@
+{
+  "source_commit": "6db593332a638b59e201d1f1421958a754f523cf",
+  "os": "Windows-11-10.0.26200-SP0",
+  "cpu": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+  "rust": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "build": "Release",
+  "fixture": "24 saved dense edited sections with parked entities; 2 resident, 1 near subscribed, 8 display; 35 forward/reverse/revisit steps per fresh process",
+  "command": "cargo run --release -p torse-server --example visual_terrain_baseline -- NEW_OUTPUT_DIRECTORY",
+  "timing": "setup and enable excluded; per-window polling and message decode/application included; first_ready is first changed CPU mirror page or immediate cache availability, not monitor presentation",
+  "memory": "logical cache charges and fixed source I/O/output/cache reservation; excludes transport, derived scene, GPU and process RSS",
+  "durability": "real files for setup; navigation reads only; authority cursor and entity-free projections checked every step",
+  "cpu_model": "Intel Core i9-14900HX"
+}
