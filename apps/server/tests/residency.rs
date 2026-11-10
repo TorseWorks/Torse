@@ -2,19 +2,19 @@
 mod support;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use support::Directory;
+pub(crate) use support::Directory;
 use torse_server::{bootstrap as base, execution::*, residency::*, section_pages::SectionPages, *};
 use torse_sim::durable::*;
 use torse_sim::{OrderingKey, Phase, SystemSpec, Transaction, WorldAuthority};
 use torse_types::*;
 use torse_world::*;
 
-fn pages(dir: &Directory) -> SectionPages {
+pub(crate) fn pages(dir: &Directory) -> SectionPages {
     let root = dir.0.join("sections");
     std::fs::create_dir_all(&root).unwrap();
     SectionPages::new(root, base::budget(), base::codec_limits(), 64).unwrap()
 }
-fn create(dir: &Directory, rules: Vec<Box<dyn DurableRule>>) -> base::Files {
+pub(crate) fn create(dir: &Directory, rules: Vec<Box<dyn DurableRule>>) -> base::Files {
     let (world, actions) = base::world().unwrap();
     base::Files::create_file(
         dir.acquire(),
@@ -25,7 +25,11 @@ fn create(dir: &Directory, rules: Vec<Box<dyn DurableRule>>) -> base::Files {
     )
     .unwrap()
 }
-fn open(dir: &Directory, pages: SectionPages, rules: Vec<Box<dyn DurableRule>>) -> base::Files {
+pub(crate) fn open(
+    dir: &Directory,
+    pages: SectionPages,
+    rules: Vec<Box<dyn DurableRule>>,
+) -> base::Files {
     let (world, actions) = base::world().unwrap();
     base::Files::open_file(
         dir.acquire(),
@@ -370,9 +374,9 @@ fn automatic_load_unload_budget_backpressure_and_page_io_retry_preserve_authorit
     );
 }
 
-struct EmptyGenerator {
-    identity: GenerationIdentity,
-    gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+pub(crate) struct EmptyGenerator {
+    pub(crate) identity: GenerationIdentity,
+    pub(crate) gate: Option<Arc<(Mutex<bool>, Condvar)>>,
 }
 struct GateRelease(Arc<(Mutex<bool>, Condvar)>);
 impl Drop for GateRelease {
@@ -408,11 +412,351 @@ impl GenerationSource for EmptyGenerator {
         })
     }
 }
-fn identity() -> GenerationIdentity {
+pub(crate) fn identity() -> GenerationIdentity {
     GenerationIdentity {
         id: base::key("test:empty-generator"),
         version: 1,
         configuration: Digest([7; 32]),
+    }
+}
+
+fn settle_batch(server: &mut base::Files) -> Vec<ResidencyBatchReport> {
+    let mut reports = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match server.poll_residency(&mut NoReplicas).unwrap() {
+            ResidencyProgress::Idle => return reports,
+            ResidencyProgress::Pending | ResidencyProgress::Published(_) => {}
+            ResidencyProgress::Batch(report) => {
+                assert!(report.failure.is_none(), "{report:?}");
+                assert_eq!(
+                    report.durability.through.0,
+                    server.authority().unwrap().cursor().seq.0
+                );
+                reports.push(report);
+            }
+            other => panic!("unexpected result {other:?}"),
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn batch_rechecks_interest_and_external_cursor_before_publication() {
+    for changed_interest in [true, false] {
+        let dir = Directory::new();
+        let pages = pages(&dir);
+        let mut server = create(&dir, Vec::new());
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = GateRelease(gate.clone());
+        let desired: Vec<_> = (0..4).map(|x| SectionPos::new(x, 0, 0)).collect();
+        server
+            .enable_residency(
+                ResidencyConfig {
+                    max_resident: 4,
+                    max_io_bytes: 64 * 1024 * 1024,
+                },
+                pages,
+                Some(Arc::new(EmptyGenerator {
+                    identity: identity(),
+                    gate: Some(gate.clone()),
+                })),
+                &desired,
+            )
+            .unwrap();
+        assert!(server.set_residency_batch_pages(0).is_err());
+        assert!(server.set_residency_batch_pages(1025).is_err());
+        server.set_residency_batch_pages(2).unwrap();
+        assert!(matches!(
+            server.poll_residency(&mut NoReplicas).unwrap(),
+            ResidencyProgress::Pending
+        ));
+        assert!(server.set_residency_batch_pages(1).is_err());
+        if changed_interest {
+            server.set_residency_interest(&desired[..2]).unwrap();
+        } else {
+            server.drive_tick(&mut NoReplicas, 1024).unwrap();
+        }
+        let cursor = server.authority().unwrap().cursor();
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let ResidencyProgress::Batch(report) =
+                server.poll_residency(&mut NoReplicas).unwrap()
+            {
+                assert!(report.committed.is_empty());
+                assert_eq!(report.failure.is_some(), !changed_interest);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(server.authority().unwrap().cursor(), cursor);
+        assert_eq!(server.authority().unwrap().world().store().len(), 2);
+        settle_batch(&mut server);
+        assert_eq!(
+            server.authority().unwrap().world().store().len(),
+            if changed_interest { 2 } else { 4 }
+        );
+    }
+}
+
+#[test]
+fn batch_byte_budget_shortens_dispatch_without_growing_business_limits() {
+    let dir = Directory::new();
+    let pages = pages(&dir);
+    let mut server = create(&dir, Vec::new());
+    let desired: Vec<_> = (0..6).map(|x| SectionPos::new(x, 0, 0)).collect();
+    server
+        .enable_residency(
+            ResidencyConfig {
+                max_resident: 6,
+                max_io_bytes: 32 * 1024 * 1024,
+            },
+            pages,
+            Some(Arc::new(EmptyGenerator {
+                identity: identity(),
+                gate: None,
+            })),
+            &desired,
+        )
+        .unwrap();
+    server.set_residency_batch_pages(24).unwrap();
+    let before = server.flush_metrics().calls;
+    let reports = settle_batch(&mut server);
+    assert_eq!(reports.len(), 4);
+    assert!(reports.iter().all(|report| report.committed.len() == 1));
+    assert_eq!(server.flush_metrics().calls - before, 4);
+}
+
+#[test]
+fn batched_24_page_generation_and_reload_match_serial_state_log_and_recovery() {
+    let run = |batch_pages| {
+        let dir = Directory::new();
+        let pages = pages(&dir);
+        let mut server = create(&dir, Vec::new());
+        let desired: Vec<_> = (0..26).map(|x| SectionPos::new(x, 0, 0)).collect();
+        let source = Arc::new(EmptyGenerator {
+            identity: identity(),
+            gate: None,
+        });
+        let config = ResidencyConfig {
+            max_resident: 26,
+            max_io_bytes: 24 * 32 * 1024 * 1024,
+        };
+        server
+            .enable_residency(config, pages.clone(), Some(source.clone()), &desired)
+            .unwrap();
+        server.set_residency_batch_pages(batch_pages).unwrap();
+        let before = server.flush_metrics().calls;
+        let generated = settle_batch(&mut server);
+        let generate_calls = server.flush_metrics().calls - before;
+        if batch_pages > 1 {
+            assert_eq!(
+                generated.iter().map(|r| r.committed.len()).sum::<usize>(),
+                24
+            );
+            assert!(generated.iter().any(|r| r.blocked.is_some()));
+        }
+        for pos in desired.iter().skip(2) {
+            assert!(matches!(
+                server
+                    .unload_section(&pages, *pos, &mut NoReplicas)
+                    .unwrap(),
+                CommitStep::Durable(_)
+            ));
+        }
+        server
+            .enable_residency(config, pages.clone(), Some(source), &desired)
+            .unwrap();
+        server.set_residency_batch_pages(batch_pages).unwrap();
+        let before = server.flush_metrics().calls;
+        settle_batch(&mut server);
+        let reload_calls = server.flush_metrics().calls - before;
+        let authority = server.authority().unwrap();
+        let state = authority
+            .world()
+            .capture_snapshot(SnapshotMeta {
+                cursor: authority.cursor(),
+                compatibility: server.binding().compatibility,
+                resume_at: authority.resume_point(),
+            })
+            .unwrap();
+        assert_eq!(state.sections.len(), 26);
+        drop(server);
+        let log = std::fs::read(dir.0.join("journal.log")).unwrap();
+        let recovered = open(&dir, pages, Vec::new());
+        let authority = recovered.authority().unwrap();
+        assert_eq!(
+            authority.world().capture_snapshot(state.meta).unwrap(),
+            state
+        );
+        drop(recovered);
+        (state, log, generate_calls, reload_calls)
+    };
+    let serial = run(1);
+    let batch = run(24);
+    assert_eq!(serial.0, batch.0);
+    assert_eq!(serial.1, batch.1);
+    assert_eq!((serial.2, serial.3), (24, 24));
+    assert_eq!((batch.2, batch.3), (6, 6));
+}
+
+#[test]
+fn batch_page_integrity_failure_reports_the_durable_prefix_and_retries() {
+    let dir = Directory::new();
+    let pages = pages(&dir);
+    let mut server = create(&dir, Vec::new());
+    let desired = [SectionPos::ZERO, SectionPos::new(1, 0, 0)];
+    for pos in desired {
+        server.unload_section(&pages, pos, &mut NoReplicas).unwrap();
+    }
+    let bad = server.authority().unwrap().parked_sections()[&desired[1]].digest;
+    let path = pages.path(bad);
+    let original = std::fs::read(&path).unwrap();
+    std::fs::write(&path, b"corrupt").unwrap();
+    server
+        .enable_residency(
+            ResidencyConfig {
+                max_resident: 4,
+                max_io_bytes: 64 * 1024 * 1024,
+            },
+            pages.clone(),
+            None,
+            &desired,
+        )
+        .unwrap();
+    server.set_residency_batch_pages(2).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let ResidencyProgress::Batch(report) = server.poll_residency(&mut NoReplicas).unwrap() {
+            assert_eq!(report.committed, vec![desired[0]]);
+            assert_eq!(report.failure.unwrap().0, desired[1]);
+            assert_eq!(
+                report.durability.through.0,
+                server.authority().unwrap().cursor().seq.0
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::fs::write(path, original).unwrap();
+    settle_batch(&mut server);
+    assert_eq!(server.authority().unwrap().world().store().len(), 2);
+}
+
+#[test]
+fn batched_partial_append_and_sync_failure_stop_host_and_recover_valid_prefix() {
+    use std::io::Write;
+    use torse_storage::{Checkpoints, FileCheckpointBackend, Journal, JournalBackend};
+    struct FailingFile {
+        file: std::fs::File,
+        appends: usize,
+        partial: bool,
+    }
+    impl JournalBackend for FailingFile {
+        fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.appends += 1;
+            if self.partial && self.appends == 2 {
+                self.file.write_all(&bytes[..bytes.len() / 2])?;
+                return Err(std::io::Error::other("injected partial append"));
+            }
+            self.file.write_all(bytes)
+        }
+        fn sync(&mut self) -> std::io::Result<()> {
+            self.file.sync_all()?;
+            Err(std::io::Error::other(
+                "injected failed sync acknowledgement",
+            ))
+        }
+    }
+    for partial in [true, false] {
+        let dir = Directory::new();
+        let pages = pages(&dir);
+        let directory = dir.acquire();
+        std::fs::create_dir(dir.0.join("checkpoints")).unwrap();
+        let (world, actions) = base::world().unwrap();
+        let binding = Binding {
+            world: base::WORLD,
+            epoch: directory.epoch(),
+            compatibility: world.coordinator().compatibility(),
+        };
+        let config = base::file_policy();
+        let codec = base::Codec::new(base::codec_limits()).unwrap();
+        let backend = FailingFile {
+            file: std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(dir.0.join("journal.log"))
+                .unwrap(),
+            appends: 0,
+            partial,
+        };
+        let journal = Journal::with_backend(
+            binding,
+            CommitCursor::initial(base::WORLD),
+            codec,
+            config.journal,
+            backend,
+        )
+        .unwrap();
+        let checkpoints = Checkpoints::open(
+            binding,
+            codec,
+            config.checkpoint,
+            FileCheckpointBackend::open(dir.0.join("checkpoints")).unwrap(),
+        )
+        .unwrap();
+        let host = ExecutionHost::new(
+            binding,
+            world,
+            actions,
+            Vec::new(),
+            base::execution_limits(),
+        )
+        .unwrap();
+        let mut server =
+            Server::initialize(directory, host, journal, checkpoints, config.server).unwrap();
+        let desired: Vec<_> = (0..6).map(|x| SectionPos::new(x, 0, 0)).collect();
+        server
+            .enable_residency(
+                ResidencyConfig {
+                    max_resident: 6,
+                    max_io_bytes: 128 * 1024 * 1024,
+                },
+                pages.clone(),
+                Some(Arc::new(EmptyGenerator {
+                    identity: identity(),
+                    gate: None,
+                })),
+                &desired,
+            )
+            .unwrap();
+        server.set_residency_batch_pages(4).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match server.poll_residency(&mut NoReplicas) {
+                Err(_) => break,
+                Ok(ResidencyProgress::Pending) => {}
+                other => panic!("expected injected failure: {other:?}"),
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(server.state(), ServerState::Faulted);
+        assert_eq!(server.durability().through.0, 0);
+        assert!(server.authority().is_err());
+        drop(server);
+        let recovered = open(&dir, pages, Vec::new());
+        let expected = if partial { 1 } else { 4 };
+        assert_eq!(recovered.authority().unwrap().cursor().seq.0, expected);
+        assert_eq!(
+            recovered.authority().unwrap().world().store().len(),
+            2 + expected as usize
+        );
     }
 }
 

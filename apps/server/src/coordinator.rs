@@ -67,9 +67,9 @@ pub struct CommitBatch {
     pub idle: bool,
 }
 
-enum PublishedStep {
+pub(crate) enum PublishedStep<P> {
     Idle,
-    Blocked(StageError),
+    Blocked(StageError, P),
     Published(Publication),
 }
 
@@ -281,7 +281,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         for _ in 0..max_records {
             match self.publish_one(sink, None)? {
                 PublishedStep::Published(_) => committed += 1,
-                PublishedStep::Blocked(error) => {
+                PublishedStep::Blocked(error, _) => {
                     blocked = Some(error);
                     break;
                 }
@@ -319,7 +319,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         }
         match self.publish_one(sink, deadline)? {
             PublishedStep::Idle => Ok(CommitStep::Idle),
-            PublishedStep::Blocked(error) => Ok(CommitStep::Blocked(error)),
+            PublishedStep::Blocked(error, _) => Ok(CommitStep::Blocked(error)),
             PublishedStep::Published(publication) => {
                 let durability = self.flush_to(publication.at)?;
                 Ok(CommitStep::Durable(DurablePublication {
@@ -330,11 +330,11 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         }
     }
 
-    fn publish_one(
+    pub(crate) fn publish_one(
         &mut self,
         sink: &mut impl InvalidationSink,
         deadline: Option<Tick>,
-    ) -> Result<PublishedStep, Fault> {
+    ) -> Result<PublishedStep<A::Prepared>, Fault> {
         let before = self.authority.cursor();
         let resume_before = self.authority.resume_point();
         let preparation = {
@@ -375,7 +375,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         let staged = match self.journal.try_stage(prepared.record()) {
             Ok(staged) => staged,
             Err(StageError::Stopped(error)) => return Err(self.fail(error)),
-            Err(error) => return Ok(PublishedStep::Blocked(error)),
+            Err(error) => return Ok(PublishedStep::Blocked(error, prepared)),
         };
         let publication_result = {
             let _span = self.profiler.span(Stage::Publication);
@@ -552,7 +552,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         })
     }
 
-    fn flush_to(&mut self, cursor: CommitCursor) -> Result<Durability, Fault> {
+    pub(crate) fn flush_to(&mut self, cursor: CommitCursor) -> Result<Durability, Fault> {
         let start = Instant::now();
         let result = {
             let _span = self.profiler.span(Stage::Flush);
