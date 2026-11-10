@@ -240,12 +240,12 @@ fn event_only_commits_authorize_before_queue_and_client_releases_once() {
         let decoded: WorldReplicaBatch =
             wire::decode(&encoded, base::budget(), base::codec_limits()).unwrap();
         let mut mirror = ReplicaMirror::from_seed(allowed).unwrap();
-        let before = mirror.state.clone();
+        let before = mirror.state().clone();
         let mut invalid: WorldReplicaBatch =
             wire::decode(&encoded, base::budget(), base::codec_limits()).unwrap();
         invalid.changes.presentation[0].id.epoch = WorldEpoch(2);
         assert!(mirror.apply_with_presentation(invalid).is_err());
-        assert_eq!(mirror.state, before);
+        assert_eq!(mirror.state(), &before);
         let effects = mirror
             .apply_with_presentation(
                 wire::decode(&encoded, base::budget(), base::codec_limits()).unwrap(),
@@ -260,7 +260,7 @@ fn event_only_commits_authorize_before_queue_and_client_releases_once() {
         source.close_replica(binding, outside.subscription).unwrap();
         let new = open(&mut source, 4, actor(), scope());
         assert!(take(&mut source, binding, &new).is_empty());
-        assert_eq!(mirror.state, new.state);
+        assert_eq!(mirror.state(), &new.state);
     }
 }
 

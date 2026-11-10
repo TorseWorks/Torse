@@ -1,0 +1,9 @@
+{
+  "order": "in-place-first",
+  "exit_code": 0,
+  "command": [
+    "mirror_baseline.exe",
+    "run-04",
+    "--in-place-first"
+  ]
+}
