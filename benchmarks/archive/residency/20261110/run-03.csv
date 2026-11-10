@@ -1,0 +1,5 @@
+mode,case,pages,flush_requests,backend_sync_calls,first_ready_ns,total_ready_ns,max_poll_ns,polls
+1,install,24,24,,569200,6848800,567800,24
+1,reload,24,24,,597600,12771100,852400,24
+24,install,24,6,,586200,1852800,436500,134
+24,reload,24,6,,3799700,5422000,430300,4817

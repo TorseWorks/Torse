@@ -1,0 +1,19 @@
+{
+  "run": 2,
+  "pid_scope": "independent child process",
+  "exit_code": 0,
+  "order": "batch-first",
+  "hashes": {
+    "1-install-state.bin": "1d90c0551c2501b28db70549647dc453863d2f91f0fe25b5aca85b341260ab87",
+    "1-journal.log": "687b57a9954c78b6519520d7b45b2d815df19f23719d7430ce4e1ddf5d85ac2b",
+    "1-reload-state.bin": "cb179fefcca3b4dd2e33f5f0d137172ca254ca0d47cde560bd8f85f52329e1b6",
+    "24-install-state.bin": "1d90c0551c2501b28db70549647dc453863d2f91f0fe25b5aca85b341260ab87",
+    "24-journal.log": "687b57a9954c78b6519520d7b45b2d815df19f23719d7430ce4e1ddf5d85ac2b",
+    "24-reload-state.bin": "cb179fefcca3b4dd2e33f5f0d137172ca254ca0d47cde560bd8f85f52329e1b6"
+  },
+  "command": [
+    "residency_baseline.exe",
+    "run-02",
+    "--batch-first"
+  ]
+}
