@@ -13,6 +13,7 @@ mod generation;
 pub use generation::GenerationIdentity;
 pub mod execution;
 pub mod item_drops;
+pub use execution::installs;
 mod lifecycle;
 #[cfg(feature = "mods")]
 pub mod mods;

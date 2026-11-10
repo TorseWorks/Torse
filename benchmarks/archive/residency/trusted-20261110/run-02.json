@@ -1,0 +1,15 @@
+{
+  "order": "batch-first",
+  "hashes": {
+    "batch-journal.log": "88461945c8c02e76f75c8ee232d9505c2563a313d3fd47226411b1568dffa5a3",
+    "batch-state.bin": "63341d87977ce22caf34bdc3dbafcc852a001cd1be956635b88dc87311bfb1bb",
+    "single-journal.log": "88461945c8c02e76f75c8ee232d9505c2563a313d3fd47226411b1568dffa5a3",
+    "single-state.bin": "63341d87977ce22caf34bdc3dbafcc852a001cd1be956635b88dc87311bfb1bb"
+  },
+  "exit_code": 0,
+  "command": [
+    "trusted_install_baseline.exe",
+    "run-02",
+    "--batch-first"
+  ]
+}

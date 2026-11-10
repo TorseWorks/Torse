@@ -1,0 +1,13 @@
+{
+  "build": "f6d766c81a88f2f8ad54b7bccc64906d4a9fa74c",
+  "binary_sha256": "eaf088362a8fcb5a3bc77ed967bec9ab180d3ff27acb8aba5460f8ed744d806b",
+  "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "cpu": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+  "logical_cpus": 32,
+  "pages": 24,
+  "generated_entities_per_page": 1,
+  "journal_pending_records": 4,
+  "logical_batch_budget_bytes": 8388608,
+  "scope": "file-backed trusted installs; total includes batch handle validation; max call excludes handle construction; flush requests only, backend sync calls uninstrumented; no shared MemoryPool attached"
+}
