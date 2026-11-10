@@ -66,6 +66,19 @@ fn removed_symbol_referenced_by_retained_terrain_is_atomically_rejected() {
 }
 
 #[test]
+fn redefining_existing_symbols_reuses_terrain_with_the_new_dictionary() {
+    let mut mirror = ReplicaMirror::from_seed(seed(2)).unwrap();
+    let buffers = pointers(&mirror);
+    let mut expected = mirror.state().clone();
+    expected.states[0].block = ContentKey::parse("test:replacement").unwrap();
+    let mut update = changes(&mirror);
+    update.states = expected.states.clone();
+    mirror.apply_interest(batch(&mirror, update)).unwrap();
+    assert_eq!(mirror.state(), &expected);
+    assert_eq!(pointers(&mirror), buffers);
+}
+
+#[test]
 fn symbol_removal_with_section_removal_or_replacement_matches_full_state() {
     for replacement in [false, true] {
         let mut mirror = ReplicaMirror::from_seed(seed(2)).unwrap();

@@ -1,0 +1,8 @@
+{
+  "order": "clone-first",
+  "exit_code": 0,
+  "command": [
+    "mirror_baseline.exe",
+    "run-05"
+  ]
+}

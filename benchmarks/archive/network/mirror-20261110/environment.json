@@ -1,0 +1,9 @@
+{
+  "build": "e5f666ad2b678a1e844f7763cd3e7bf3f82be572",
+  "binary_sha256": "ffcc9238389262446873ee7ae245c17bd962c97ea6d896d4dd0ecde4aa1eea8c",
+  "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "cpu": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+  "logical_cpus": 32,
+  "scope": "dense 16^3 sections, 10 warmups and 100 samples per case; logical retained cell copy bytes only, not allocator traffic or validation reads; clone_validate is an explicit reference, not a historical binary"
+}
