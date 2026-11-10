@@ -63,6 +63,16 @@ impl SectionPages {
     pub fn budget(&self) -> OutputBudget {
         self.budget
     }
+    pub(crate) fn measure(&self, page: &Snapshot, max_bytes: u64) -> Result<wire::WireCost, Fault> {
+        wire::measure_inner(
+            page,
+            OutputBudget {
+                max_bytes: self.budget.max_bytes.min(max_bytes),
+                ..self.budget
+            },
+            self.codec,
+        )
+    }
     fn encode(&self, page: &Snapshot) -> Result<Vec<u8>, Fault> {
         if page.sections.len() != 1 {
             return Err(Fault::invalid_data("page requires exactly one section"));

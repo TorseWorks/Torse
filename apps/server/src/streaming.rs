@@ -90,7 +90,10 @@ impl ExecutionHost {
                     .all(|e| matches!(e.event.dependencies(), Ok(EventDependencies::Scoped(_)))))
     }
 
-    fn prepare_residency(&self, change: SectionChange) -> Result<ExecutionPrepared, Fault> {
+    pub(crate) fn prepare_residency(
+        &self,
+        change: SectionChange,
+    ) -> Result<ExecutionPrepared, Fault> {
         let _codec = self
             .memory_pool()
             .map(|pool| {
@@ -167,7 +170,7 @@ impl ExecutionHost {
     }
 }
 
-fn reference(page: &Snapshot, digest: Digest) -> ParkedSection {
+pub(crate) fn reference(page: &Snapshot, digest: Digest) -> ParkedSection {
     ParkedSection {
         digest,
         entities: page.entities.iter().map(|e| e.id).collect(),
