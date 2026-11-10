@@ -1,0 +1,22 @@
+{
+  "order": "seed-first",
+  "hashes": {
+    "interest-0-state.bin": "00d3f349ec7a681d6e93bff6f77a4d3297baccccd50329a697a0f49141ee9e0a",
+    "interest-1-state.bin": "2a875b63e059666c64755075bc944e56dfa952c17696d23fd4f31965deb8cc3d",
+    "interest-2-state.bin": "00d3f349ec7a681d6e93bff6f77a4d3297baccccd50329a697a0f49141ee9e0a",
+    "interest-3-state.bin": "2a875b63e059666c64755075bc944e56dfa952c17696d23fd4f31965deb8cc3d",
+    "interest-4-state.bin": "00d3f349ec7a681d6e93bff6f77a4d3297baccccd50329a697a0f49141ee9e0a",
+    "interest-5-state.bin": "2a875b63e059666c64755075bc944e56dfa952c17696d23fd4f31965deb8cc3d",
+    "seed-0-state.bin": "00d3f349ec7a681d6e93bff6f77a4d3297baccccd50329a697a0f49141ee9e0a",
+    "seed-1-state.bin": "2a875b63e059666c64755075bc944e56dfa952c17696d23fd4f31965deb8cc3d",
+    "seed-2-state.bin": "00d3f349ec7a681d6e93bff6f77a4d3297baccccd50329a697a0f49141ee9e0a",
+    "seed-3-state.bin": "2a875b63e059666c64755075bc944e56dfa952c17696d23fd4f31965deb8cc3d",
+    "seed-4-state.bin": "00d3f349ec7a681d6e93bff6f77a4d3297baccccd50329a697a0f49141ee9e0a",
+    "seed-5-state.bin": "2a875b63e059666c64755075bc944e56dfa952c17696d23fd4f31965deb8cc3d"
+  },
+  "command": [
+    "interest_baseline.exe",
+    "run-05"
+  ],
+  "exit_code": 0
+}

@@ -6,6 +6,16 @@
 
 主程序通过`--memory-mib N`设置共享逻辑内存上限，默认512MiB。世界、执行、存储、订阅、传输和并行工作使用同一MemoryPool；预算不足暂停可重试工作，提交序号保持不变，关闭控制消息保留专用空间。库宿主在恢复后、注册会话前调用`Server::attach_memory`，并使用`NetworkHub::with_memory`。预留口径、失败释放及不包含的内存范围见[共享内存记录](../../benchmarks/archive/performance/M6-shared-memory.md)。
 
+## 兴趣范围增量
+
+应用协议5的`Interest`与普通`Batch`共享订阅序号，允许在同一耐久游标连续切换。保留区域的未变地形直接复用，进入区域与实体字段按当前授权投影；重复、缺失、乱序更新返回`ResetRequired`。初次订阅和`NetworkHub::reset_policy`继续发送完整`Seed`。传输未排空时修改策略会关闭连接并要求重连，详情见[协议格式](../../crates/protocol/FORMAT.md#兴趣范围切换)。客户端与服务端须同时升级，不改变存档格式。
+
+公开文件夹具比较256分区、224分区重叠窗口，六个独立release进程交替执行两种顺序，共72次切换。每次客户端镜像都与新生成的完整授权快照逐项相等，两条路径和各进程的状态字节哈希一致。完整Seed每次包含256页及224页交集地形，Interest只包含32页进入地形，交集地形载荷为零。
+
+Windows 26200、Rust 1.93.1上，Seed正文为138208–138551字节，Interest为1856–2167字节。宿主切换调用耗时分别为0.273–0.451毫秒（中位0.346）与0.046–0.136毫秒（中位0.063）。该固定、热缓存夹具包含少量实体和非空地形；内存传输测量不含TCP/TLS帧头、Socket I/O、客户端应用和完整快照对照耗时，不代表复杂实体或冷缓存负载。
+
+原始样本、环境与状态哈希见[测量归档](../../benchmarks/archive/network/interest-20261110/environment.json)。重跑：`cargo build --release -p torse-server --example interest_baseline --locked`，随后`python apps/server/examples/interest_baseline/repeat.py --binary <release-example> --output <new-archive> --work <new-fixtures> --build <build-commit>`。大状态字节只保留在work目录，归档保存样本和哈希。
+
 ## 队列与进度诊断
 
 库宿主向`Server::queue_diagnostics`、`NetworkHub::queue_diagnostics`或`peer_queue_diagnostics`传入`torse_types::QueueDiagnostics`读取已有账目。默认配置返回`NotEnabled`；显式使用`QueueDiagnostics::enabled(4096)?`启用一次读取，参数限制返回值的固定尺寸，包含外层`Diagnostic`，合法范围为1字节至1MiB。尺寸不足返回`BudgetUnavailable`。这些接口不分配快照缓冲、不保存历史、不增加生产路径计数器或时钟；调用方保留的副本、序列化和导出内存由调用方管理，不属于内核预留。

@@ -264,3 +264,55 @@ fn explicit_reset_uses_a_new_seed_and_output_budget_failure_invalidates_projecti
     // No partial interest delta was placed in transport; the host must reset.
     assert!(drain(&mut client).0.is_empty());
 }
+
+#[test]
+fn pending_source_edit_falls_back_to_a_complete_current_seed() {
+    use torse_sim::{action::ActionTarget, durable::Call};
+    use torse_world::ComponentValue;
+    let dir = Directory::new();
+    let mut server = create(&dir);
+    let (mut hub, id, mut client, mirror, _) = connect(&mut server, scope(0));
+    send(
+        &mut client,
+        ClientMessage::Request {
+            seq: RequestSeq(1),
+            call: Call {
+                action: base::key("world:action/place"),
+                version: 1,
+                target: ActionTarget::Block(BlockPos::new(640, 1, 1)),
+                parameters: [(
+                    base::key("world:field/block"),
+                    ComponentValue::Content(base::key("base:stone")),
+                )]
+                .into(),
+            },
+        },
+    );
+    hub.poll(&mut server).unwrap();
+    drain(&mut client);
+    server.drive_tick(&mut hub, 1024).unwrap();
+    // Commit produced a source delta, but the network has not taken it yet.
+    assert!(
+        !server
+            .authority()
+            .unwrap()
+            .can_change_interest(SessionId(1))
+    );
+    hub.replace_policy(
+        &mut server,
+        id,
+        PeerPolicy {
+            actor: actor(),
+            scope: scope(32),
+        },
+    )
+    .unwrap();
+    let messages = drain(&mut client).0;
+    assert_eq!(messages.len(), 1);
+    let ServerMessage::Seed(seed) = messages.into_iter().next().unwrap() else {
+        panic!("pending source requires seed")
+    };
+    assert_ne!(seed.subscription, mirror.subscription);
+    assert!(seed.baseline.seq > mirror.through.seq);
+    assert_eq!(seed.state, reference(&mut server, actor(), scope(32)));
+}
