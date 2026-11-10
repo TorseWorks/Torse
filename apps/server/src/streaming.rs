@@ -6,6 +6,14 @@ use crate::{
 use torse_storage::CommitJournal;
 use torse_world::Snapshot;
 
+/// Last atomic installation attempt, including preparation and durable wait time.
+#[derive(Clone, Debug, Default)]
+pub struct SectionInstallDiagnostics {
+    pub sections: usize,
+    pub elapsed: std::time::Duration,
+    pub failure: Option<String>,
+}
+
 const MAX_RESIDENT: usize = 4096;
 
 impl ExecutionHost {
@@ -101,6 +109,43 @@ impl ExecutionHost {
                 )
             })
             .transpose()?;
+        self.check_residency(&change)?;
+        let world = if change.fresh {
+            self.world()
+                .prepare_generated_section(&change.page, self.limits.runtime)?
+        } else {
+            self.world()
+                .prepare_section(&change.page, change.load, self.limits.runtime)?
+        };
+        let meta = world.meta();
+        let changes = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
+            .map_err(|e| Fault::invalid_data(e.to_string()))?;
+        let mut prepared = ExecutionPrepared {
+            memory: None,
+            world: PreparedWorld {
+                normal: None,
+                section: Some(Box::new(world)),
+                sections: None,
+            },
+            runtime: self.runtime.clone(),
+            remove_pending: Vec::new(),
+            record: CommitRecord {
+                meta,
+                changes: ExecutionChanges {
+                    world: changes,
+                    runtime: RuntimeUpdate::Full(self.runtime.clone()),
+                    outcome: None,
+                    cancelled: None,
+                    section: Some(change),
+                    sections: Vec::new(),
+                },
+            },
+        };
+        wire::measure_inner(&prepared.record, self.limits.runtime, self.limits.codec)?;
+        self.account_residency(&mut prepared)?;
+        Ok(prepared)
+    }
+    fn check_residency(&self, change: &SectionChange) -> Result<(), Fault> {
         if !self.at_tick_boundary()
             || (!change.load && !self.pending.is_empty())
             || self.frozen.is_some()
@@ -111,7 +156,7 @@ impl ExecutionHost {
                 "section transition requires an idle tick boundary",
             ));
         }
-        check_reference(&change, &self.parked)?;
+        check_reference(change, &self.parked)?;
         if !change.load
             && self.runtime.events.iter().any(|event| {
                 event
@@ -132,32 +177,61 @@ impl ExecutionHost {
             candidate.insert(change.page.sections[0].pos, change.reference.clone());
             wire::measure_inner(&candidate, self.limits.runtime, self.limits.codec)?;
         }
-        let world = if change.fresh {
-            self.world()
-                .prepare_generated_section(&change.page, self.limits.runtime)?
-        } else {
-            self.world()
-                .prepare_section(&change.page, change.load, self.limits.runtime)?
-        };
+        Ok(())
+    }
+
+    fn prepare_section_batch(
+        &self,
+        changes: Vec<SectionChange>,
+    ) -> Result<ExecutionPrepared, Fault> {
+        if changes.is_empty() || changes.len() > self.section_install_limit {
+            return Err(Fault::resource_limit(
+                "generated batch exceeds section limit",
+            ));
+        }
+        if self.world().store().len().saturating_add(changes.len()) > MAX_RESIDENT {
+            return Err(Fault::resource_limit("resident section capacity"));
+        }
+        for change in &changes {
+            self.check_residency(change)?;
+        }
+        let _codec = self
+            .memory_pool()
+            .map(|pool| {
+                pool.reserve(
+                    MemoryClass::Codec,
+                    self.limits.runtime.max_bytes.saturating_mul(4),
+                    EvictionRank::Pinned,
+                )
+            })
+            .transpose()?;
+        // Bound the full input before the world decodes or clones individual pages.
+        wire::measure_inner(&changes, self.limits.runtime, self.limits.codec)?;
+        let pages: Vec<_> = changes.iter().map(|c| c.page.clone()).collect();
+        let world = self
+            .world()
+            .prepare_generated_sections(&pages, self.limits.runtime)?;
         let meta = world.meta();
-        let changes = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
+        let empty = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
             .map_err(|e| Fault::invalid_data(e.to_string()))?;
         let mut prepared = ExecutionPrepared {
             memory: None,
             world: PreparedWorld {
                 normal: None,
-                section: Some(Box::new(world)),
+                section: None,
+                sections: Some(Box::new(world)),
             },
             runtime: self.runtime.clone(),
             remove_pending: Vec::new(),
             record: CommitRecord {
                 meta,
                 changes: ExecutionChanges {
-                    world: changes,
+                    world: empty,
                     runtime: RuntimeUpdate::Full(self.runtime.clone()),
                     outcome: None,
                     cancelled: None,
-                    section: Some(change),
+                    section: None,
+                    sections: changes,
                 },
             },
         };
@@ -370,6 +444,63 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         self.authority.section_pending = Some(self.authority.prepare_residency(change)?);
         self.drive_one(sink)
     }
+    /// Set the atomic installation bound without changing storage or output budgets.
+    pub fn set_section_install_limit(&mut self, max_sections: usize) -> Result<(), Fault> {
+        self.authority()?;
+        if !(1..=1024).contains(&max_sections) {
+            return Err(Fault::invalid_data(
+                "section install limit must be 1..=1024",
+            ));
+        }
+        self.authority.section_install_limit = max_sections;
+        Ok(())
+    }
+    pub fn section_install_diagnostics(&self) -> &SectionInstallDiagnostics {
+        &self.authority.section_install_diagnostics
+    }
+    /// Install an ordered generated batch as one record, publication and durable barrier.
+    /// Pages use the current generation cut and consecutive authority-allocated IDs.
+    pub fn install_section_batch(
+        &mut self,
+        pages: &SectionPages,
+        batch: Vec<Snapshot>,
+        sink: &mut impl InvalidationSink,
+    ) -> Result<CommitStep, Fault> {
+        let start = std::time::Instant::now();
+        let count = batch.len();
+        let result = (|| {
+            self.authority()?;
+            if count == 0 || count > self.authority.section_install_limit {
+                return Err(Fault::resource_limit(
+                    "generated batch exceeds section limit",
+                ));
+            }
+            let mut changes = Vec::with_capacity(count);
+            for page in batch {
+                let digest = pages.digest(&page)?;
+                changes.push(SectionChange {
+                    reference: reference(&page, digest),
+                    page,
+                    load: true,
+                    fresh: true,
+                });
+            }
+            self.authority.section_pending = Some(self.authority.prepare_section_batch(changes)?);
+            self.drive_one(sink)
+        })();
+        let failure = match &result {
+            Err(error) => Some(error.to_string()),
+            Ok(CommitStep::Blocked(error)) => Some(format!("{error:?}")),
+            _ => None,
+        };
+        self.authority.section_install_diagnostics = SectionInstallDiagnostics {
+            sections: count,
+            elapsed: start.elapsed(),
+            failure,
+        };
+        result
+    }
+
     /// Install trusted generated terrain and freshly allocated attached state atomically.
     pub fn install_section(
         &mut self,
@@ -470,6 +601,54 @@ impl ExecutionRecovery<'_> {
             self.parked.insert(pos, change.reference.clone());
         }
         Ok(())
+    }
+
+    pub(super) fn replay_section_batch(
+        &mut self,
+        record: CommitRecord<ExecutionChanges>,
+    ) -> Result<(), Fault> {
+        let changes = &record.changes;
+        let before = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| Fault::invalid_data("missing runtime"))?;
+        let point = self
+            .point
+            .ok_or_else(|| Fault::invalid_data("missing resume point"))?;
+        if changes.section.is_some()
+            || changes.sections.len() > 1024
+            || changes.sections.is_empty()
+            || record.meta != changes.world.meta
+            || record.meta.compatibility != self.binding.compatibility
+            || record.meta.resume_at != point
+            || point.next_phase != 0
+            || point.next_step != 0
+            || before.work.is_some()
+            || changes.outcome.is_some()
+            || changes.cancelled.is_some()
+            || !matches!(&changes.runtime, RuntimeUpdate::Full(state) if state == before)
+        {
+            return Err(Fault::invalid_data(
+                "invalid generated batch execution semantics",
+            ));
+        }
+        wire::measure_inner(&record, self.limits.runtime, self.limits.codec)?;
+        let store = self
+            .section_pages
+            .as_ref()
+            .ok_or_else(|| Fault::invalid_data("missing section pages"))?;
+        for change in &changes.sections {
+            check_reference(change, &self.parked)?;
+            if !change.fresh
+                || !change.load
+                || store.digest(&change.page)? != change.reference.digest
+            {
+                return Err(Fault::invalid_data("invalid generated batch page"));
+            }
+        }
+        let pages: Vec<_> = changes.sections.iter().map(|c| c.page.clone()).collect();
+        self.recovery
+            .replay_generated_sections(&changes.world, &pages, self.limits.runtime)
     }
 
     pub(super) fn validate_parked(&self) -> Result<(), Fault> {

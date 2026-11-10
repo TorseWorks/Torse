@@ -35,6 +35,7 @@ mod player_control;
 #[path = "streaming.rs"]
 mod streaming;
 pub use player_control::{PlayerState, movement_action, movement_call};
+pub use streaming::SectionInstallDiagnostics;
 
 pub struct ExecutionModel;
 /// Derived event tickets. They are rebuilt from committed events and current entity locations.
@@ -170,6 +171,8 @@ pub struct ExecutionHost {
     players: BTreeMap<u128, player_control::PlayerSession>,
     parked: BTreeMap<SectionPos, ParkedSection>,
     section_pending: Option<ExecutionPrepared>,
+    section_install_limit: usize,
+    section_install_diagnostics: streaming::SectionInstallDiagnostics,
     source: ReplicaSource,
     runtime: RuntimeState,
     rules: Vec<Box<dyn DurableRule>>,
@@ -200,6 +203,7 @@ pub struct ExecutionPrepared {
 struct PreparedWorld {
     normal: Option<torse_sim::PreparedChange>,
     section: Option<Box<torse_sim::streaming::PreparedSection>>,
+    sections: Option<Box<torse_sim::streaming::PreparedSections>>,
 }
 impl PreparedChange for ExecutionPrepared {
     type Model = ExecutionModel;
@@ -464,6 +468,8 @@ impl ExecutionHost {
             source: ReplicaSource::new(world, binding, limits.replicas)?,
             parked: BTreeMap::new(),
             section_pending: None,
+            section_install_limit: 24,
+            section_install_diagnostics: streaming::SectionInstallDiagnostics::default(),
             runtime,
             rules,
             actions,
@@ -960,11 +966,13 @@ impl ExecutionHost {
                     outcome,
                     cancelled: None,
                     section: None,
+                    sections: Vec::new(),
                 },
             },
             world: PreparedWorld {
                 normal: Some(prepared),
                 section: None,
+                sections: None,
             },
             remove_pending,
             runtime,
@@ -1419,7 +1427,9 @@ impl HostAuthority for ExecutionHost {
             ));
         }
         let accounting = prepared.memory.take();
-        let publication = if let Some(section) = prepared.world.section {
+        let publication = if let Some(sections) = prepared.world.sections {
+            self.source.publish_sections(*sections)
+        } else if let Some(section) = prepared.world.section {
             self.source.publish_section(*section)
         } else {
             self.source
@@ -1616,6 +1626,9 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
         Ok(())
     }
     fn replay(&mut self, record: CommitRecord<ExecutionChanges>) -> Result<(), Fault> {
+        if !record.changes.sections.is_empty() {
+            return self.replay_section_batch(record);
+        }
         if record.changes.section.is_some() {
             return self.replay_section(record);
         }

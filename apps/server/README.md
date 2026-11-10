@@ -395,3 +395,13 @@ Windows 11 build 26200 and NTFS; affinity and power were uncontrolled and caches
 evicted. These numbers apply only to this fixed experiment. Per-process instrumented-minus-
 uninstrumented mean differences ranged from -0.6683ms to +0.6543ms across file cases. They
 do not establish stable observer overhead or any speedup. CPU time was not separately sampled.
+
+### 原子安装已生成分区
+
+`Server<ExecutionHost,_,_>::install_section_batch(&pages, batch, &mut sink)`接收有序`Vec<Snapshot>`，将整批作为单条持久记录安装。默认单批上限24，`set_section_install_limit(1..=1024)`调整上限，其他输出、存储、内存与驻留预算保持原配置。每页使用当前权威生成切面；附带实体仍须遵守`install_section`的校验，编号按页顺序连续分配，不在此接口隐式重映射引用。
+
+任何非法页面或总预算不足都拒绝整批，journal压力返回`CommitStep::Blocked`，不会发布前缀或消耗实体编号。调用方需要重试时保留原输入，确认生成切面仍有效；只有`CommitStep::Durable`表示整个批次到达持久位置。终止性存储错误使宿主停止，必须重开判定完整日志。`section_install_diagnostics()`保留最近一批数量、包含准备和持久等待的耗时以及失败原因，停止后仍可读取。
+
+此接口区别于`set_residency_batch_pages`的有界前缀组提交。已有驻留、权限、tick和事件处理接口不变。提交布局版本4及兼容边界见[Execution载荷](../../crates/codec/EXECUTION.md)。复跑安装与恢复基准：`cargo test --release -p torse-server --test atomic_install --locked release_atomic_column_install_comparison -- --ignored --nocapture --test-threads=1`。该夹具使用一列24个均匀石块分区和实际文件后端，并直接统计journal追加与同步调用；不包含生成、传输或客户端呈现耗时。
+
+[20261110]同机实测：Windows 11 10.0.26200，WD Blue SN580 1TB NVMe SSD，Rust 1.93.1，Release，单进程文件后端，交替顺序各六轮。24分区逐个安装中位数8.601ms，原子批次0.7395ms，单分区0.6765ms；整批约为单次1.09倍，较逐个安装快11.63倍。安装吞吐分别约2790和32454分区/秒。实际journal追加及同步调用从24次降为1次；新建checkpoint和输入页构造不在计时区间内，准备、发布、日志追加与同步均在区间内，每轮随后重开核对完整状态。夹具没有生成、传输或50ms tick循环，不能据此推断集成地形列吞吐；未进行硬件断电测试。原始样本、配置和源码指纹见[测量数据](../../benchmarks/archive/residency/atomic-20261110/environment.json)与[逐轮样本](../../benchmarks/archive/residency/atomic-20261110/samples.json)。

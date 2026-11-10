@@ -202,15 +202,53 @@ impl WorldAuthority {
 
     pub fn publish_section(
         &mut self,
-        mut prepared: crate::streaming::PreparedSection,
+        prepared: crate::streaming::PreparedSection,
     ) -> Result<Publication, CommitFault> {
         prepared.validate(self)?;
+        let barrier = prepared.barrier.clone();
+        let mut publication =
+            self.coordinator
+                .publish_with_entities(&mut self.store, &mut self.entities, barrier)?;
+        self.install_prepared_section(prepared, &mut publication)?;
+        Ok(publication)
+    }
+
+    pub fn prepare_generated_sections(
+        &self,
+        pages: &[Snapshot],
+        budget: torse_types::OutputBudget,
+    ) -> Result<crate::streaming::PreparedSections, torse_types::Fault> {
+        crate::streaming::prepare_batch(self, pages, budget)
+    }
+
+    pub fn publish_sections(
+        &mut self,
+        prepared: crate::streaming::PreparedSections,
+    ) -> Result<Publication, CommitFault> {
+        for section in &prepared.sections {
+            section.validate(self)?;
+        }
+        let mut sections = prepared.sections.into_iter();
+        let first = sections
+            .next()
+            .ok_or(CommitFault::Invariant("empty section batch"))?;
+        let barrier = first.barrier.clone();
+        let mut publication =
+            self.coordinator
+                .publish_with_entities(&mut self.store, &mut self.entities, barrier)?;
+        self.install_prepared_section(first, &mut publication)?;
+        for section in sections {
+            self.install_prepared_section(section, &mut publication)?;
+        }
+        Ok(publication)
+    }
+
+    fn install_prepared_section(
+        &mut self,
+        mut prepared: crate::streaming::PreparedSection,
+        publication: &mut Publication,
+    ) -> Result<(), CommitFault> {
         let pos = prepared.position();
-        let mut publication = self.coordinator.publish_with_entities(
-            &mut self.store,
-            &mut self.entities,
-            prepared.barrier,
-        )?;
         if prepared.load {
             self.store
                 .request(pos)
@@ -246,7 +284,7 @@ impl WorldAuthority {
                 .section(pos)
                 .map_or(torse_types::Revision::INITIAL, |s| s.revision()),
         ));
-        Ok(publication)
+        Ok(())
     }
 
     pub fn prevalidate_components(
@@ -588,6 +626,24 @@ impl<'a> Recovery<'a> {
         generated: bool,
         budget: torse_types::OutputBudget,
     ) -> Result<(), torse_types::Fault> {
+        self.replay_sections_impl(changes, std::slice::from_ref(page), load, generated, budget)
+    }
+    pub fn replay_generated_sections(
+        &mut self,
+        changes: &ChangeSet,
+        pages: &[Snapshot],
+        budget: torse_types::OutputBudget,
+    ) -> Result<(), torse_types::Fault> {
+        self.replay_sections_impl(changes, pages, true, true, budget)
+    }
+    fn replay_sections_impl(
+        &mut self,
+        changes: &ChangeSet,
+        pages: &[Snapshot],
+        load: bool,
+        generated: bool,
+        budget: torse_types::OutputBudget,
+    ) -> Result<(), torse_types::Fault> {
         let invalid = || torse_types::Fault::invalid_data("illegal section recovery transition");
         if changes.meta.cursor.world != self.world
             || changes.meta.previous != self.seq
@@ -613,17 +669,28 @@ impl<'a> Recovery<'a> {
             entities: restored.entities,
             coordinator,
         };
-        let prepared = if generated {
-            world.prepare_generated_section(page, budget)?
+        if generated && pages.len() > 1 {
+            let prepared = world.prepare_generated_sections(pages, budget)?;
+            if prepared.meta() != changes.meta {
+                return Err(invalid());
+            }
+            world
+                .publish_sections(prepared)
+                .map_err(crate::streaming::fault)?;
         } else {
-            world.prepare_section(page, load, budget)?
-        };
-        if prepared.meta() != changes.meta {
-            return Err(invalid());
+            let page = pages.first().ok_or_else(invalid)?;
+            let prepared = if generated {
+                world.prepare_generated_section(page, budget)?
+            } else {
+                world.prepare_section(page, load, budget)?
+            };
+            if prepared.meta() != changes.meta {
+                return Err(invalid());
+            }
+            world
+                .publish_section(prepared)
+                .map_err(crate::streaming::fault)?;
         }
-        world
-            .publish_section(prepared)
-            .map_err(crate::streaming::fault)?;
         self.seq = changes.meta.cursor.seq;
         self.restored = Some(RestoredWorld {
             store: world.store,

@@ -1,0 +1,20 @@
+{
+  "serial_24": {
+    "median_us": 8601.0,
+    "min_us": 8117,
+    "max_us": 9705,
+    "median_sections_per_second": 2790.3732124171606
+  },
+  "atomic_24": {
+    "median_us": 739.5,
+    "min_us": 552,
+    "max_us": 801,
+    "median_sections_per_second": 32454.361054766734
+  },
+  "atomic_1": {
+    "median_us": 676.5,
+    "min_us": 575,
+    "max_us": 780,
+    "median_sections_per_second": 1478.1966001478197
+  }
+}
