@@ -183,6 +183,8 @@ NetworkHub通过应用协议版本5接收意图，可信actor由PeerPolicy和会
 
 append/sync失败停止宿主。batch.accepted列出已被内存权威接受的页，batch.durability仅代表最近成功确认的耐久水位；失败时不能把accepted全当作已耐久，也不能假定未确认部分全部回滚。必须重新打开目录，按实际完整日志前缀恢复页面与实体分配器，不把旧句柄接到新宿主上重试。测试覆盖24页背压续传、非法页前缀、外部推进、内存预留释放、部分append、sync确认失败，以及确认4页后强制终止子进程再续传。未进行硬件断电验收，不改变存档或协议格式。
 
+公开streaming实体夹具的六个独立release进程交替执行两种顺序，24页、每页1实体。逐页/批量同步请求为24/6，总确认耗时区间为6.112–9.017/1.885–2.614毫秒，中位为6.999/2.274毫秒；批量总耗时包含句柄构造和输入预检。Windows 26200、Rust 1.93.1、日志暂存上限4条，批次逻辑预算8MiB，未附加共享MemoryPool。完整状态、实体编号、日志字节及重开结果一致，跨进程哈希相同。未测后端真实sync调用，不推广到复杂组件、冷缓存或其他硬件。样本见[可信安装归档](../../benchmarks/archive/residency/trusted-20261110/environment.json)，入口为`cargo build --release -p torse-server --example trusted_install_baseline --locked`及`python apps/server/examples/trusted_install_baseline/repeat.py --binary <release-example> --output <new-archive> --work <new-fixtures> --build <build-commit>`。
+
 ## 联网玩家
 
 新世界可加`--players 2`创建两个带碰撞体及持久运动状态的玩家，配合`--fill`提供地面。重开时保留`--players 2`并去掉`--fill`，复用存档中的玩家；请求数量不能超过已有玩家数。演示程序把可用玩家依次分配给连接，断线后可重新分配。这是显式本地策略，正式身份验证另由宿主装配。
