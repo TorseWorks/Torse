@@ -572,6 +572,14 @@ impl ExecutionHost {
             .is_some_and(|live| self.source.can_change_interest(live.viewer))
     }
 
+    pub fn interest_ready(&self, session: SessionId) -> Result<bool, Fault> {
+        let live = self
+            .sessions
+            .get(&session.0)
+            .ok_or_else(|| Fault::invalid_data("unknown session"))?;
+        self.source.interest_ready(live.viewer)
+    }
+
     pub fn change_session_interest(
         &mut self,
         session: SessionId,

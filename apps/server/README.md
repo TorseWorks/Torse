@@ -16,6 +16,8 @@ Windows 26200、Rust 1.93.1上，Seed正文为138208–138551字节，Interest�
 
 原始样本、环境与状态哈希见[测量归档](../../benchmarks/archive/network/interest-20261110/environment.json)。重跑：`cargo build --release -p torse-server --example interest_baseline --locked`，随后`python apps/server/examples/interest_baseline/repeat.py --binary <release-example> --output <new-archive> --work <new-fixtures> --build <build-commit>`。大状态字节只保留在work目录，归档保存样本和哈希。
 
+宿主普通视野移动可调用`NetworkHub::try_change_interest(server, peer, scope)`，仅改变范围并保留actor授权。应用/TLS输出或源复制队列尚未排空时返回`InterestUpdate::Deferred`，不改变旧授权、订阅或序号，也不保存新请求。宿主继续poll并让客户端消费输出后，用当前所需范围重试；成功返回`Applied`并发送一次有序Interest，已完成的相同范围重试不再发送。投影失效返回`ResetRequired`，须显式重置或重连；只支持已建立的显式订阅，不接管自动玩家跟随。未知传输默认不报告空闲，适配器需实现`output_idle`才能使用。强制撤权继续使用`replace_policy`或`revoke`，不能等待该入口排空。
+
 ## 队列与进度诊断
 
 库宿主向`Server::queue_diagnostics`、`NetworkHub::queue_diagnostics`或`peer_queue_diagnostics`传入`torse_types::QueueDiagnostics`读取已有账目。默认配置返回`NotEnabled`；显式使用`QueueDiagnostics::enabled(4096)?`启用一次读取，参数限制返回值的固定尺寸，包含外层`Diagnostic`，合法范围为1字节至1MiB。尺寸不足返回`BudgetUnavailable`。这些接口不分配快照缓冲、不保存历史、不增加生产路径计数器或时钟；调用方保留的副本、序列化和导出内存由调用方管理，不属于内核预留。

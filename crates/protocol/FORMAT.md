@@ -73,6 +73,8 @@ Seed只包含状态。重连、订阅重建和新epoch都从新基线开始，�
 
 ## 兴趣范围切换
 
+宿主的`try_change_interest`仅在旧actor授权下移动视野。待发应用/TLS输出或未消费源批次返回Deferred且不保存请求、不变更授权/订阅/序号，排空后显式重试。失效投影返回ResetRequired。该API不新增协议消息；成功仍使用Interest，强制撤权的关闭屏障不变。
+
 版本5追加Interest标签9，沿用ReplicaBatch封装及ReplicaChanges字段。普通Batch仍要求世界through严格递增；Interest允许through等于前一游标，但禁止倒退，且与普通Batch共用同一订阅的连续ReplicaSeq。Interest不包含呈现事件。重复、缺失、乱序、旧订阅或旧绑定均返回ResetRequired，完整校验失败不修改镜像；应用须丢弃旧连接镜像并重新连接或请求完整Seed。客户端与服务端必须同时升级，Hello拒绝版本1至4，不改变codec/wire版本1或存档布局。
 
 初次订阅和显式NetworkHub::reset_policy使用完整Seed。正常replace_policy在活跃、已取空源队列和空闲传输下保留订阅身份，发送进入分区、离开记录及实体/状态变化；未变交集地形不重新捕获或编码，实体字段仍按新授权逐项过滤。源队列尚有未消费批次或旧投影失效时退回完整Seed，丢弃易失呈现输出。玩家移动时批准权限不变，先按原顺序发送普通编辑，再发送Interest。

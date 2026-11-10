@@ -30,6 +30,13 @@ pub type ServerMessage = torse_protocol::ServerMessage<
     torse_sim::replica::ReplicaChanges,
 >;
 
+/// A deferred request has no side effects and is not retained by the hub.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterestUpdate {
+    Applied,
+    Deferred,
+}
+
 impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
     Server<ExecutionHost, J, S>
 {
@@ -486,6 +493,55 @@ impl<T: Transport> NetworkHub<T> {
         policy: PeerPolicy,
     ) -> Result<(), Fault> {
         self.replace_policy_inner(server, id, policy, true)
+    }
+
+    /// Ordinary host-selected movement with unchanged actor grants. Pending
+    /// application/TLS output or source edits defer without changing the peer.
+    /// Poll/drain before retrying; invalid projections require an explicit reset.
+    /// Use replace_policy/revoke for immediate authorization changes instead.
+    pub fn try_change_interest<
+        J: CommitJournal<ExecutionModel>,
+        S: HostCheckpointStore<ExecutionModel>,
+    >(
+        &mut self,
+        server: &mut Server<ExecutionHost, J, S>,
+        id: u128,
+        scope: ReplicaScope,
+    ) -> Result<InterestUpdate, Fault> {
+        let authority = server.authority()?;
+        if scope.sections.len() > authority.replica_section_limit() {
+            return Err(Fault::resource_limit("session scope too large"));
+        }
+        let peer = self
+            .peers
+            .get(&id)
+            .ok_or_else(|| Fault::invalid_data("unknown peer"))?;
+        let viewer = peer
+            .viewer
+            .ok_or_else(|| Fault::invalid_data("interest requires a session"))?;
+        if peer.closed
+            || peer.subscriptions.is_empty()
+            || (self.follow.is_some() && peer.player.is_some())
+        {
+            return Err(Fault::invalid_data(
+                "interest requires a live explicit subscription",
+            ));
+        }
+        // Check invalidation even with pending output: it cannot be drained into
+        // a valid projection. Caller must reset or disconnect, not retry forever.
+        let ready = authority.interest_ready(viewer.session)?;
+        if !ready || !peer.transport.output_idle() {
+            return Ok(InterestUpdate::Deferred);
+        }
+        if peer.policy.scope.sections == scope.sections {
+            return Ok(InterestUpdate::Applied);
+        }
+        let policy = PeerPolicy {
+            actor: peer.policy.actor.clone(),
+            scope,
+        };
+        self.replace_policy_inner(server, id, policy, true)?;
+        Ok(InterestUpdate::Applied)
     }
 
     /// Explicitly retire old subscriptions and send a complete baseline.
