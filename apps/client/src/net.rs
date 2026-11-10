@@ -282,6 +282,14 @@ impl<T: Transport> Connection<T> {
                 let _ = seq;
                 Ok(Some(NetEvent::Increment(changes)))
             }
+            ServerMessage::Interest(batch) => {
+                let changes = batch.changes.clone();
+                self.mirror
+                    .as_mut()
+                    .ok_or_else(|| Fault::invalid_data("interest before baseline"))?
+                    .apply_interest(batch)?;
+                Ok(Some(NetEvent::Increment(changes)))
+            }
             ServerMessage::Admission { seq, admission } => {
                 let rejected = match admission {
                     Admission::Queued { .. } | Admission::Duplicate => None,

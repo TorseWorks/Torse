@@ -53,6 +53,26 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         self.authority()?;
         self.authority.register_session(viewer, actor, scope)
     }
+
+    pub fn change_session_interest(
+        &mut self,
+        session: SessionId,
+        actor: ActorContext,
+        scope: ReplicaScope,
+        budget: OutputBudget,
+    ) -> Result<Vec<WorldReplicaBatch>, Fault> {
+        self.authority()?;
+        let batches = self
+            .authority
+            .change_session_interest(session, actor, scope, budget)?;
+        if batches
+            .iter()
+            .any(|batch| !self.durability().covers(batch.through))
+        {
+            return Err(self.fail(Fault::invalid_data("undurable interest cut")));
+        }
+        Ok(batches)
+    }
     /// Retire old authorized projections and return their independent control
     /// signal. Hosts must clear downstream copies before further sends.
     pub fn replace_session_scope(
@@ -453,9 +473,9 @@ impl<T: Transport> NetworkHub<T> {
         }
         self.cleanup(server)
     }
-    /// Trusted application-driven scope replacement. Re-seed live subscriptions
-    /// before retiring sections so residency invalidation cannot close this peer.
-    /// Failure after replacing grants closes and revokes the connection.
+    /// Trusted grant/interest replacement. Live, drained projections receive an
+    /// ordered interest cut; invalidated or unconsumed sources receive a new seed.
+    /// Pending transport output or a post-cut failure closes the connection.
     pub fn replace_policy<
         J: CommitJournal<ExecutionModel>,
         S: HostCheckpointStore<ExecutionModel>,
@@ -464,6 +484,32 @@ impl<T: Transport> NetworkHub<T> {
         server: &mut Server<ExecutionHost, J, S>,
         id: u128,
         policy: PeerPolicy,
+    ) -> Result<(), Fault> {
+        self.replace_policy_inner(server, id, policy, true)
+    }
+
+    /// Explicitly retire old subscriptions and send a complete baseline.
+    pub fn reset_policy<
+        J: CommitJournal<ExecutionModel>,
+        S: HostCheckpointStore<ExecutionModel>,
+    >(
+        &mut self,
+        server: &mut Server<ExecutionHost, J, S>,
+        id: u128,
+        policy: PeerPolicy,
+    ) -> Result<(), Fault> {
+        self.replace_policy_inner(server, id, policy, false)
+    }
+
+    fn replace_policy_inner<
+        J: CommitJournal<ExecutionModel>,
+        S: HostCheckpointStore<ExecutionModel>,
+    >(
+        &mut self,
+        server: &mut Server<ExecutionHost, J, S>,
+        id: u128,
+        policy: PeerPolicy,
+        incremental: bool,
     ) -> Result<(), Fault> {
         let control_bytes = self.control_reserve();
         let peer = self
@@ -502,6 +548,55 @@ impl<T: Transport> NetworkHub<T> {
             })
             .transpose()?;
         if let Some(viewer) = peer.viewer {
+            if policy.scope.sections.len() > server.authority()?.replica_section_limit()
+                || policy.actor.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS
+            {
+                return Err(Fault::resource_limit("session scope too large"));
+            }
+            // A grant change cannot let queued frames or partial TLS records
+            // escape afterward. Without a proven idle transport, close rather
+            // than silently skipping control frames or corrupting stream framing.
+            if !peer.transport.output_idle() {
+                peer.closed = true;
+                peer.transport.close();
+                self.cleanup(server)?;
+                return Err(Fault::new(
+                    FaultCode::ResetRequired,
+                    "policy cut has pending transport output",
+                ));
+            }
+            if incremental
+                && !peer.subscriptions.is_empty()
+                && !(self.follow.is_some() && peer.player.is_some())
+                && server.authority()?.can_change_interest(viewer.session)
+            {
+                let result = (|| -> Result<(), Fault> {
+                    let batches = server.change_session_interest(
+                        viewer.session,
+                        policy.actor.clone(),
+                        policy.scope.clone(),
+                        self.limits.budget,
+                    )?;
+                    for batch in batches {
+                        Self::send(peer, ServerMessage::Interest(batch), self.limits)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    peer.closed = true;
+                    peer.transport.close();
+                    self.cleanup(server)?;
+                    return Err(error);
+                }
+                peer.policy = policy;
+                peer.deferred = None;
+                peer.follow_scope = None;
+                peer.follow_ready = false;
+                if let (Some(memory), Some(growth)) = (&mut peer.memory, &mut growth) {
+                    memory.absorb(growth, policy_bytes)?;
+                }
+                return Ok(());
+            }
             let invalidated = server.replace_session_scope(
                 viewer.session,
                 policy.actor.clone(),

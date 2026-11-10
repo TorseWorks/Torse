@@ -13,7 +13,7 @@ TcpTransport提供双向TLS，证书及应用协议验证完成后才报告对�
 
 传输不参与世界发布。TcpTransport的长度检查发生在正文分配前，socket非阻塞，每次poll限制字节和最多64次读/64次写尝试。配置显式限制单帧、排队帧数、累计字节和每poll工作量。Partial/WouldBlock保留到下一次poll，错误只关闭对应连接。
 
-MemoryTransport和TcpTransport都提供独立close，清空尚未发送的数据。NetworkHub还限制连接、空闲Tick、请求与订阅，按宿主PeerPolicy绑定权限；权威ExecutionHost负责持久请求去重。应用协议3保留握手后Ping，客户端每10秒发送，默认空闲上限仍为60秒。心跳由应用连接层驱动。
+MemoryTransport和TcpTransport都提供独立close，清空尚未发送的数据。NetworkHub还限制连接、空闲Tick、请求与订阅，按宿主PeerPolicy绑定权限；权威ExecutionHost负责持久请求去重。应用协议5保留握手后Ping，客户端每10秒发送，默认空闲上限仍为60秒。心跳由应用连接层驱动。
 
 `Transport::queue_diagnostics`默认关闭，传入显式`QueueDiagnostics`读取固定尺寸值，定制传输默认返回`NotSupported`。MemoryTransport报告两端共享队列的负载字节，分别try_lock，竞争返回`Busy`；两次取样不保证原子性。TCP已完成入站帧按负载计字节，未完成输入单独报告，出站沿用已有剩余帧字节账（含尚未写出的长度前缀），不再次扣减部分写偏移。TLS沿用应用层明文帧账，已经交给TLS的内部缓冲、密文记录和Socket收发字节不在此范围。观察不驱动poll或握手，也不消费帧；关闭和正常排空后沿用现有队列状态，不提供累计流量或驻留时间。预算与进度语义见[服务端](../../apps/server/README.md#队列与进度诊断)。
 

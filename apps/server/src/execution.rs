@@ -566,6 +566,37 @@ impl ExecutionHost {
         Ok(invalidated)
     }
 
+    pub fn can_change_interest(&self, session: SessionId) -> bool {
+        self.sessions
+            .get(&session.0)
+            .is_some_and(|live| self.source.can_change_interest(live.viewer))
+    }
+
+    pub fn change_session_interest(
+        &mut self,
+        session: SessionId,
+        actor: ActorContext,
+        scope: ReplicaScope,
+        budget: OutputBudget,
+    ) -> Result<Vec<WorldReplicaBatch>, Fault> {
+        if scope.sections.len() > self.limits.replicas.max_sections
+            || actor.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS
+        {
+            return Err(Fault::resource_limit("session scope too large"));
+        }
+        let live = self
+            .sessions
+            .get(&session.0)
+            .ok_or_else(|| Fault::invalid_data("unknown session"))?;
+        let batches =
+            self.source
+                .change_interest(live.viewer, actor.clone(), scope.clone(), budget)?;
+        let live = self.sessions.get_mut(&session.0).expect("checked session");
+        live.actor = actor;
+        live.scope = scope;
+        Ok(batches)
+    }
+
     pub fn revoke_session(&mut self, session: SessionId) -> Vec<SubscriptionId> {
         let children: Vec<_> = self
             .players

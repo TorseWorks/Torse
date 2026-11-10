@@ -789,22 +789,25 @@ fn body_collision_jump_and_interest_replacement_preserve_the_live_session() {
     let replacement = receive(&mut client)
         .into_iter()
         .find_map(|message| {
-            if let ServerMessage::Seed(seed) = message {
-                Some(seed)
+            if let ServerMessage::Interest(batch) = message {
+                Some(batch)
             } else {
                 None
             }
         })
         .unwrap();
-    assert_ne!(replacement.subscription, old_seed.subscription);
-    assert_eq!(
+    assert_eq!(replacement.subscription, old_seed.subscription);
+    assert!(
         server
             .take_replica(old_seed.subscription, base::budget())
-            .unwrap_err()
-            .code,
-        FaultCode::ResetRequired
+            .unwrap()
+            .is_empty()
     );
-    assert_eq!(replacement.state.sections.len(), 1);
+    assert!(replacement.changes.sections.is_empty());
+    assert_eq!(
+        replacement.changes.removed_sections,
+        vec![SectionPos::new(1, 0, 0)]
+    );
     movement(&mut client, 1, 2, [0, 0], true);
     hub.poll(&mut server).unwrap();
     receive(&mut client);

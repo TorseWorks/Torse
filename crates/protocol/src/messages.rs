@@ -1,6 +1,6 @@
 use torse_codec::{Decoder, EncodeResult, Encoder, wire::Wire};
 use torse_types::*;
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 /// Negotiated separately from [`PROTOCOL_VERSION`] and from world payloads.
 pub const CONTROL_API_VERSION: u16 = 1;
 /// Movement sequencing is independent of ordinary action requests.
@@ -116,6 +116,8 @@ pub enum ServerMessage<O, S, C> {
     },
     Seed(ReplicaSeed<S>),
     Batch(ReplicaBatch<C>),
+    /// Ordered interest cut; may share the preceding durable world cursor.
+    Interest(ReplicaBatch<C>),
     Rejected(RejectCode),
     Player(PlayerUpdate),
     /// The offered control API was accepted for this connection.
@@ -253,6 +255,10 @@ impl<O: Wire, S: Wire, C: Wire> Wire for ServerMessage<O, S, C> {
                 4u8.write(e)?;
                 batch.write(e)
             }
+            Self::Interest(batch) => {
+                9u8.write(e)?;
+                batch.write(e)
+            }
             Self::Rejected(reason) => {
                 5u8.write(e)?;
                 reason.write(e)
@@ -288,6 +294,7 @@ impl<O: Wire, S: Wire, C: Wire> Wire for ServerMessage<O, S, C> {
             }),
             3 => Ok(Self::Seed(Wire::read(d)?)),
             4 => Ok(Self::Batch(Wire::read(d)?)),
+            9 => Ok(Self::Interest(Wire::read(d)?)),
             5 => Ok(Self::Rejected(Wire::read(d)?)),
             6 => Ok(Self::Player(Wire::read(d)?)),
             7 => Ok(Self::ControlReady {

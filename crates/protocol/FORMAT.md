@@ -1,16 +1,18 @@
-# 应用协议版本4
+# 应用协议版本5
 
 每个TCP帧为u32小端正文长度 + 正文。零长度或超出本地frame上限拒绝。正文使用codec/wire版本u16=1，再跟u8消息标签和以下字段。TCP分段不等于应用分片，正文未收齐不解码。
 
 | 客户端标签 | 字段顺序 |
 |---|---|
-| 0 Hello | protocol_version:u16=4、Compatibility |
+| 0 Hello | protocol_version:u16=5、Compatibility |
 | 1 Request | RequestSeq:u64、泛型输入I |
 | 2 Subscribe | SectionPos的有界Vec |
 | 3 Unsubscribe | SubscriptionId:u128 |
 | 4 Close | 无 |
 | 5 Ping | 无 |
 | 6 Move | SessionId:u128、seq:u64、tick_hint:u64、wish_x:u8、wish_z:u8、jump:bool |
+| 7 ControlOffer | api:u16 |
+| 8 Control | seq:u64、payload的有界字节Vec |
 
 | 服务端标签 | 字段顺序 |
 |---|---|
@@ -21,6 +23,9 @@
 | 4 Batch | ReplicaBatch<C> |
 | 5 Rejected | RejectCode |
 | 6 Player | SessionId、EntityId、input_seq:u64、tick:u64、position_bits的3个u64、vertical_micros:i64、grounded:bool、reset:bool |
+| 7 ControlReady | api:u16 |
+| 8 ControlAck | seq:u64、accepted:bool |
+| 9 Interest | ReplicaBatch<C>，其中presentation必须为空 |
 
 接纳状态为0 + target_tick:u64、1表示Duplicate、2 + RejectCode表示Rejected。元数据和容器按codec显式基础编码，应用层本版绑定I=Call、O=Reply、S=ReplicaSnapshot、C=ReplicaChanges，见../codec/EXECUTION.md。
 
@@ -40,7 +45,7 @@ Move的水平意向以i8的二进制补码写入两个u8，服务端归一化方
 
 断线撤销父会话及内部移动会话，冻结任务在提交前重查绑定、运行代数与批准范围。重连创建新会话；订阅替换保留当前移动序号并建立新代数基线，旧代数增量不能进入新镜像。移动路径及碰撞读取涉及的所有分区必须处于批准范围。
 
-外层消息标签及codec/wire版本1保持原布局，Batch正文增加呈现事件。Hello拒绝协议版本1至3和未知版本。协议升级不重写现有存档；存在玩家运动组件的新世界需要支持该组件的读取器。具体预算和验证见[权威移动](../../benchmarks/archive/network/M5-authoritative-movement.md)。
+外层消息标签及codec/wire版本1保持原布局，Batch正文增加呈现事件。Hello拒绝协议版本1至4和未知版本。协议升级不重写现有存档；存在玩家运动组件的新世界需要支持该组件的读取器。具体预算和验证见[权威移动](../../benchmarks/archive/network/M5-authoritative-movement.md)。
 
 机器UI复用Seed/Batch中的Authorized组件和Request中的Call。机器对象及两个端口分别授权，引用端口身份不扩大读取权限。UI描述版本1是客户端编译期模型版本，独立于应用协议版本；未知描述版本清空视图。按钮ActionID与版本见[执行载荷](../codec/EXECUTION.md)，模型和场景见[机器UI验证](../../benchmarks/archive/mods/M4-machine-ui.md)。
 
@@ -50,7 +55,7 @@ Ping仅在Hello成功后接纳，没有响应、不占RequestSeq、不写日志�
 
 应用时序须满足`idle_ticks * tick_period >= 3 * heartbeat_interval`。演示配置为1200个Tick、50毫秒一个Tick、10秒心跳，空闲上限为60秒。停发后仍按原空闲规则回收连接。未握手连接也受空闲上限约束，Ping不能延长其占位。
 
-Ping在应用协议版本2加入，当前协议版本4在Hello阶段拒绝旧版本混用。codec/wire版本保持1，既有标签顺序、存档及执行记录布局不变；未知消息标签仍拒绝。
+Ping在应用协议版本2加入，当前协议版本5在Hello阶段拒绝旧版本混用。codec/wire版本保持1，既有标签顺序、存档及执行记录布局不变；未知消息标签仍拒绝。
 
 ## 提交呈现事件
 
@@ -65,3 +70,13 @@ PresentationId依次为epoch:u128、cursor（WorldId:u128、CommitSeq:u64）、i
 ReplicaMirror.apply_with_presentation在完整状态与事件校验通过后一次返回该批事件。重复批次返回ResetRequired，不修改镜像或再次释放事件。apply保留只应用状态的用法并丢弃事件。客户端NetEvent::Increment携带经镜像验证的事件，消费者按kind/version选择处理器，未知类型或版本跳过，不转成服务器任务。返回值有界且不存历史；应用须在连接失效、重建基线或退出时丢弃尚未处理的旧连接输出。
 
 Seed只包含状态。重连、订阅重建和新epoch都从新基线开始，不重播已提交事件。已提交但尚未发出的呈现事件是易失输出，重启时丢弃；冻结但未提交的任务保留草稿，恢复后首次提交按新epoch产生身份。音频设备、混音与粒子渲染不属于本通道。
+
+## 兴趣范围切换
+
+版本5追加Interest标签9，沿用ReplicaBatch封装及ReplicaChanges字段。普通Batch仍要求世界through严格递增；Interest允许through等于前一游标，但禁止倒退，且与普通Batch共用同一订阅的连续ReplicaSeq。Interest不包含呈现事件。重复、缺失、乱序、旧订阅或旧绑定均返回ResetRequired，完整校验失败不修改镜像；应用须丢弃旧连接镜像并重新连接或请求完整Seed。客户端与服务端必须同时升级，Hello拒绝版本1至4，不改变codec/wire版本1或存档布局。
+
+初次订阅和显式NetworkHub::reset_policy使用完整Seed。正常replace_policy在活跃、已取空源队列和空闲传输下保留订阅身份，发送进入分区、离开记录及实体/状态变化；未变交集地形不重新捕获或编码，实体字段仍按新授权逐项过滤。源队列尚有未消费批次或旧投影失效时退回完整Seed，丢弃易失呈现输出。玩家移动时批准权限不变，先按原顺序发送普通编辑，再发送Interest。
+
+修改批准权限前，Transport::output_idle须确认没有未交付的应用/TLS缓冲；MemoryTransport检查共享出站队列，TCP检查未完成帧和TLS待写记录，未知适配器默认返回false。非空、竞争或未知状态直接关闭并清空连接，客户端重连取Seed，不能跳过协议控制帧或截断帧继续运行。已被对端读取或Socket接受的数据无法撤回，空闲判定不表示网络对端已确认接收。库宿主绕过NetworkHub调用change_session_interest时须自行执行同样的下游输出屏障。
+
+范围进入尚未驻留的页、驻留失效、超预算和编码/发送失败可能要求重建基线或关闭；协议不保存兴趣历史，不追溯播放事件。所有成功切换仍受既有快照、复制输出和连接预算限制，未确认世界进度不外发。

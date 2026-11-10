@@ -23,11 +23,13 @@ fn observed<T>(value: Diagnostic<T>) -> T {
 fn queue_diagnostics_observe_memory_backpressure_without_consuming_frames() {
     let config = QueueDiagnostics::enabled(4096).unwrap();
     let (mut a, mut b) = MemoryTransport::pair(limits()).unwrap();
+    assert!(a.output_idle());
     assert_eq!(
         a.queue_diagnostics(&QueueDiagnostics::default()),
         Diagnostic::Unavailable(Unavailable::NotEnabled)
     );
     a.send(vec![1; 128]).unwrap();
+    assert!(!a.output_idle());
     a.send(vec![2; 128]).unwrap();
     assert!(a.send(vec![3]).is_err());
     for _ in 0..1000 {
@@ -45,6 +47,7 @@ fn queue_diagnostics_observe_memory_backpressure_without_consuming_frames() {
     assert_eq!(b.receive().unwrap().unwrap(), vec![1; 128]);
     assert_eq!(observed(a.queue_diagnostics(&config)).outgoing.bytes, 128);
     a.close();
+    assert!(!a.output_idle());
     let closed = observed(b.queue_diagnostics(&config));
     assert!(closed.closed);
     assert_eq!((closed.incoming.records, closed.incoming.bytes), (0, 0));
@@ -59,7 +62,9 @@ fn tcp_queue_diagnostics_keep_partial_framing_and_remaining_writes_distinct() {
     let mut raw = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (socket, _) = listener.accept().unwrap();
     let mut tcp = TcpTransport::new(socket, limits()).unwrap();
+    assert!(tcp.output_idle());
     tcp.send(vec![7; 10]).unwrap();
+    assert!(!tcp.output_idle());
     let before = observed(tcp.queue_diagnostics(&config));
     assert_eq!(
         (
@@ -75,6 +80,7 @@ fn tcp_queue_diagnostics_keep_partial_framing_and_remaining_writes_distinct() {
     raw.read_exact(&mut written).unwrap();
     assert_eq!(written, 10u32.to_le_bytes()[..3]);
     assert_eq!(observed(tcp.queue_diagnostics(&config)).outgoing.bytes, 11);
+    assert!(!tcp.output_idle());
     raw.write_all(&4u32.to_le_bytes()[..2]).unwrap();
     for _ in 0..100 {
         tcp.poll().unwrap();
