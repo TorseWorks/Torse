@@ -503,7 +503,12 @@ impl ResidencyScheduler {
             .iter()
             .find(|pos| world.store().section(**pos).is_none())
             .copied();
-        let victim = if tickets.global || !server.authority.residency_ready(true) {
+        // A generated parking job owns page-file publication. Near reads can
+        // continue against immutable files, but defer other writes to the catalog.
+        let victim = if tickets.global
+            || server.parking.is_some()
+            || !server.authority.residency_ready(true)
+        {
             None
         } else {
             world.store().positions().find(|pos| {

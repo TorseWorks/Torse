@@ -227,13 +227,53 @@ impl WorldAuthority {
         pages: impl ExactSizeIterator<Item = &'a Snapshot>,
         budget: torse_types::OutputBudget,
     ) -> Result<crate::streaming::PreparedSections, torse_types::Fault> {
-        crate::streaming::prepare_batch(self, pages, budget)
+        crate::streaming::prepare_batch(self, pages, budget, false)
+    }
+
+    /// Validate generated pages against the current positions and allocator.
+    /// Their immutable generation cut may predate a background save.
+    pub fn prepare_parked_sections<'a>(
+        &self,
+        pages: impl ExactSizeIterator<Item = &'a Snapshot>,
+        budget: torse_types::OutputBudget,
+    ) -> Result<crate::streaming::PreparedSections, torse_types::Fault> {
+        crate::streaming::prepare_batch(self, pages, budget, true)
+    }
+
+    /// Publish only the barrier and allocator watermark, leaving the pages
+    /// outside the authoritative section and active entity stores.
+    pub fn publish_parked_sections(
+        &mut self,
+        prepared: crate::streaming::PreparedSections,
+    ) -> Result<Publication, CommitFault> {
+        if !prepared.park {
+            return Err(CommitFault::Invariant("batch was prepared for residency"));
+        }
+        for section in &prepared.sections {
+            section.validate(self)?;
+        }
+        let first = prepared
+            .sections
+            .first()
+            .ok_or(CommitFault::Invariant("empty section batch"))?;
+        let publication = self.coordinator.publish_with_entities(
+            &mut self.store,
+            &mut self.entities,
+            first.barrier.clone(),
+        )?;
+        self.entities
+            .restore_next_entity_id(prepared.next_entity_id)
+            .map_err(|_| CommitFault::Invariant("invalid parked allocator"))?;
+        Ok(publication)
     }
 
     pub fn publish_sections(
         &mut self,
         prepared: crate::streaming::PreparedSections,
     ) -> Result<Publication, CommitFault> {
+        if prepared.park {
+            return Err(CommitFault::Invariant("batch was prepared for parking"));
+        }
         for section in &prepared.sections {
             section.validate(self)?;
         }
@@ -645,6 +685,14 @@ impl<'a> Recovery<'a> {
     ) -> Result<(), torse_types::Fault> {
         self.replay_sections_impl(changes, pages, true, true, budget)
     }
+    pub fn replay_parked_sections(
+        &mut self,
+        changes: &ChangeSet,
+        pages: &[Snapshot],
+        budget: torse_types::OutputBudget,
+    ) -> Result<(), torse_types::Fault> {
+        self.replay_sections_impl(changes, pages, false, true, budget)
+    }
     fn replay_sections_impl(
         &mut self,
         changes: &ChangeSet,
@@ -678,7 +726,15 @@ impl<'a> Recovery<'a> {
             entities: restored.entities,
             coordinator,
         };
-        if generated && pages.len() > 1 {
+        if generated && !load {
+            let prepared = world.prepare_parked_sections(pages.iter(), budget)?;
+            if prepared.meta() != changes.meta {
+                return Err(invalid());
+            }
+            world
+                .publish_parked_sections(prepared)
+                .map_err(crate::streaming::fault)?;
+        } else if generated && pages.len() > 1 {
             let prepared = world.prepare_generated_sections(pages, budget)?;
             if prepared.meta() != changes.meta {
                 return Err(invalid());

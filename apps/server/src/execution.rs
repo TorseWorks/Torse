@@ -35,7 +35,7 @@ mod memory;
 #[path = "player_control.rs"]
 mod player_control;
 #[path = "streaming.rs"]
-mod streaming;
+pub(crate) mod streaming;
 pub use player_control::{PlayerState, movement_action, movement_call};
 pub use streaming::SectionInstallDiagnostics;
 
@@ -173,7 +173,7 @@ pub struct ExecutionHost {
     players: BTreeMap<u128, player_control::PlayerSession>,
     parked: BTreeMap<SectionPos, ParkedSection>,
     section_pending: Option<ExecutionPrepared>,
-    section_install_limit: usize,
+    pub(crate) section_install_limit: usize,
     section_install_diagnostics: streaming::SectionInstallDiagnostics,
     source: ReplicaSource,
     runtime: RuntimeState,
@@ -1428,9 +1428,19 @@ impl HostAuthority for ExecutionHost {
                 "publication lacks memory reservation",
             ));
         }
+        let parking = prepared
+            .record
+            .changes
+            .sections
+            .first()
+            .is_some_and(|change| !change.load);
         let accounting = prepared.memory.take();
         let publication = if let Some(sections) = prepared.world.sections {
-            self.source.publish_sections(*sections)
+            if parking {
+                self.source.publish_parked_sections(*sections)
+            } else {
+                self.source.publish_sections(*sections)
+            }
         } else if let Some(section) = prepared.world.section {
             self.source.publish_section(*section)
         } else {
@@ -1438,6 +1448,12 @@ impl HostAuthority for ExecutionHost {
                 .publish(prepared.world.normal.expect("normal preparation"))
         }
         .map_err(commit_fault)?;
+        if parking {
+            for change in &prepared.record.changes.sections {
+                self.parked
+                    .insert(change.page.sections[0].pos, change.reference.clone());
+            }
+        }
         if let Some(section) = &prepared.record.changes.section {
             let pos = section.page.sections[0].pos;
             if section.load {

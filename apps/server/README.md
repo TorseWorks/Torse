@@ -16,6 +16,14 @@
 
 `cargo run --release -p torse-server --example visual_terrain_baseline -- NEW_OUTPUT_DIRECTORY`使用公共文件夹具测量24个已保存稠密分区，2个模拟驻留分区与8页显示窗的直行、掉头和回访。CSV记录CPU镜像首批/全批可用时间、最长poll、传输字节和逻辑内存；不等同于显示器呈现时间或RSS。回归另覆盖近景切换、恢复、损坏修复、积压和内存释放。
 
+## 生成地形直接停放
+
+远景生成可用 `Server::begin_generated_parking` 将一批完整生成快照交给单个有界文件工作线程，再在 tick 边界调用 `poll_generated_parking`。页位置、代数绑定、生成切面、连续实体编号、现有驻留或停放来源和索引预算均受检查。工作期间可推进模拟 tick。若实体分配器变化或位置被其他提交占用，整批拒绝，调用方可重新准备。日志暂存阻塞时调用方可重提未发布批次。已停放位置拒绝重复提交。
+
+工作线程把一列保存到一个不可变包，使用每页摘要名链接到同一文件，读取时只取请求成员。成功后执行一条权威日志记录和一次日志同步，远处页及实体始终留在停放索引中。持久实体组件随快照保存，包括由宿主编码在其中的生成更新。平台支持的目录元数据另行同步，页面存储卷需要支持硬链接。工作线程错误不会发布部分列，残留的无引用页由现有回收入口清理。恢复先建立停放索引与分配器水位，靠近时走普通重载。
+
+文件页仍可读取旧格式。直接停放写提交版本6和页包 `TORSEPB1`，旧读取器需要升级后才能打开含新记录的世界。协议和检查点字段布局保持原版本。Windows Release 对照入口见 `cargo test --release --locked -p torse-server --test parking compare_direct_parking -- --ignored --nocapture --test-threads=1`。
+
 ## 稠密原子安装诊断
 
 `section_install_diagnostics`按最近一次`install_section_batch`记录`page_preparation`（页编码、摘要和引用）、`validation`（结构、内容、预算、恢复准备和完整记录成本）、`commit`（日志暂存编码、原子发布和失效通知，排除刷盘）、`durability_wait`与总`elapsed`。失败阶段同样记录；这些墙钟观察不参与权威决策。另用可选SerialProfiler的Encoding阶段细分最终日志编码，不能把全部commit时间当作纯发布。
