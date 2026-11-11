@@ -487,10 +487,16 @@ impl Snapshot {
             SectionStore::new(self.side, self.bounds).map_err(|error| ExchangeError::Store {
                 detail: error.to_string(),
             })?;
+        // Structure validation above proved that every cell has a symbol. A
+        // native registry often resolves all symbols to their original IDs.
+        let identity = mapping.iter().all(|(remote, local)| remote == local);
         for section in &self.sections {
             let cells = match &section.cells {
                 SnapshotCells::Uniform(value) => {
                     SectionStorage::Uniform(resolve(*value, &mapping)?)
+                }
+                SnapshotCells::Dense(list) if identity => {
+                    SectionStorage::Dense(list.clone().into())
                 }
                 SnapshotCells::Dense(list) => {
                     let mut resolved = Vec::with_capacity(list.len());
@@ -941,6 +947,58 @@ mod tests {
         assert_eq!(entity.position, Position::new(0.5, 1.5, 0.5));
         assert_eq!(entity.components.len(), 1);
         assert_eq!(restored.resume, meta().resume_at);
+    }
+
+    #[test]
+    fn dense_native_and_remapped_symbols_restore_identical_cells() {
+        let (store, entities) = world();
+        let registry = registry();
+        let native = Snapshot::capture(meta(), &store, &entities, &registry).unwrap();
+        assert!(
+            native
+                .sections
+                .iter()
+                .any(|s| matches!(s.cells, SnapshotCells::Dense(_)))
+        );
+        let mut remapped = native.clone();
+        for state in &mut remapped.states {
+            state.id.0 += 100;
+        }
+        for section in &mut remapped.sections {
+            match &mut section.cells {
+                SnapshotCells::Uniform(id) => {
+                    if !id.is_empty() {
+                        id.0 += 100;
+                    }
+                }
+                SnapshotCells::Dense(cells) => {
+                    for id in cells {
+                        if !id.is_empty() {
+                            id.0 += 100;
+                        }
+                    }
+                }
+            }
+        }
+        let a = native.restore(&registry, &schemas()).unwrap();
+        let b = remapped.restore(&registry, &schemas()).unwrap();
+        for pos in store.positions() {
+            assert_eq!(
+                SnapshotCells::capture(a.store.section(pos).unwrap()),
+                SnapshotCells::capture(b.store.section(pos).unwrap())
+            );
+        }
+        let SnapshotCells::Dense(cells) = &mut remapped.sections[0].cells else {
+            unreachable!()
+        };
+        cells[0] = BlockStateId(65535);
+        assert!(remapped.restore(&registry, &schemas()).is_err());
+        let mut invalid = native;
+        let SnapshotCells::Dense(cells) = &mut invalid.sections[0].cells else {
+            unreachable!()
+        };
+        cells[0] = BlockStateId(65535);
+        assert!(invalid.restore(&registry, &schemas()).is_err());
     }
 
     #[test]

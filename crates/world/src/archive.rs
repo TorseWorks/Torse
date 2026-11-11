@@ -186,12 +186,22 @@ impl SnapshotArchive {
         manifest: ArchiveManifest,
         budget: OutputBudget,
     ) -> Result<Self, Fault> {
-        check_budget(snapshot, &manifest, budget)?;
+        Self::validate_legacy(snapshot, &manifest, budget)?;
         Ok(Self {
             origin: snapshot.meta.compatibility,
             manifest,
             snapshot: snapshot.clone(),
         })
+    }
+
+    /// Validate the same canonical structure and owned budget as import, without
+    /// creating an owned archive. The caller retains the immutable snapshot.
+    pub fn validate_legacy(
+        snapshot: &Snapshot,
+        manifest: &ArchiveManifest,
+        budget: OutputBudget,
+    ) -> Result<(), Fault> {
+        check_budget(snapshot, manifest, budget)
     }
 
     pub fn inspect(

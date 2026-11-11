@@ -218,6 +218,15 @@ impl WorldAuthority {
         pages: &[Snapshot],
         budget: torse_types::OutputBudget,
     ) -> Result<crate::streaming::PreparedSections, torse_types::Fault> {
+        self.prepare_generated_sections_iter(pages.iter(), budget)
+    }
+
+    /// Borrow a bounded exact-size page sequence without collecting cloned snapshots.
+    pub fn prepare_generated_sections_iter<'a>(
+        &self,
+        pages: impl ExactSizeIterator<Item = &'a Snapshot>,
+        budget: torse_types::OutputBudget,
+    ) -> Result<crate::streaming::PreparedSections, torse_types::Fault> {
         crate::streaming::prepare_batch(self, pages, budget)
     }
 

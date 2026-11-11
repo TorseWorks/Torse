@@ -182,8 +182,18 @@ pub(crate) fn validate(
             torse_world::SectionStorage::Dense(cells) => {
                 cells.iter().filter(|s| needs_instance(**s)).count()
             }
-            torse_world::SectionStorage::Palette(_) => {
-                section.values().filter(|s| needs_instance(*s)).count()
+            torse_world::SectionStorage::Palette(palette) => {
+                let required: std::collections::BTreeSet<_> = palette
+                    .states()
+                    .iter()
+                    .copied()
+                    .filter(|s| needs_instance(*s))
+                    .collect();
+                if required.is_empty() {
+                    0
+                } else {
+                    section.values().filter(|s| required.contains(s)).count()
+                }
             }
         };
         required = required.checked_add(count).ok_or_else(invalid)?;

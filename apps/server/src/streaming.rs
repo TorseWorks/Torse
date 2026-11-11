@@ -215,10 +215,10 @@ impl ExecutionHost {
             .transpose()?;
         // Bound the full input before the world decodes or clones individual pages.
         wire::measure_inner(&changes, self.limits.runtime, self.limits.codec)?;
-        let pages: Vec<_> = changes.iter().map(|c| c.page.clone()).collect();
-        let world = self
-            .world()
-            .prepare_generated_sections(&pages, self.limits.runtime)?;
+        let world = self.world().prepare_generated_sections_iter(
+            changes.iter().map(|c| &c.page),
+            self.limits.runtime,
+        )?;
         let meta = world.meta();
         let empty = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
             .map_err(|e| Fault::invalid_data(e.to_string()))?;

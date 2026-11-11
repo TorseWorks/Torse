@@ -1,5 +1,15 @@
 # 服务端
 
+## 稠密原子安装诊断
+
+`section_install_diagnostics`按最近一次`install_section_batch`记录`page_preparation`（页编码、摘要和引用）、`validation`（结构、内容、预算、恢复准备和完整记录成本）、`commit`（日志暂存编码、原子发布和失效通知，排除刷盘）、`durability_wait`与总`elapsed`。失败阶段同样记录；这些墙钟观察不参与权威决策。另用可选SerialProfiler的Encoding阶段细分最终日志编码，不能把全部commit时间当作纯发布。
+
+批量准备借用原有页序列，保留只含身份和版本的发布令牌，不重复保存完整地形页。快照仍执行原有结构、内容、持久字段和预算校验；符号解析全部保持原ID时直接复制已验证的稠密ID序列，否则逐项重映射。调色板仅在实际包含需要附属实例的状态时扫描所有单元。一次日志记录、一次原子发布和一次耐久屏障不变，提交格式仍为4，存档与协议不因这些优化变化。
+
+`cargo run --release -p torse-server --example dense_install_baseline -- NEW_OUTPUT_DIRECTORY`初始化25列、每列24页，然后以50ms节拍驱动200次内核tick，在10.9格/秒的虚拟位移下安装30列。固定种子每列16页稠密地形和3个附属实体；使用真实文件日志、600页授权复制、编码/解码和镜像更新，窗口移动后卸载后方页。正常驻留600页、安装边界最多720页，每列断言一次flush请求，最终核对完整授权快照与重开恢复。
+
+该公共夹具是内核复现模型，未包含外部宿主的游戏系统、Socket或原始生成参数。`--uniform`保留均匀页对照；`--unpaced`只供快速正确性检查，不用于定时长尾验收。夹具为稠密输入将runtime条目预算设为200000，并为600页复制和检查点设置2000000条目容量；字节、日志同步和恢复策略保持原文件策略，两版使用相同容量。保留所有样本，单独报告耐久等待；文件同步本身可能超过5ms，结果不构成硬实时承诺。
+
 包名：`torse-server`。提供权威世界的持久执行、文件恢复、授权网络和可选Mod装配，可在无GPU环境中运行。主程序通过ExecutionHost驱动阶段任务，WorldHost保留可信本地事务示例。范围与证据见[执行与网络验证](../../benchmarks/archive/network/B6-B7-execution-network.md)。
 
 明文演示只允许回环地址。对外监听必须配置`--tls-cert`、`--tls-key`、`--client-ca`和`--users`，按验证后的证书指纹选择用户权限、范围和玩家，不能叠加全局演示授权。重复登录、错误或过期凭据及重放的拒绝语义见[用户认证与连接策略](../../benchmarks/archive/network/M5-user-authentication.md)。
