@@ -1,5 +1,7 @@
 # Dense generated section installations
 
+The [follow-up Ryzen/NVMe comparison](../dense-install-tail-20261111.md) measures a later restore optimization on a separate machine.
+
 Six alternating pairs of fresh Release processes on Windows 11 / Intel Core i9-14900HX. Each process initializes 25 columns (600 sections), then drives a 50 ms kernel tick for ten seconds at a virtual 10.9 cells/s. It installs 30 columns, each with 24 pages (16 dense) and three attached entities, while encoding and applying authorized replica updates and unloading the rear window. Steady residency is 600 sections, temporarily at most 720. Final replicas match a fresh projection and reopening reproduces the exact world and entity allocator.
 
 The baseline is PR #70 behavior plus identical phase instrumentation and fixture at `03f8681`. The optimized source is `f3d2238`. Every measured column asserts one flush request; record/publication/barrier semantics and physical backend call counts are covered by separate atomic recovery tests. No durability policy was weakened. The paced fixture does not separately intercept backend sync calls.

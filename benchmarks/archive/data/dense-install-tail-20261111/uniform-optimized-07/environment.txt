@@ -1,0 +1,1 @@
+seed=8327473519530246828 paced=true uniform=true initial_columns=25 sections_per_column=24 ticks=200 tick_ms=50 speed=10.9 samples=30 max_resident_sections=720 steady_resident_sections=600 memory_ledger_peak=159896040 recovery=exact replica=exact flush_requests_per_sample=1; kernel fixture, not an external host content workload
