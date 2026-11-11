@@ -247,9 +247,20 @@ fn measure<B: JournalBackend, S: HostCheckpointStore<ExecutionModel>>(
             tick,
             tick >= o.warmup
         )?;
-        for stage in Stage::ALL {
+        for stage in [
+            Stage::Planning,
+            Stage::Preparation,
+            Stage::Encoding,
+            Stage::Publication,
+            Stage::Projection,
+        ] {
             write!(raw, ",{}", totals[stage as usize].total_ns)?;
         }
+        let flush_ns = [Stage::Flush, Stage::JournalAppend, Stage::JournalSync]
+            .into_iter()
+            .map(|stage| totals[stage as usize].total_ns)
+            .sum::<u128>();
+        write!(raw, ",{flush_ns}")?;
         writeln!(
             raw,
             ",{},{dispatched},{},{},{}",

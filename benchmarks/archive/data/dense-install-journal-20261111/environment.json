@@ -1,0 +1,16 @@
+{
+  "baseline_source": "001ff3f6c12430047154962d4cf7cdd00df96f83",
+  "optimized_source": "be59228398d88cf7429ef97bc34a7b46351c53a1",
+  "os": "Windows-11-10.0.26200-SP0",
+  "cpu": "AMD64 Family 25 Model 116 Stepping 1, AuthenticAMD",
+  "build": "Release",
+  "rust": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "runs_per_mode": 8,
+  "order": "alternating fresh processes, then one uniform run per mode",
+  "timing": "50ms paced kernel ticks over 10s at 10.9 cells/s; initial 25 columns and recovery excluded; host input construction reported separately; no concurrent builds requested",
+  "fixture": "fixed seed 8327473519530246828; 24 pages, 16 dense, three attached entities per column; 30 measured columns; steady 600 resident sections, maximum 720",
+  "semantics": "one atomic record/publication/durable barrier; one flush request asserted for every measured column; exact replica and reopened state verified every process",
+  "scope": "representative kernel fixture; original external host seed/entry point not provided; no Socket or external gameplay systems; logical memory reported, RSS not sampled",
+  "capacities": "runtime max_items=200000; replica/checkpoint snapshot max_items=2000000; original byte and journal synchronization policies; identical in both modes",
+  "quantiles": "nearest-rank ceil(p*n)-1; all final samples retained, including outliers"
+}

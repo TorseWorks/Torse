@@ -15,6 +15,7 @@ pub struct Decoder<'a> {
     depth: u16,
     limits: CodecLimits,
     guard: BudgetGuard,
+    pub(crate) packed_snapshot_cells: bool,
 }
 
 impl<'a> Decoder<'a> {
@@ -25,6 +26,7 @@ impl<'a> Decoder<'a> {
             depth: 0,
             limits,
             guard: BudgetGuard::new(budget),
+            packed_snapshot_cells: false,
         }
     }
 

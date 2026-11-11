@@ -4,6 +4,11 @@ mod fixture;
 mod support;
 use fixture::*;
 use support::Directory;
+use torse_codec::{
+    Encoder, StorageCodec,
+    record::{RecordRead, read_record},
+    wire::{EXECUTION_COMMIT_VERSION, PACKED_EXECUTION_COMMIT_VERSION, Wire},
+};
 use torse_server::{bootstrap as base, execution::*, *};
 use torse_types::*;
 use torse_world::*;
@@ -53,6 +58,35 @@ fn dense_batch_keeps_one_atomic_cut_and_exact_recovery_and_rejects_a_bad_last_pa
         .capture_snapshot(torse_sim::streaming::page_meta(world))
         .unwrap();
     drop(server);
+    let log = std::fs::read(dir.0.join("journal.log")).unwrap();
+    let RecordRead::Complete {
+        payload,
+        encoded_bytes,
+        ..
+    } = read_record(&log, base::codec_limits()).unwrap()
+    else {
+        panic!("installation did not write a complete record");
+    };
+    assert_eq!(encoded_bytes, log.len());
+    assert_eq!(
+        &payload[..2],
+        &PACKED_EXECUTION_COMMIT_VERSION.to_le_bytes()
+    );
+    let codec = base::Codec::new(base::codec_limits()).unwrap();
+    let record = codec.decode_commit(payload, budget()).unwrap();
+    let mut plain = Vec::new();
+    let mut encoder = Encoder::new(&mut plain, budget(), base::codec_limits());
+    encoder.count_items(1).unwrap();
+    encoder.write_u16(EXECUTION_COMMIT_VERSION).unwrap();
+    record.write(&mut encoder).unwrap();
+    encoder.finish();
+    assert!(payload.len() < plain.len() / 4);
+    let legacy = codec.decode_commit(&plain, budget()).unwrap();
+    assert_eq!(legacy.meta, record.meta);
+    assert_eq!(legacy.changes, record.changes);
+    let mut mislabeled = payload.to_vec();
+    mislabeled[..2].copy_from_slice(&EXECUTION_COMMIT_VERSION.to_le_bytes());
+    assert!(codec.decode_commit(&mislabeled, budget()).is_err());
     let (world, actions) = base::world().unwrap();
     let recovered = base::Files::open_file(
         dir.acquire(),

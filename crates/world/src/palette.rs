@@ -35,6 +35,35 @@ impl PaletteCells {
     pub fn get(&self, index: usize) -> Option<BlockStateId> {
         (index < self.len).then(|| self.states[self.symbol(index)])
     }
+    /// Pack a slice whose census has found exactly two states in this order.
+    pub(crate) fn build_binary(
+        cells: &[BlockStateId],
+        first: BlockStateId,
+        second: BlockStateId,
+    ) -> Option<Self> {
+        let len = cells.len();
+        if !smaller(len, 2, 1) {
+            return None;
+        }
+        let mut second_count = 0;
+        let mut words = Vec::with_capacity(word_count(len, 1));
+        for chunk in cells.chunks(64) {
+            let mut word = 0u64;
+            for (bit, &state) in chunk.iter().enumerate() {
+                debug_assert!(state == first || state == second);
+                word |= u64::from(state == second) << bit;
+            }
+            second_count += word.count_ones();
+            words.push(word);
+        }
+        Some(Self {
+            states: vec![first, second],
+            counts: vec![len as u32 - second_count, second_count],
+            words,
+            bits: 1,
+            len,
+        })
+    }
     pub(crate) fn build(
         values: impl Iterator<Item = BlockStateId> + Clone,
         len: usize,
