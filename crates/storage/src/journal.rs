@@ -575,11 +575,20 @@ impl<M: AuthorityData, C: StorageCodec<M>, B: JournalBackend> CommitJournal<M>
             .is_some_and(|next| next.cursor.seq <= target.seq)
         {
             let next = self.pending.pop_front().expect("front was present");
-            if let Err(error) = self.backend.append(&next.bytes) {
+            let result = {
+                let mut span = self.profiler.span(Stage::JournalAppend);
+                span.set_bytes(next.bytes.len() as u64);
+                self.backend.append(&next.bytes)
+            };
+            if let Err(error) = result {
                 return Err(self.stop(io_fault("append journal record", error)));
             }
         }
-        if let Err(error) = self.backend.sync() {
+        let result = {
+            let _span = self.profiler.span(Stage::JournalSync);
+            self.backend.sync()
+        };
+        if let Err(error) = result {
             return Err(self.stop(io_fault("sync journal records", error)));
         }
         // Only a successful barrier advances the confirmed position. Write/sync failures
