@@ -11,6 +11,11 @@ use torse_world::Snapshot;
 pub struct SectionInstallDiagnostics {
     pub sections: usize,
     pub elapsed: std::time::Duration,
+    pub page_preparation: std::time::Duration,
+    pub validation: std::time::Duration,
+    /// Journal staging/encoding, publication and invalidation, excluding flush wait.
+    pub commit: std::time::Duration,
+    pub durability_wait: std::time::Duration,
     pub failure: Option<String>,
 }
 
@@ -471,6 +476,10 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
     ) -> Result<CommitStep, Fault> {
         let start = std::time::Instant::now();
         let count = batch.len();
+        let mut diagnostics = SectionInstallDiagnostics {
+            sections: count,
+            ..Default::default()
+        };
         let result = (|| {
             self.authority()?;
             if count == 0 || count > self.authority.section_install_limit {
@@ -478,29 +487,41 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
                     "generated batch exceeds section limit",
                 ));
             }
-            let mut changes = Vec::with_capacity(count);
-            for page in batch {
-                let digest = pages.digest(&page)?;
-                changes.push(SectionChange {
-                    reference: reference(&page, digest),
-                    page,
-                    load: true,
-                    fresh: true,
-                });
-            }
-            self.authority.section_pending = Some(self.authority.prepare_section_batch(changes)?);
-            self.drive_one(sink)
+            let stage = std::time::Instant::now();
+            let changes = (|| {
+                let mut changes = Vec::with_capacity(count);
+                for page in batch {
+                    let digest = pages.digest(&page)?;
+                    changes.push(SectionChange {
+                        reference: reference(&page, digest),
+                        page,
+                        load: true,
+                        fresh: true,
+                    });
+                }
+                Ok::<_, Fault>(changes)
+            })();
+            diagnostics.page_preparation = stage.elapsed();
+            let changes = changes?;
+            let stage = std::time::Instant::now();
+            let prepared = self.authority.prepare_section_batch(changes);
+            diagnostics.validation = stage.elapsed();
+            self.authority.section_pending = Some(prepared?);
+            let before = self.flush_metrics().total_wait;
+            let stage = std::time::Instant::now();
+            let result = self.drive_one(sink);
+            diagnostics.durability_wait = self.flush_metrics().total_wait.saturating_sub(before);
+            diagnostics.commit = stage.elapsed().saturating_sub(diagnostics.durability_wait);
+            result
         })();
         let failure = match &result {
             Err(error) => Some(error.to_string()),
             Ok(CommitStep::Blocked(error)) => Some(format!("{error:?}")),
             _ => None,
         };
-        self.authority.section_install_diagnostics = SectionInstallDiagnostics {
-            sections: count,
-            elapsed: start.elapsed(),
-            failure,
-        };
+        diagnostics.elapsed = start.elapsed();
+        diagnostics.failure = failure;
+        self.authority.section_install_diagnostics = diagnostics;
         result
     }
 
