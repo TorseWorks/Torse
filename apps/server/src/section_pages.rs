@@ -146,6 +146,13 @@ impl SectionPages {
             .max_bytes
             .min(u64::from(self.codec.max_frame_bytes).saturating_add(8));
         let length = file.metadata().map_err(io)?.len();
+        if length < 8 {
+            return Err(if length > limit {
+                Fault::resource_limit("section page too large")
+            } else {
+                Fault::invalid_data("section page integrity check failed")
+            });
+        }
         let mut magic = [0; 8];
         file.read_exact(&mut magic).map_err(io)?;
         if &magic == bundle::MAGIC {

@@ -89,10 +89,13 @@ fn complete_generated_columns_park_across_ticks_and_recover_without_activation()
             assert!(host.world().store().section(pos).is_none());
             assert_eq!(pages.get(saved.digest).unwrap(), *page);
         }
-        assert!(
+        let duplicate = fixture::column(server.authority().unwrap(), x, 0, &template, false);
+        assert_eq!(
             server
-                .begin_generated_parking(pages.clone(), input.clone(), LIMITS)
-                .is_err()
+                .begin_generated_parking(pages.clone(), duplicate, LIMITS)
+                .unwrap_err()
+                .code,
+            FaultCode::InvalidData
         );
         eprintln!(
             "direct parking 24 pages in {:?}, {file_syncs} bundle sync and 1 journal flush",
