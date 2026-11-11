@@ -12,8 +12,14 @@ use torse_sim::replica::{ReplicaScope, ReplicaSnapshot, WorldReplicaSeed};
 use torse_types::*;
 use torse_world::{Snapshot, SnapshotCells, SnapshotSection, StateEntry};
 
+mod approval;
+pub use approval::VisualTerrainApproval;
+
+const MAX_VISUAL_SECTIONS: usize = 16_384;
+
 #[derive(Clone, Copy, Debug)]
 pub struct VisualTerrainLimits {
+    /// Maximum pages in the current desired window.
     pub max_sections: usize,
     pub cache_bytes: u64,
     pub io_bytes: u64,
@@ -33,7 +39,7 @@ pub struct VisualTerrainDiagnostics {
 impl VisualTerrainLimits {
     fn validate(self, pages: &SectionPages) -> Result<u64, Fault> {
         if self.max_sections == 0
-            || self.max_sections > 16384
+            || self.max_sections > MAX_VISUAL_SECTIONS
             || self.pages_per_poll == 0
             || self.pages_per_poll > 64
             || self.cache_bytes < 4096
@@ -226,7 +232,7 @@ fn resident(
 
 pub(crate) struct VisualSession {
     binding: Binding,
-    approved: ReplicaScope,
+    approved: VisualTerrainApproval,
     desired: ReplicaScope,
     center: SectionPos,
     limits: VisualTerrainLimits,
@@ -249,22 +255,15 @@ impl VisualSession {
     pub(crate) fn new(
         host: &ExecutionHost,
         pages: SectionPages,
-        approved: ReplicaScope,
+        approved: VisualTerrainApproval,
         desired: ReplicaScope,
         center: SectionPos,
         limits: VisualTerrainLimits,
     ) -> Result<Self, Fault> {
         let charge = limits.validate(&pages)?;
-        if approved.sections.len() > 16384
-            || desired.sections.len() > limits.max_sections
-            || !desired.sections.is_subset(&approved.sections)
-        {
-            return Err(Fault::invalid_data(
-                "visual scope outside approval or limits",
-            ));
-        }
+        approved.check_desired(&desired, limits.max_sections)?;
         let charge = charge
-            .checked_add(approved.sections.len() as u64 * 128)
+            .checked_add(approved.reservation_bytes()?)
             .ok_or_else(|| Fault::resource_limit("visual approval reservation"))?;
         let memory = host
             .memory_pool()
@@ -393,13 +392,8 @@ impl VisualSession {
         center: SectionPos,
         refresh: bool,
     ) -> Result<(), Fault> {
-        if desired.sections.len() > self.limits.max_sections
-            || !desired.sections.is_subset(&self.approved.sections)
-        {
-            return Err(Fault::invalid_data(
-                "visual scope outside approval or limits",
-            ));
-        }
+        self.approved
+            .check_desired(&desired, self.limits.max_sections)?;
         self.center = center;
         if !refresh && desired == self.desired {
             return Ok(());

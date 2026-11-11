@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     section_pages::SectionPages,
-    visual::{VisualSession, VisualTerrainLimits},
+    visual::{VisualSession, VisualTerrainApproval, VisualTerrainLimits},
 };
 
 impl<T: Transport> NetworkHub<T> {
@@ -19,6 +19,8 @@ impl<T: Transport> NetworkHub<T> {
     /// Enable once for this connection. The approved display envelope is
     /// immutable: revoke the connection to tighten it. No entity/interaction
     /// authorization is added. Delivery begins after a normal subscription.
+    /// Pass a compact approval for a large rectangle. Only `desired` uses the
+    /// configured window page budget.
     #[allow(clippy::too_many_arguments)]
     pub fn enable_visual_interest<
         J: CommitJournal<ExecutionModel>,
@@ -28,7 +30,7 @@ impl<T: Transport> NetworkHub<T> {
         server: &Server<ExecutionHost, J, S>,
         id: u128,
         pages: SectionPages,
-        approved: ReplicaScope,
+        approved: impl Into<VisualTerrainApproval>,
         desired: ReplicaScope,
         center: SectionPos,
         limits: VisualTerrainLimits,
@@ -48,7 +50,7 @@ impl<T: Transport> NetworkHub<T> {
         peer.visual = Some(VisualSession::new(
             server.authority()?,
             pages,
-            approved,
+            approved.into(),
             desired,
             center,
             limits,

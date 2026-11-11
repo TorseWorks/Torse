@@ -16,8 +16,10 @@ use torse_net::{
     terrain::{TerrainLimits, TerrainMirror},
 };
 use torse_server::{
-    NoReplicas, bootstrap as base, network::*, section_pages::SectionPages,
-    visual::VisualTerrainLimits,
+    NoReplicas, bootstrap as base,
+    network::*,
+    section_pages::SectionPages,
+    visual::{VisualTerrainApproval, VisualTerrainLimits},
 };
 use torse_sim::replica::*;
 use torse_types::*;
@@ -30,6 +32,13 @@ pub fn scope(start: i64, count: i64) -> ReplicaScope {
             .collect(),
     }
 }
+pub const APPROVAL_MIN: SectionPos = SectionPos::new(-32, -4, -32);
+pub const APPROVAL_MAX: SectionPos = SectionPos::new(32, 19, 32);
+
+pub fn approval() -> VisualTerrainApproval {
+    VisualTerrainApproval::rectangular(APPROVAL_MIN, APPROVAL_MAX).unwrap()
+}
+
 pub fn limits() -> VisualTerrainLimits {
     VisualTerrainLimits {
         max_sections: 8,
@@ -46,7 +55,14 @@ pub fn create(
     SectionPages,
     BTreeMap<SectionPos, ReplicaSnapshot>,
 ) {
-    let mut server = streaming::create(dir);
+    let (world, actions) = base::world().unwrap();
+    let mut snapshot = world
+        .capture_snapshot(torse_sim::streaming::page_meta(&world))
+        .unwrap();
+    snapshot.bounds = WorldBounds::new(-64, 320).unwrap();
+    let mut recovery = world.begin_restore();
+    recovery.restore_snapshot(&snapshot).unwrap();
+    let mut server = streaming::create_with_world(dir, (recovery.finish().unwrap(), actions));
     let pages = streaming::pages(dir);
     let mut expected = BTreeMap::new();
     for x in 2..26 {
