@@ -504,14 +504,41 @@ impl Wire for SnapshotCells {
             }
             Self::Dense(v) => {
                 1u8.write(e)?;
-                v.write(e)
+                write_items(e, v.len(), "wire collection")?;
+                e.ensure(
+                    (v.len() as u64)
+                        .checked_mul(2)
+                        .ok_or_else(|| Fault::resource_limit("dense cell bytes overflow"))?,
+                )?;
+                let mut bytes = [0u8; 256];
+                for cells in v.chunks(128) {
+                    for (pair, cell) in bytes.chunks_exact_mut(2).zip(cells) {
+                        pair.copy_from_slice(&cell.0.to_le_bytes());
+                    }
+                    e.write(&bytes[..cells.len() * 2])?;
+                }
+                Ok(())
             }
         }
     }
     fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
         match u8::read(d)? {
             0 => Ok(Self::Uniform(Wire::read(d)?)),
-            1 => Ok(Self::Dense(Wire::read(d)?)),
+            1 => {
+                let count = read_items(d, 2, "wire collection")?;
+                charge_vec::<BlockStateId>(d, count)?;
+                let bytes = d.read(
+                    count
+                        .checked_mul(2)
+                        .ok_or_else(|| Fault::resource_limit("dense cell bytes overflow"))?,
+                )?;
+                Ok(Self::Dense(
+                    bytes
+                        .chunks_exact(2)
+                        .map(|p| BlockStateId(u16::from_le_bytes([p[0], p[1]])))
+                        .collect(),
+                ))
+            }
             _ => Err(invalid("unknown cells")),
         }
     }

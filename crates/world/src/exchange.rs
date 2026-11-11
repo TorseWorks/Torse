@@ -491,25 +491,24 @@ impl Snapshot {
         // native registry often resolves all symbols to their original IDs.
         let identity = mapping.iter().all(|(remote, local)| remote == local);
         for section in &self.sections {
-            let cells = match &section.cells {
+            let data = match &section.cells {
                 SnapshotCells::Uniform(value) => {
-                    SectionStorage::Uniform(resolve(*value, &mapping)?)
+                    Section::new(self.side, resolve(*value, &mapping)?)
                 }
                 SnapshotCells::Dense(list) if identity => {
-                    SectionStorage::Dense(list.clone().into())
+                    Section::from_cells(self.side, list.clone())
                 }
                 SnapshotCells::Dense(list) => {
                     let mut resolved = Vec::with_capacity(list.len());
                     for value in list {
                         resolved.push(resolve(*value, &mapping)?);
                     }
-                    SectionStorage::Dense(resolved.into())
+                    Section::from_cells(self.side, resolved)
                 }
             };
-            let data =
-                Section::from_storage(self.side, cells).map_err(|error| ExchangeError::Store {
-                    detail: error.to_string(),
-                })?;
+            let data = data.map_err(|error| ExchangeError::Store {
+                detail: error.to_string(),
+            })?;
             store.request(section.pos).map_err(store_error)?;
             store.install(section.pos, data).map_err(store_error)?;
             store.finish_load(section.pos).map_err(store_error)?;

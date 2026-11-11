@@ -167,9 +167,12 @@ fn prepare_at(
         budget,
     )?;
     let pos = page.sections[0].pos;
-    let persistent = page.persistent_view(world.schemas()).map_err(fault)?;
-    if persistent.as_ref() != page {
-        return Err(Fault::invalid_data("page contains transient components"));
+    // Archive validation already checked the complete immutable structure.
+    // Only the persistence policy remains; projecting would scan terrain again.
+    for component in page.entities.iter().flat_map(|e| &e.components) {
+        if !world.schemas().persists(&component.schema).map_err(fault)? {
+            return Err(Fault::invalid_data("page contains transient components"));
+        }
     }
     let restored = page
         .restore(world.registry(), world.schemas())

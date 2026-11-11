@@ -207,6 +207,32 @@ impl Section {
         Ok(section)
     }
 
+    /// Build imported cells directly into their compact layout, avoiding a
+    /// temporary dense census when the final section uses a small palette.
+    pub fn from_cells(side: u32, cells: Vec<BlockStateId>) -> Result<Self, SectionError> {
+        let expected = checked_cell_count(side)?;
+        if cells.len() != expected {
+            return Err(SectionError::CellCountMismatch {
+                expected,
+                actual: cells.len(),
+            });
+        }
+        let storage = if cells.iter().all(|id| *id == cells[0]) {
+            SectionStorage::Uniform(cells[0])
+        } else if let Some(packed) = crate::PaletteCells::build(cells.iter().copied(), cells.len())
+        {
+            SectionStorage::Palette(Box::new(packed))
+        } else {
+            SectionStorage::Dense(cells.into())
+        };
+        Ok(Self {
+            side,
+            revision: Revision::INITIAL,
+            storage,
+            dense_edits: 0,
+        })
+    }
+
     /// Section side length in cells.
     pub const fn side(&self) -> u32 {
         self.side
@@ -558,6 +584,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn imported_cells_match_dense_compaction_for_all_storage_classes() {
+        for states in [1, 2, 17, 257, 300] {
+            let cells: Vec<_> = (0..4096)
+                .map(|i| BlockStateId((i % states) as u16))
+                .collect();
+            let expected =
+                Section::from_storage(16, SectionStorage::Dense(cells.clone().into())).unwrap();
+            let actual = Section::from_cells(16, cells).unwrap();
+            assert_eq!(actual.storage(), expected.storage());
+            assert_eq!(actual.revision(), expected.revision());
+        }
+        assert!(Section::from_cells(16, vec![BlockStateId::EMPTY; 4095]).is_err());
+        assert!(Section::from_cells(0, vec![]).is_err());
     }
 
     #[test]
