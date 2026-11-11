@@ -1,0 +1,146 @@
+[
+  {
+    "iteration": 0,
+    "sections": 1,
+    "appends": 1,
+    "syncs": 1,
+    "microseconds": 679,
+    "mode": "atomic_1"
+  },
+  {
+    "iteration": 0,
+    "sections": 24,
+    "appends": 1,
+    "syncs": 1,
+    "microseconds": 746,
+    "mode": "atomic_24"
+  },
+  {
+    "iteration": 0,
+    "sections": 24,
+    "appends": 24,
+    "syncs": 24,
+    "microseconds": 8146,
+    "mode": "serial_24"
+  },
+  {
+    "iteration": 1,
+    "sections": 24,
+    "appends": 24,
+    "syncs": 24,
+    "microseconds": 9247,
+    "mode": "serial_24"
+  },
+  {
+    "iteration": 1,
+    "sections": 24,
+    "appends": 1,
+    "syncs": 1,
+    "microseconds": 801,
+    "mode": "atomic_24"
+  },
+  {
+    "iteration": 1,
+    "sections": 1,
+    "appends": 1,
+    "syncs": 1,
+    "microseconds": 780,
+    "mode": "atomic_1"
+  },
+  {
+    "iteration": 2,
+    "sections": 1,
+    "appends": 1,
+    "syncs": 1,
+    "microseconds": 674,
+    "mode": "atomic_1"
+  },
+  {
+    "iteration": 2,
+    "sections": 24,
+    "appends": 1,
+    "syncs": 1,
+    "microseconds": 780,
+    "mode": "atomic_24"
+  },
+  {
+    "iteration": 2,
+    "sections": 24,
+    "appends": 24,
+    "syncs": 24,
+    "microseconds": 9705,
+    "mode": "serial_24"
+  },
+  {
+    "iteration": 3,
+    "sections": 24,
+    "appends": 24,
+    "syncs": 24,
+    "microseconds": 8117,
+    "mode": "serial_24"
+  },
+  {
+    "iteration": 3,
+    "sections": 24,
+    "appends": 1,
+    "syncs": 1,
+    "microseconds": 552,
+    "mode": "atomic_24"
+  },
+  {
+    "iteration": 3,
+    "sections": 1,
+    "appends": 1,
+    "syncs": 1,
+    "microseconds": 575,
+    "mode": "atomic_1"
+  },
+  {
+    "iteration": 4,
+    "sections": 1,
+    "appends": 1,
+    "syncs": 1,
+    "microseconds": 755,
+    "mode": "atomic_1"
+  },
+  {
+    "iteration": 4,
+    "sections": 24,
+    "appends": 1,
+    "syncs": 1,
+    "microseconds": 733,
+    "mode": "atomic_24"
+  },
+  {
+    "iteration": 4,
+    "sections": 24,
+    "appends": 24,
+    "syncs": 24,
+    "microseconds": 8644,
+    "mode": "serial_24"
+  },
+  {
+    "iteration": 5,
+    "sections": 24,
+    "appends": 24,
+    "syncs": 24,
+    "microseconds": 8558,
+    "mode": "serial_24"
+  },
+  {
+    "iteration": 5,
+    "sections": 24,
+    "appends": 1,
+    "syncs": 1,
+    "microseconds": 616,
+    "mode": "atomic_24"
+  },
+  {
+    "iteration": 5,
+    "sections": 1,
+    "appends": 1,
+    "syncs": 1,
+    "microseconds": 661,
+    "mode": "atomic_1"
+  }
+]

@@ -67,12 +67,59 @@ impl PreparedSection {
     }
 }
 
+/// A single publication containing ordered, individually validated generated pages.
+pub struct PreparedSections {
+    pub(crate) sections: Vec<PreparedSection>,
+}
+impl PreparedSections {
+    pub fn meta(&self) -> torse_types::CommitMeta {
+        self.sections[0].meta()
+    }
+    pub fn positions(&self) -> impl Iterator<Item = SectionPos> + '_ {
+        self.sections.iter().map(PreparedSection::position)
+    }
+}
+
+pub(crate) fn prepare_batch(
+    world: &WorldAuthority,
+    pages: &[Snapshot],
+    budget: OutputBudget,
+) -> Result<PreparedSections, Fault> {
+    if pages.is_empty() || pages.len() > 1024 {
+        return Err(Fault::resource_limit(
+            "generated batch requires 1..=1024 sections",
+        ));
+    }
+    let mut positions = std::collections::BTreeSet::new();
+    let mut allocator = world.entities().next_entity_id();
+    let mut sections = Vec::with_capacity(pages.len());
+    for page in pages {
+        let prepared = prepare_at(world, page, true, true, budget, Some(allocator))?;
+        if !positions.insert(prepared.position()) {
+            return Err(Fault::invalid_data("duplicate generated batch position"));
+        }
+        allocator = page.next_entity_id;
+        sections.push(prepared);
+    }
+    Ok(PreparedSections { sections })
+}
+
 pub(crate) fn prepare(
     world: &WorldAuthority,
     page: &Snapshot,
     load: bool,
     generated: bool,
     budget: OutputBudget,
+) -> Result<PreparedSection, Fault> {
+    prepare_at(world, page, load, generated, budget, None)
+}
+fn prepare_at(
+    world: &WorldAuthority,
+    page: &Snapshot,
+    load: bool,
+    generated: bool,
+    budget: OutputBudget,
+    allocator: Option<u128>,
 ) -> Result<PreparedSection, Fault> {
     if page.sections.len() != 1
         || page.side != world.store().side()
@@ -87,7 +134,7 @@ pub(crate) fn prepare(
         ));
     }
     if generated {
-        let first = world.entities().next_entity_id();
+        let first = allocator.unwrap_or_else(|| world.entities().next_entity_id());
         let end = first
             .checked_add(page.entities.len() as u128)
             .ok_or_else(|| Fault::resource_limit("generated entity allocator exhausted"))?;

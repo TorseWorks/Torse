@@ -117,6 +117,14 @@ impl ExecutionHost {
         let pool = self.memory_pool().expect("attached memory");
         let growth = if let Some(normal) = &prepared.world.normal {
             self.world().growth_reservation(normal)
+        } else if !prepared.record.changes.sections.is_empty() {
+            prepared
+                .record
+                .changes
+                .sections
+                .iter()
+                .map(|change| self.world().section_growth_reservation(&change.page))
+                .fold(0u64, u64::saturating_add)
         } else if let Some(change) = &prepared.record.changes.section {
             if change.load {
                 self.world().section_growth_reservation(&change.page)

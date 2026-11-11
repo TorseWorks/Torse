@@ -758,7 +758,7 @@ fn legacy_execution_snapshot_and_commit_layouts_remain_readable() {
     );
     let p = host.prepare_next().unwrap().unwrap();
     let r = p.record();
-    for version in [1u16, 2] {
+    for version in [1u16, 2, 3] {
         bytes.clear();
         let mut e = torse_codec::Encoder::new(&mut bytes, base::budget(), base::codec_limits());
         version.write(&mut e).unwrap();
@@ -771,6 +771,9 @@ fn legacy_execution_snapshot_and_commit_layouts_remain_readable() {
         }
         r.changes.outcome.write(&mut e).unwrap();
         r.changes.cancelled.write(&mut e).unwrap();
+        if version == 3 {
+            r.changes.section.write(&mut e).unwrap();
+        }
         e.finish();
         assert!(
             codec

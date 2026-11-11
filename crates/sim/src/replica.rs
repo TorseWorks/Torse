@@ -227,6 +227,26 @@ impl ReplicaSource {
         Ok(publication)
     }
 
+    /// Publish one atomic generated-page batch and invalidate intersecting peers once.
+    pub fn publish_sections(
+        &mut self,
+        prepared: crate::streaming::PreparedSections,
+    ) -> Result<Publication, CommitFault> {
+        let positions: BTreeSet<_> = prepared.positions().collect();
+        let mut publication = self.world.publish_sections(prepared)?;
+        for (&id, sub) in &mut self.subscriptions {
+            if sub.state.is_some() && sub.scope.sections.iter().any(|pos| positions.contains(pos)) {
+                reset(sub);
+                self.pending_invalidations.insert(id);
+            }
+        }
+        publication.invalidated_replicas = std::mem::take(&mut self.pending_invalidations)
+            .into_iter()
+            .map(SubscriptionId)
+            .collect();
+        Ok(publication)
+    }
+
     pub fn new(
         world: WorldAuthority,
         binding: Binding,

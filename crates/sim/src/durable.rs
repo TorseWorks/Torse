@@ -306,6 +306,8 @@ pub struct ExecutionChanges {
     pub outcome: Option<ReplyStatus>,
     pub cancelled: Option<Accepted>,
     pub section: Option<SectionChange>,
+    /// Ordered, atomic trusted generated installation; exclusive with section.
+    pub sections: Vec<SectionChange>,
 }
 
 /// Full state freezes a batch or finishes a phase. Progress reuses its immutable rule and

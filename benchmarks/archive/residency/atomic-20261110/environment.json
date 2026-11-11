@@ -1,0 +1,23 @@
+{
+  "date": "2026-11-10",
+  "os": "Windows 11 Home 10.0.26200",
+  "storage": "WD Blue SN580 1TB NVMe SSD",
+  "rustc": "1.93.1 (01f6ddf75 2026-02-11)",
+  "profile": "release",
+  "baseline": "7ce1880",
+  "source_files": [
+    "apps/server/src/execution.rs",
+    "apps/server/src/execution_memory.rs",
+    "apps/server/src/streaming.rs",
+    "apps/server/tests/atomic_install.rs",
+    "apps/server/tests/streaming.rs",
+    "crates/codec/src/wire.rs",
+    "crates/sim/src/authority.rs",
+    "crates/sim/src/durable.rs",
+    "crates/sim/src/replica.rs",
+    "crates/sim/src/streaming.rs"
+  ],
+  "canonical_source_sha256": "f8bd9d7e9f58f2a26cc82e887584eb34574f5a5ab4970ee5647b1b0db4222fb6",
+  "command": "cargo test --release -p torse-server --test atomic_install --locked release_atomic_column_install_comparison -- --ignored --nocapture --test-threads=1",
+  "fixture": "One 24-section column, y=-4..19, 16^3 uniform stone cells per section, no generated entities; same process and file-backed journal, alternating order, six repetitions, initial checkpoint creation and page construction outside timing, installation and actual journal append/sync inside timing. Each result fully reopened and compared. No generator, transport or tick loop; no power-loss test."
+}

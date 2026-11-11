@@ -12,7 +12,7 @@ use torse_types::*;
 use torse_world::*;
 
 pub const EXECUTION_VERSION: u16 = 1;
-pub const EXECUTION_COMMIT_VERSION: u16 = 3;
+pub const EXECUTION_COMMIT_VERSION: u16 = 4;
 pub const EXECUTION_SNAPSHOT_VERSION: u16 = 2;
 pub trait Wire: Sized {
     fn write(&self, out: &mut Encoder<'_>) -> EncodeResult<()>;
@@ -820,7 +820,8 @@ fields!(ExecutionChanges {
     runtime,
     outcome,
     cancelled,
-    section
+    section,
+    sections
 });
 fields!(torse_sim::SystemSpec {
     id,
@@ -1018,6 +1019,7 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
                     outcome: Wire::read(&mut d)?,
                     cancelled: Wire::read(&mut d)?,
                     section: None,
+                    sections: Vec::new(),
                 },
             },
             2 => CommitRecord {
@@ -1028,6 +1030,18 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
                     outcome: Wire::read(&mut d)?,
                     cancelled: Wire::read(&mut d)?,
                     section: None,
+                    sections: Vec::new(),
+                },
+            },
+            3 => CommitRecord {
+                meta: Wire::read(&mut d)?,
+                changes: ExecutionChanges {
+                    world: Wire::read(&mut d)?,
+                    runtime: Wire::read(&mut d)?,
+                    outcome: Wire::read(&mut d)?,
+                    cancelled: Wire::read(&mut d)?,
+                    section: Wire::read(&mut d)?,
+                    sections: Vec::new(),
                 },
             },
             EXECUTION_COMMIT_VERSION => ModelCommit::<M>::read(&mut d)?,
