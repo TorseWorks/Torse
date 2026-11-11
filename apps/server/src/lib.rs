@@ -18,6 +18,7 @@ mod lifecycle;
 #[cfg(feature = "mods")]
 pub mod mods;
 pub mod network;
+pub mod parking;
 mod profiling;
 mod reclamation;
 pub mod residency;

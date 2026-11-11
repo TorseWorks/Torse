@@ -71,6 +71,8 @@ impl PreparedSection {
 /// A single publication containing ordered, individually validated generated pages.
 pub struct PreparedSections {
     pub(crate) sections: Vec<PreparedSection>,
+    pub(crate) next_entity_id: u128,
+    pub(crate) park: bool,
 }
 impl PreparedSections {
     pub fn meta(&self) -> torse_types::CommitMeta {
@@ -85,6 +87,7 @@ pub(crate) fn prepare_batch<'a>(
     world: &WorldAuthority,
     pages: impl ExactSizeIterator<Item = &'a Snapshot>,
     budget: OutputBudget,
+    park: bool,
 ) -> Result<PreparedSections, Fault> {
     let count = pages.len();
     if count == 0 || count > 1024 {
@@ -95,11 +98,21 @@ pub(crate) fn prepare_batch<'a>(
     let mut positions = std::collections::BTreeSet::new();
     let mut allocator = world.entities().next_entity_id();
     let mut sections = Vec::with_capacity(count);
+    let mut cut = None;
     for (index, page) in pages.enumerate() {
         if index >= count {
             return Err(Fault::invalid_data("page iterator length changed"));
         }
-        let prepared = prepare_at(world, page, true, true, budget, Some(allocator))?;
+        if park
+            && (page.meta.resume_at.next_phase != 0
+                || page.meta.resume_at.next_step != 0
+                || *cut.get_or_insert(page.meta) != page.meta)
+        {
+            return Err(Fault::invalid_data(
+                "parking pages require one generation cut",
+            ));
+        }
+        let prepared = prepare_at(world, page, true, true, budget, Some(allocator), park)?;
         if !positions.insert(prepared.position()) {
             return Err(Fault::invalid_data("duplicate generated batch position"));
         }
@@ -109,7 +122,11 @@ pub(crate) fn prepare_batch<'a>(
     if sections.len() != count {
         return Err(Fault::invalid_data("page iterator length changed"));
     }
-    Ok(PreparedSections { sections })
+    Ok(PreparedSections {
+        sections,
+        next_entity_id: allocator,
+        park,
+    })
 }
 
 pub(crate) fn prepare(
@@ -119,7 +136,7 @@ pub(crate) fn prepare(
     generated: bool,
     budget: OutputBudget,
 ) -> Result<PreparedSection, Fault> {
-    prepare_at(world, page, load, generated, budget, None)
+    prepare_at(world, page, load, generated, budget, None, false)
 }
 fn prepare_at(
     world: &WorldAuthority,
@@ -128,6 +145,7 @@ fn prepare_at(
     generated: bool,
     budget: OutputBudget,
     allocator: Option<u128>,
+    park: bool,
 ) -> Result<PreparedSection, Fault> {
     if page.sections.len() != 1
         || page.side != world.store().side()
@@ -147,7 +165,7 @@ fn prepare_at(
             .checked_add(page.entities.len() as u128)
             .ok_or_else(|| Fault::resource_limit("generated entity allocator exhausted"))?;
         if !load
-            || page.meta.cursor.seq != world.seq()
+            || (!park && page.meta.cursor.seq != world.seq())
             || page.next_entity_id != end
             || page
                 .entities

@@ -316,6 +316,61 @@ fn partial_append_and_failed_sync_recover_zero_or_whole_batch_above_confirmed_fl
 }
 
 #[test]
+fn parked_batch_recovery_handles_partial_append_and_lost_sync_acknowledgement() {
+    use std::time::Duration;
+    use torse_server::{execution::installs::SectionInstallLimits, parking::ParkingProgress};
+
+    for mode in [1, 2] {
+        let dir = Directory::new();
+        let (mut server, pages, counts) = setup(&dir, base::execution_limits().runtime, 8_388_608);
+        let anchor = column(server.authority().unwrap(), 2, false).remove(0);
+        server
+            .install_section_batch(&pages, vec![anchor], &mut NoReplicas)
+            .unwrap();
+        let floor = server.durability().through;
+        let input = column(server.authority().unwrap(), 3, true);
+        counts.fail.store(mode, Ordering::SeqCst);
+        server
+            .begin_generated_parking(
+                pages.clone(),
+                input,
+                SectionInstallLimits {
+                    max_pages: 24,
+                    max_bytes: 8_388_608,
+                },
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match server.poll_generated_parking(&mut NoReplicas) {
+                Ok(ParkingProgress::Pending) => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                Err(error) => {
+                    assert_eq!(error.code, FaultCode::StorageUnavailable);
+                    break;
+                }
+                other => panic!("unexpected parking progress: {other:?}"),
+            }
+        }
+        assert_eq!(server.durability().through, floor);
+        assert!(server.authority().is_err());
+        drop(server);
+        let reopened = open(&dir, pages);
+        let host = reopened.authority().unwrap();
+        assert!(reopened.durability().through >= floor);
+        assert_eq!(host.world().store().len(), 1);
+        assert_eq!(host.world().entities().iter().count(), 0);
+        assert_eq!(host.parked_sections().len(), if mode == 1 { 0 } else { 24 });
+        assert_eq!(
+            host.world().entities().next_entity_id(),
+            if mode == 1 { 1 } else { 25 }
+        );
+    }
+}
+
+#[test]
 #[ignore = "run with --release --ignored --nocapture --test-threads=1"]
 fn release_atomic_column_install_comparison() {
     for iteration in 0..6 {

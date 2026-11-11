@@ -12,6 +12,7 @@ use torse_types::{Digest, Fault, FaultCode, OutputBudget};
 use torse_world::Snapshot;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+mod bundle;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PageCollection {
@@ -139,19 +140,33 @@ impl SectionPages {
         {
             return Err(Fault::invalid_data("section page must be a regular file"));
         }
-        let file = fs::File::open(path).map_err(io)?;
+        let mut file = fs::File::open(path).map_err(io)?;
         let limit = self
             .budget
             .max_bytes
             .min(u64::from(self.codec.max_frame_bytes).saturating_add(8));
-        if file.metadata().map_err(io)?.len() > limit {
+        let length = file.metadata().map_err(io)?.len();
+        let mut magic = [0; 8];
+        file.read_exact(&mut magic).map_err(io)?;
+        if &magic == bundle::MAGIC {
+            let bytes = self.read_bundle_page(file, length, digest, limit)?;
+            return self.decode_page(&bytes, digest);
+        }
+        if length > limit {
             return Err(Fault::resource_limit("section page too large"));
         }
-        let mut bytes = Vec::new();
-        file.take(limit.saturating_add(1))
+        let mut bytes = magic.to_vec();
+        file.take(limit.saturating_add(1).saturating_sub(8))
             .read_to_end(&mut bytes)
             .map_err(io)?;
-        if bytes.len() as u64 > limit || hash(&bytes) != digest || !bytes.starts_with(b"TORSEPG1") {
+        if bytes.len() as u64 > limit {
+            return Err(Fault::resource_limit("section page too large"));
+        }
+        self.decode_page(&bytes, digest)
+    }
+
+    fn decode_page(&self, bytes: &[u8], digest: Digest) -> Result<Snapshot, Fault> {
+        if hash(bytes) != digest || !bytes.starts_with(b"TORSEPG1") {
             return Err(Fault::invalid_data("section page integrity check failed"));
         }
         let page: Snapshot = wire::decode(&bytes[8..], self.budget, self.codec)?;
