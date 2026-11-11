@@ -11,7 +11,13 @@ pub fn pages(dir: &Directory) -> SectionPages {
 }
 
 pub fn create(dir: &Directory) -> base::Files {
-    let (mut world, actions) = base::world().unwrap();
+    create_with_world(dir, base::world().unwrap())
+}
+
+pub fn create_with_world(
+    dir: &Directory,
+    (mut world, actions): (WorldAuthority, torse_sim::action::ActionService),
+) -> base::Files {
     let schemas = world.schemas().clone();
     let handle = world.entities().iter().next().unwrap().0;
     world
