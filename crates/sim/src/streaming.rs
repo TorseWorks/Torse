@@ -160,23 +160,9 @@ fn prepare_at(
             ));
         }
     }
-    // Budget and canonical structure are checked before cloning the page.
-    torse_world::SnapshotArchive::validate_legacy(
-        page,
-        &torse_world::ArchiveManifest::default(),
-        budget,
-    )?;
+    let restored =
+        page.restore_persistent_with_budget(world.registry(), world.schemas(), budget)?;
     let pos = page.sections[0].pos;
-    // Archive validation already checked the complete immutable structure.
-    // Only the persistence policy remains; projecting would scan terrain again.
-    for component in page.entities.iter().flat_map(|e| &e.components) {
-        if !world.schemas().persists(&component.schema).map_err(fault)? {
-            return Err(Fault::invalid_data("page contains transient components"));
-        }
-    }
-    let restored = page
-        .restore(world.registry(), world.schemas())
-        .map_err(fault)?;
     crate::block_instances::validate(&restored.store, &restored.entities, world.registry())
         .map_err(fault)?;
     let entities: Vec<_> = restored.entities.iter().map(|(_, e)| e.clone()).collect();
