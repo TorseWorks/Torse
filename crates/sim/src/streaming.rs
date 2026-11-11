@@ -6,7 +6,8 @@ use crate::{CommitFault, PreparedChange, WorldAuthority};
 
 pub struct PreparedSection {
     pub(crate) barrier: PreparedChange,
-    pub(crate) page: Snapshot,
+    page_meta: SnapshotMeta,
+    position: SectionPos,
     pub(crate) load: bool,
     pub(crate) section: Option<Section>,
     pub(crate) entities: Vec<Entity>,
@@ -22,7 +23,7 @@ impl PreparedSection {
         self.barrier.meta()
     }
     pub fn position(&self) -> SectionPos {
-        self.page.sections[0].pos
+        self.position
     }
 
     pub(crate) fn validate(&self, world: &WorldAuthority) -> Result<(), CommitFault> {
@@ -50,7 +51,7 @@ impl PreparedSection {
                 return Err(invalid());
             }
             let current = Snapshot::capture_section_with_budget(
-                self.page.meta,
+                self.page_meta,
                 world.store(),
                 world.entities(),
                 world.registry(),
@@ -80,26 +81,33 @@ impl PreparedSections {
     }
 }
 
-pub(crate) fn prepare_batch(
+pub(crate) fn prepare_batch<'a>(
     world: &WorldAuthority,
-    pages: &[Snapshot],
+    pages: impl ExactSizeIterator<Item = &'a Snapshot>,
     budget: OutputBudget,
 ) -> Result<PreparedSections, Fault> {
-    if pages.is_empty() || pages.len() > 1024 {
+    let count = pages.len();
+    if count == 0 || count > 1024 {
         return Err(Fault::resource_limit(
             "generated batch requires 1..=1024 sections",
         ));
     }
     let mut positions = std::collections::BTreeSet::new();
     let mut allocator = world.entities().next_entity_id();
-    let mut sections = Vec::with_capacity(pages.len());
-    for page in pages {
+    let mut sections = Vec::with_capacity(count);
+    for (index, page) in pages.enumerate() {
+        if index >= count {
+            return Err(Fault::invalid_data("page iterator length changed"));
+        }
         let prepared = prepare_at(world, page, true, true, budget, Some(allocator))?;
         if !positions.insert(prepared.position()) {
             return Err(Fault::invalid_data("duplicate generated batch position"));
         }
         allocator = page.next_entity_id;
         sections.push(prepared);
+    }
+    if sections.len() != count {
+        return Err(Fault::invalid_data("page iterator length changed"));
     }
     Ok(PreparedSections { sections })
 }
@@ -153,18 +161,20 @@ fn prepare_at(
         }
     }
     // Budget and canonical structure are checked before cloning the page.
-    let checked = torse_world::SnapshotArchive::import_legacy(
+    torse_world::SnapshotArchive::validate_legacy(
         page,
-        torse_world::ArchiveManifest::default(),
+        &torse_world::ArchiveManifest::default(),
         budget,
     )?;
     let pos = page.sections[0].pos;
-    let persistent = page.persistent_view(world.schemas()).map_err(fault)?;
-    if persistent.as_ref() != page {
-        return Err(Fault::invalid_data("page contains transient components"));
+    // Archive validation already checked the complete immutable structure.
+    // Only the persistence policy remains; projecting would scan terrain again.
+    for component in page.entities.iter().flat_map(|e| &e.components) {
+        if !world.schemas().persists(&component.schema).map_err(fault)? {
+            return Err(Fault::invalid_data("page contains transient components"));
+        }
     }
-    let restored = checked
-        .snapshot
+    let restored = page
         .restore(world.registry(), world.schemas())
         .map_err(fault)?;
     crate::block_instances::validate(&restored.store, &restored.entities, world.registry())
@@ -217,7 +227,8 @@ fn prepare_at(
     };
     Ok(PreparedSection {
         barrier: world.prepare_barrier().map_err(fault)?,
-        page: checked.snapshot,
+        page_meta: page.meta,
+        position: pos,
         load,
         section: restored.store.section(pos).cloned(),
         entities,
