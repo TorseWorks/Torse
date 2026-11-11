@@ -63,6 +63,9 @@ impl SectionPages {
     pub fn budget(&self) -> OutputBudget {
         self.budget
     }
+    pub(crate) fn codec_limits(&self) -> CodecLimits {
+        self.codec
+    }
     pub(crate) fn measure(&self, page: &Snapshot, max_bytes: u64) -> Result<wire::WireCost, Fault> {
         wire::measure_inner(
             page,

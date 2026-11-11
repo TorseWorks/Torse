@@ -23,6 +23,7 @@ mod reclamation;
 pub mod residency;
 pub mod section_pages;
 pub mod systems;
+pub mod visual;
 pub use execution::PlanningConfig;
 mod world;
 

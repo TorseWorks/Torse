@@ -1,10 +1,20 @@
-# 应用协议版本5
+# 应用协议版本6
+
+## 独立显示地形
+
+版本6追加Terrain标签10。Hello拒绝版本1至5，双方须同时升级；codec/wire版本1与存档格式不变。近景仍使用Seed/Batch/Interest。Terrain不包含实体，不授予交互权限。
+
+TerrainUpdate字段依次为Binding、generation:u64、seq:u64、through:CommitCursor、reset:Option<TerrainReset>、pages:Vec<TerrainPage<S>>、unavailable:Vec<(SectionPos,TerrainUnavailable)>。TerrainReset为有序唯一sections和retained:Vec<(SectionPos,Digest)>。TerrainPage为at:CommitCursor、digest:Digest、terrain:S；S含单个分区、使用到的状态字典和空实体列表。Digest为地形投影wire编码的SHA-256内容标记。可用性标签为0 Pending、1 Missing、2 Corrupt、3 Budget。
+
+范围替换提高generation，从seq=1和reset开始；同代seq连续增长，through可相等但不能倒退。新范围只能保留reset列出且标记一致的页；保留证明确认内容在through仍有效。其他旧页清除。近景变化设置显示页版本下界，晚到页低于下界时隐藏，近景始终优先。非法绑定、重复、乱序、无效引用和超额输入原子拒绝，应用丢弃连接镜像并重连，宿主重新批准范围。
+
+显示批准范围由宿主设定，连接内不可收紧；撤销须关闭连接并清理输出。普通移动在批准范围内更换意向，积压时等待输出排空，丢弃过期后台结果。缺失或损坏不伪造空气、不安装权威分区。Terrain不保存事件历史。
 
 每个TCP帧为u32小端正文长度 + 正文。零长度或超出本地frame上限拒绝。正文使用codec/wire版本u16=1，再跟u8消息标签和以下字段。TCP分段不等于应用分片，正文未收齐不解码。
 
 | 客户端标签 | 字段顺序 |
 |---|---|
-| 0 Hello | protocol_version:u16=5、Compatibility |
+| 0 Hello | protocol_version:u16=6、Compatibility |
 | 1 Request | RequestSeq:u64、泛型输入I |
 | 2 Subscribe | SectionPos的有界Vec |
 | 3 Unsubscribe | SubscriptionId:u128 |
@@ -26,6 +36,7 @@
 | 7 ControlReady | api:u16 |
 | 8 ControlAck | seq:u64、accepted:bool |
 | 9 Interest | ReplicaBatch<C>，其中presentation必须为空 |
+| 10 Terrain | TerrainUpdate<S>，只读地形独立顺序流 |
 
 接纳状态为0 + target_tick:u64、1表示Duplicate、2 + RejectCode表示Rejected。元数据和容器按codec显式基础编码，应用层本版绑定I=Call、O=Reply、S=ReplicaSnapshot、C=ReplicaChanges，见../codec/EXECUTION.md。
 
@@ -55,7 +66,7 @@ Ping仅在Hello成功后接纳，没有响应、不占RequestSeq、不写日志�
 
 应用时序须满足`idle_ticks * tick_period >= 3 * heartbeat_interval`。演示配置为1200个Tick、50毫秒一个Tick、10秒心跳，空闲上限为60秒。停发后仍按原空闲规则回收连接。未握手连接也受空闲上限约束，Ping不能延长其占位。
 
-Ping在应用协议版本2加入，当前协议版本5在Hello阶段拒绝旧版本混用。codec/wire版本保持1，既有标签顺序、存档及执行记录布局不变；未知消息标签仍拒绝。
+Ping在应用协议版本2加入，当前协议版本6在Hello阶段拒绝旧版本混用。codec/wire版本保持1，既有标签顺序、存档及执行记录布局不变；未知消息标签仍拒绝。
 
 ## 提交呈现事件
 
