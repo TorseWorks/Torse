@@ -21,6 +21,192 @@ pub struct SectionInstallDiagnostics {
 
 const MAX_RESIDENT: usize = 4096;
 
+// The record appends exactly the already measured Vec<SectionChange>. Its
+// container prefix is present in both measurements; subtract it once. No
+// structure or value depth is added by the surrounding wire field structs.
+fn section_record_cost(
+    record: &mut CommitRecord<ExecutionChanges>,
+    sections_cost: wire::WireCost,
+    budget: OutputBudget,
+    codec: torse_codec::CodecLimits,
+) -> Result<wire::WireCost, Fault> {
+    let sections = std::mem::take(&mut record.changes.sections);
+    let envelope = wire::measure_inner(record, budget, codec);
+    record.changes.sections = sections;
+    let envelope = envelope?;
+    let prefix = wire::measure_inner(&Vec::<SectionChange>::new(), budget, codec)?;
+    let overflow = || Fault::resource_limit("section record cost overflow");
+    let cost = wire::WireCost {
+        encoded_bytes: envelope
+            .encoded_bytes
+            .checked_sub(prefix.encoded_bytes)
+            .and_then(|n| n.checked_add(sections_cost.encoded_bytes))
+            .ok_or_else(overflow)?,
+        owned_bytes: envelope
+            .owned_bytes
+            .checked_sub(prefix.owned_bytes)
+            .and_then(|n| n.checked_add(sections_cost.owned_bytes))
+            .ok_or_else(overflow)?,
+        items: envelope
+            .items
+            .checked_sub(prefix.items)
+            .and_then(|n| n.checked_add(sections_cost.items))
+            .ok_or_else(overflow)?,
+    };
+    if cost.encoded_bytes > budget.max_bytes.min(u64::from(codec.max_frame_bytes))
+        || cost.owned_bytes > budget.max_bytes
+        || cost.items > budget.max_items
+    {
+        return Err(Fault::resource_limit(
+            "section record exceeds aggregate budget",
+        ));
+    }
+    Ok(cost)
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+    use crate::bootstrap as base;
+    use torse_world::{BlockStateId, Position, SnapshotCells};
+    #[test]
+    fn composed_section_record_cost_matches_full_wire_measurement_and_denials() {
+        for dense in [false, true] {
+            for entities in [false, true] {
+                for count in [1, 4] {
+                    let (world, actions) = base::world().unwrap();
+                    let template = world
+                        .capture_section(SectionPos::ZERO, base::budget())
+                        .unwrap();
+                    let binding = Binding {
+                        world: base::WORLD,
+                        epoch: WorldEpoch(1),
+                        compatibility: world.coordinator().compatibility(),
+                    };
+                    let first = world.entities().next_entity_id();
+                    let mut changes = Vec::new();
+                    for index in 0..count {
+                        let mut page = template.clone();
+                        let pos = SectionPos::new(2 + index as i64, 0, 0);
+                        page.sections[0].pos = pos;
+                        if dense {
+                            let stone = world
+                                .registry()
+                                .default_state(&base::key("base:stone"))
+                                .unwrap();
+                            page.states = vec![torse_world::StateEntry {
+                                id: stone,
+                                block: base::key("base:stone"),
+                                values: vec![],
+                            }];
+                            page.sections[0].cells = SnapshotCells::Dense(
+                                (0..4096)
+                                    .map(|i| {
+                                        if i % 3 == 0 {
+                                            stone
+                                        } else {
+                                            BlockStateId::EMPTY
+                                        }
+                                    })
+                                    .collect(),
+                            );
+                        }
+                        page.entities.truncate(usize::from(entities));
+                        let next = first + if entities { index as u128 } else { 0 };
+                        if entities {
+                            page.entities[0].id = EntityId(next);
+                            page.entities[0].position_bits =
+                                Position::new(pos.x as f64 * 16. + 1.5, 1.5, 1.5).to_bits();
+                        }
+                        page.next_entity_id = next + u128::from(entities);
+                        changes.push(SectionChange {
+                            reference: reference(&page, Digest([0; 32])),
+                            page,
+                            load: true,
+                            fresh: true,
+                        });
+                    }
+                    let host = ExecutionHost::new(
+                        binding,
+                        world,
+                        actions,
+                        vec![],
+                        base::execution_limits(),
+                    )
+                    .unwrap();
+                    let mut prepared = host.prepare_section_batch(changes).unwrap();
+                    let sections = wire::measure_inner(
+                        &prepared.record.changes.sections,
+                        base::budget(),
+                        base::codec_limits(),
+                    )
+                    .unwrap();
+                    let expected =
+                        wire::measure_inner(&prepared.record, base::budget(), base::codec_limits())
+                            .unwrap();
+                    assert_eq!(
+                        section_record_cost(
+                            &mut prepared.record,
+                            sections,
+                            base::budget(),
+                            base::codec_limits()
+                        )
+                        .unwrap(),
+                        expected
+                    );
+                    let tiny = OutputBudget {
+                        max_items: expected.items - 1,
+                        ..base::budget()
+                    };
+                    assert!(
+                        wire::measure_inner(&prepared.record, tiny, base::codec_limits()).is_err()
+                    );
+                    assert!(
+                        section_record_cost(
+                            &mut prepared.record,
+                            sections,
+                            tiny,
+                            base::codec_limits()
+                        )
+                        .is_err()
+                    );
+                    let tiny = OutputBudget {
+                        max_bytes: expected.encoded_bytes.max(expected.owned_bytes) - 1,
+                        ..base::budget()
+                    };
+                    assert!(
+                        wire::measure_inner(&prepared.record, tiny, base::codec_limits()).is_err()
+                    );
+                    assert!(
+                        section_record_cost(
+                            &mut prepared.record,
+                            sections,
+                            tiny,
+                            base::codec_limits()
+                        )
+                        .is_err()
+                    );
+                    let codec = torse_codec::CodecLimits {
+                        max_frame_bytes: expected.encoded_bytes as u32 - 1,
+                        ..base::codec_limits()
+                    };
+                    assert!(wire::measure_inner(&prepared.record, base::budget(), codec).is_err());
+                    assert!(
+                        section_record_cost(&mut prepared.record, sections, base::budget(), codec)
+                            .is_err()
+                    );
+                    assert_eq!(prepared.record.changes.sections.len(), count);
+                    assert_eq!(
+                        wire::measure_inner(&prepared.record, base::budget(), base::codec_limits())
+                            .unwrap(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl ExecutionHost {
     pub fn parked_sections(&self) -> &BTreeMap<SectionPos, ParkedSection> {
         &self.parked
@@ -214,7 +400,7 @@ impl ExecutionHost {
             })
             .transpose()?;
         // Bound the full input before the world decodes or clones individual pages.
-        wire::measure_inner(&changes, self.limits.runtime, self.limits.codec)?;
+        let sections_cost = wire::measure_inner(&changes, self.limits.runtime, self.limits.codec)?;
         let world = self.world().prepare_generated_sections_iter(
             changes.iter().map(|c| &c.page),
             self.limits.runtime,
@@ -243,7 +429,12 @@ impl ExecutionHost {
                 },
             },
         };
-        wire::measure_inner(&prepared.record, self.limits.runtime, self.limits.codec)?;
+        section_record_cost(
+            &mut prepared.record,
+            sections_cost,
+            self.limits.runtime,
+            self.limits.codec,
+        )?;
         self.account_residency(&mut prepared)?;
         Ok(prepared)
     }

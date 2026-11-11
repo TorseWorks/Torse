@@ -217,9 +217,23 @@ impl Section {
                 actual: cells.len(),
             });
         }
-        let storage = if cells.iter().all(|id| *id == cells[0]) {
+        let mut seen = [0u64; 1024];
+        let mut distinct = 0;
+        for id in &cells {
+            let word = &mut seen[id.0 as usize / 64];
+            let bit = 1u64 << (id.0 % 64);
+            if *word & bit == 0 {
+                *word |= bit;
+                distinct += 1;
+            }
+            if distinct > crate::MAX_PALETTE_STATES {
+                break;
+            }
+        }
+        let storage = if distinct == 1 {
             SectionStorage::Uniform(cells[0])
-        } else if let Some(packed) = crate::PaletteCells::build(cells.iter().copied(), cells.len())
+        } else if distinct <= crate::MAX_PALETTE_STATES
+            && let Some(packed) = crate::PaletteCells::build(cells.iter().copied(), cells.len())
         {
             SectionStorage::Palette(Box::new(packed))
         } else {
@@ -598,6 +612,14 @@ mod tests {
             assert_eq!(actual.storage(), expected.storage());
             assert_eq!(actual.revision(), expected.revision());
         }
+        let mut late: Vec<_> = (0..4096).map(|i| BlockStateId((i % 256) as u16)).collect();
+        late[4095] = BlockStateId(300);
+        let expected =
+            Section::from_storage(16, SectionStorage::Dense(late.clone().into())).unwrap();
+        assert_eq!(
+            Section::from_cells(16, late).unwrap().storage(),
+            expected.storage()
+        );
         assert!(Section::from_cells(16, vec![BlockStateId::EMPTY; 4095]).is_err());
         assert!(Section::from_cells(0, vec![]).is_err());
     }
