@@ -172,6 +172,8 @@ struct Queued {
 pub struct ExecutionHost {
     players: BTreeMap<u128, player_control::PlayerSession>,
     parked: BTreeMap<SectionPos, ParkedSection>,
+    visual_transitions:
+        std::collections::VecDeque<(SectionPos, crate::visual::Stamp, crate::visual::Stamp)>,
     section_pending: Option<ExecutionPrepared>,
     section_install_limit: usize,
     section_install_diagnostics: streaming::SectionInstallDiagnostics,
@@ -413,6 +415,19 @@ fn receipt_bounds(state: &RuntimeState, cursor: CommitCursor) -> Result<(), Faul
 }
 
 impl ExecutionHost {
+    pub(crate) fn proves_visual_transition(
+        &self,
+        pos: SectionPos,
+        before: crate::visual::Stamp,
+        after: crate::visual::Stamp,
+    ) -> bool {
+        self.visual_transitions
+            .iter()
+            .rev()
+            .find(|(p, _, _)| *p == pos)
+            .is_some_and(|(_, from, to)| *from == before && *to == after)
+    }
+
     /// Export a tick-boundary archive with source versions and complete runtime.
     pub fn capture_archive(
         &mut self,
@@ -469,6 +484,7 @@ impl ExecutionHost {
             players: BTreeMap::new(),
             source: ReplicaSource::new(world, binding, limits.replicas)?,
             parked: BTreeMap::new(),
+            visual_transitions: std::collections::VecDeque::new(),
             section_pending: None,
             section_install_limit: 24,
             section_install_diagnostics: streaming::SectionInstallDiagnostics::default(),
@@ -1429,6 +1445,16 @@ impl HostAuthority for ExecutionHost {
             ));
         }
         let accounting = prepared.memory.take();
+        let transition = prepared
+            .record
+            .changes
+            .section
+            .as_ref()
+            .filter(|change| !change.fresh)
+            .map(|change| {
+                let pos = change.page.sections[0].pos;
+                (pos, crate::visual::stamp(self, pos))
+            });
         let publication = if let Some(sections) = prepared.world.sections {
             self.source.publish_sections(*sections)
         } else if let Some(section) = prepared.world.section {
@@ -1445,6 +1471,13 @@ impl HostAuthority for ExecutionHost {
             } else {
                 self.parked.insert(pos, section.reference.clone());
             }
+        }
+        if let Some((pos, before)) = transition {
+            if self.visual_transitions.len() == crate::visual::TRANSITION_LIMIT {
+                self.visual_transitions.pop_front();
+            }
+            let after = crate::visual::stamp(self, pos);
+            self.visual_transitions.push_back((pos, before, after));
         }
         if let Some(request) = &prepared.record.changes.cancelled
             && let Some(live) = self.sessions.get_mut(&request.id.session.0)
