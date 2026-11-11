@@ -18,9 +18,9 @@
 
 ## 稠密原子安装诊断
 
-`section_install_diagnostics`按最近一次`install_section_batch`记录`page_preparation`（页编码、摘要和引用）、`validation`（结构、内容、预算、恢复准备和完整记录成本）、`commit`（日志暂存编码、原子发布和失效通知，排除刷盘）、`durability_wait`与总`elapsed`。失败阶段同样记录；这些墙钟观察不参与权威决策。另用可选SerialProfiler的Encoding阶段细分最终日志编码，不能把全部commit时间当作纯发布。
+`section_install_diagnostics`按最近一次`install_section_batch`记录`page_preparation`（页编码、摘要和引用）、`validation`（结构、内容、预算、恢复准备和完整记录成本）、`commit`（日志暂存编码、原子发布和失效通知，排除刷盘）、`durability_wait`与总`elapsed`。失败阶段同样记录。可选SerialProfiler分别记录最终日志编码、`JournalAppend`（追加及包裹字节）和`JournalSync`（文件同步）。`Flush`阶段自身报告扣除子阶段的时间，耐久等待总时长仍见`flush_metrics`。这些墙钟观察只供诊断。
 
-批量准备借用原有页序列，保留只含身份和版本的发布令牌，不重复保存完整地形页。快照仍执行原有结构、内容、持久字段和预算校验；符号解析全部保持原ID时直接复制已验证的稠密ID序列，否则逐项重映射；直接建立最终紧凑布局，避免中间稠密统计。稠密wire数组按有界字节块处理，旧字节与条目/拥有量预算保持一致。调色板仅在实际包含需要附属实例的状态时扫描所有单元。完整记录成本由已测页列表和实际空列表记录包络精确合成，保留总编码字节、解码拥有量、条目和帧限制，日志写入仍执行原有完整编码。一次日志记录、一次原子发布和一次耐久屏障不变，提交格式仍为4，存档与协议不因这些优化变化。
+批量准备借用原有页序列，保留只含身份和版本的发布令牌，不重复保存完整地形页。快照仍执行原有结构、内容、持久字段和预算校验；符号解析全部保持原ID时直接复制已验证的稠密ID序列，否则逐项重映射；直接建立最终紧凑布局，避免中间稠密统计。稠密wire数组按有界字节块处理，旧字节与条目/拥有量预算保持一致。调色板仅在实际包含需要附属实例的状态时扫描所有单元。完整记录成本由已测页列表和实际空列表记录包络精确合成，保留总编码字节、解码拥有量、条目和帧限制。适用的批量安装使用提交版本5打包内联稠密页，仍只产生一条记录、一次原子发布和一次耐久屏障。
 
 `cargo run --release -p torse-server --example dense_install_baseline -- NEW_OUTPUT_DIRECTORY`初始化25列、每列24页，然后以50ms节拍驱动200次内核tick，在10.9格/秒的虚拟位移下安装30列。固定种子每列16页稠密地形和3个附属实体；使用真实文件日志、600页授权复制、编码/解码和镜像更新，窗口移动后卸载后方页。正常驻留600页、安装边界最多720页，每列断言一次flush请求，最终核对完整授权快照与重开恢复。
 
@@ -164,7 +164,7 @@ cargo test -p torse-server --test event_budget --locked
 
 WorkPlan支持携带TransactionGroup。Mod机器自有状态与库存规划器返回的事务按来源组成一个任务，连同新唤醒共同预留、发布和刷盘。冻结任务保存稳定成员，恢复不重跑已规划或已结算的Guest。库存拒绝保留机器完成前的进度，不登记该计划的新唤醒；陷阱重试次数由持久事件载荷记录，停机以没有后续唤醒表示。ModStats只供诊断，不影响恢复后的执行。验证见[Mod原子执行](../../benchmarks/archive/mods/M4-mod-atomic.md)。
 
-持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本4、读版本1至4，快照写版本2、读版本1和2，应用协议为版本6。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。主程序仍使用有限范围，显式装卸接口另见下文，未进行硬件断电验收。
+持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本4或5、读版本1至5，快照写版本2、读版本1和2，应用协议为版本6。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。主程序仍使用有限范围，显式装卸接口另见下文，未进行硬件断电验收。
 
 ## 运行态与批量刷盘
 
@@ -442,6 +442,6 @@ do not establish stable observer overhead or any speedup. CPU time was not separ
 
 任何非法页面或总预算不足都拒绝整批，journal压力返回`CommitStep::Blocked`，不会发布前缀或消耗实体编号。调用方需要重试时保留原输入，确认生成切面仍有效；只有`CommitStep::Durable`表示整个批次到达持久位置。终止性存储错误使宿主停止，必须重开判定完整日志。`section_install_diagnostics()`保留最近一批数量、包含准备和持久等待的耗时以及失败原因，停止后仍可读取。
 
-此接口区别于`set_residency_batch_pages`的有界前缀组提交。已有驻留、权限、tick和事件处理接口不变。提交布局版本4及兼容边界见[Execution载荷](../../crates/codec/EXECUTION.md)。复跑安装与恢复基准：`cargo test --release -p torse-server --test atomic_install --locked release_atomic_column_install_comparison -- --ignored --nocapture --test-threads=1`。该夹具使用一列24个均匀石块分区和实际文件后端，并直接统计journal追加与同步调用；不包含生成、传输或客户端呈现耗时。
+此接口区别于`set_residency_batch_pages`的有界前缀组提交。已有驻留、权限、tick和事件处理接口不变。提交布局版本4、5及兼容边界见[Execution载荷](../../crates/codec/EXECUTION.md)。复跑安装与恢复基准：`cargo test --release -p torse-server --test atomic_install --locked release_atomic_column_install_comparison -- --ignored --nocapture --test-threads=1`。该夹具使用一列24个均匀石块分区和实际文件后端，并直接统计journal追加与同步调用；不包含生成、传输或客户端呈现耗时。
 
 [20261110]同机实测：Windows 11 10.0.26200，WD Blue SN580 1TB NVMe SSD，Rust 1.93.1，Release，单进程文件后端，交替顺序各六轮。24分区逐个安装中位数8.601ms，原子批次0.7395ms，单分区0.6765ms；整批约为单次1.09倍，较逐个安装快11.63倍。安装吞吐分别约2790和32454分区/秒。实际journal追加及同步调用从24次降为1次；新建checkpoint和输入页构造不在计时区间内，准备、发布、日志追加与同步均在区间内，每轮随后重开核对完整状态。夹具没有生成、传输或50ms tick循环，不能据此推断集成地形列吞吐；未进行硬件断电测试。原始样本、配置和源码指纹见[测量数据](../../benchmarks/archive/residency/atomic-20261110/environment.json)与[逐轮样本](../../benchmarks/archive/residency/atomic-20261110/samples.json)。
