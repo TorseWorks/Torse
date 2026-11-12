@@ -56,12 +56,12 @@ impl VisualTerrainLimits {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Stamp {
+pub(crate) enum Stamp {
     Resident(Revision, Option<Revision>),
     Parked(Digest),
     Missing,
 }
-fn stamp(host: &ExecutionHost, pos: SectionPos) -> Stamp {
+pub(crate) fn stamp(host: &ExecutionHost, pos: SectionPos) -> Stamp {
     let store = host.world().store();
     if store.section(pos).is_some() {
         Stamp::Resident(
@@ -74,11 +74,14 @@ fn stamp(host: &ExecutionHost, pos: SectionPos) -> Stamp {
         Stamp::Missing
     }
 }
+pub(crate) const TRANSITION_LIMIT: usize = 1024;
+
 struct Cached {
     stamp: Stamp,
     page: ReplicaSnapshot,
     digest: Digest,
     touched: u64,
+    verify_source: bool,
 }
 fn distance(pos: SectionPos, center: SectionPos) -> u128 {
     u128::from(pos.x.abs_diff(center.x))
@@ -466,8 +469,17 @@ impl VisualSession {
                                             .state_of(&s.block, &s.values)
                                             .is_none()
                                     }) {
+                                        self.remove(page.pos);
                                         self.unavailable
                                             .insert(page.pos, TerrainUnavailable::Corrupt);
+                                        continue;
+                                    }
+                                    if let Some(cached) = self.cache.get_mut(&page.pos)
+                                        && cached.stamp == page.stamp
+                                        && cached.digest == digest
+                                    {
+                                        cached.verify_source = false;
+                                        self.unavailable.remove(&page.pos);
                                         continue;
                                     }
                                     self.remove(page.pos);
@@ -522,6 +534,7 @@ impl VisualSession {
                                             page: terrain,
                                             digest,
                                             touched: self.clock,
+                                            verify_source: false,
                                         },
                                     );
                                     self.dirty.insert(page.pos);
@@ -547,10 +560,21 @@ impl VisualSession {
         let desired: Vec<_> = self.desired.sections.iter().copied().collect();
         for pos in desired.iter().copied() {
             let current = stamp(host, pos);
-            if self.cache.get(&pos).is_some_and(|p| p.stamp != current) {
-                self.remove(pos);
+            if let Some(cached) = self.cache.get_mut(&pos)
+                && cached.stamp != current
+            {
                 self.observed.remove(&pos);
-                self.unavailable.insert(pos, TerrainUnavailable::Pending);
+                if host.proves_visual_transition(pos, cached.stamp, current) {
+                    // Reaffirm at the new durable cursor for the client's near-data
+                    // floor. Verify the new source without first removing the page.
+                    cached.stamp = current;
+                    cached.verify_source = true;
+                    self.dirty.insert(pos);
+                    self.unavailable.remove(&pos);
+                } else {
+                    self.remove(pos);
+                    self.unavailable.insert(pos, TerrainUnavailable::Pending);
+                }
             }
             if let Some(page) = self.cache.get_mut(&pos) {
                 page.touched = self.clock;
@@ -579,7 +603,10 @@ impl VisualSession {
                     break;
                 }
                 let current = stamp(host, pos);
-                if self.cache.get(&pos).is_some_and(|p| p.stamp == current)
+                if self
+                    .cache
+                    .get(&pos)
+                    .is_some_and(|p| p.stamp == current && !p.verify_source)
                     || self.observed.get(&pos) == Some(&current)
                 {
                     continue;
@@ -598,6 +625,7 @@ impl VisualSession {
                             if reason == TerrainUnavailable::Budget && !items.is_empty() {
                                 break;
                             }
+                            self.remove(pos);
                             self.observed.insert(pos, current);
                             self.unavailable.insert(pos, reason);
                             continue;
@@ -635,7 +663,7 @@ impl VisualSession {
         }
         let through = host.cursor();
         let reset = if self.reset {
-            let retained = self
+            let retained: Vec<_> = self
                 .cache
                 .iter()
                 .filter(|(p, c)| {
@@ -645,6 +673,9 @@ impl VisualSession {
                 })
                 .map(|(p, c)| (*p, c.digest))
                 .collect();
+            for (pos, _) in &retained {
+                self.dirty.remove(pos);
+            }
             Some(TerrainReset {
                 sections: self.desired.sections.iter().copied().collect(),
                 retained,

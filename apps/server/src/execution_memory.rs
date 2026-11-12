@@ -47,6 +47,13 @@ impl ExecutionHost {
             .and_then(|bytes| {
                 bytes.checked_add(u64::from(self.limits.runtime.max_items).checked_mul(128)?)
             })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    (crate::visual::TRANSITION_LIMIT
+                        * size_of::<(SectionPos, crate::visual::Stamp, crate::visual::Stamp)>())
+                        as u64,
+                )
+            })
             .ok_or_else(|| Fault::resource_limit("control memory reservation overflow"))?;
         let resident = Resident {
             world: pool.reserve(
