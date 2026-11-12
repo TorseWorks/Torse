@@ -421,11 +421,22 @@ impl ExecutionHost {
         before: crate::visual::Stamp,
         after: crate::visual::Stamp,
     ) -> bool {
-        self.visual_transitions
-            .iter()
-            .rev()
-            .find(|(p, _, _)| *p == pos)
-            .is_some_and(|(_, from, to)| *from == before && *to == after)
+        // A visual poll may see several residency changes for the same page.
+        // An intervening change to its content breaks the stamp chain.
+        let mut expected = after;
+        for &(page, from, to) in self.visual_transitions.iter().rev() {
+            if page != pos {
+                continue;
+            }
+            if to != expected {
+                return false;
+            }
+            if from == before {
+                return true;
+            }
+            expected = from;
+        }
+        false
     }
 
     /// Export a tick-boundary archive with source versions and complete runtime.

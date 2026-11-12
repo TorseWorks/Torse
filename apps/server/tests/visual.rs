@@ -32,12 +32,15 @@ fn unchanged_terrain_remains_visible_while_parking_and_reloading() {
     .unwrap();
     fill(&mut hub, &mut server, &mut client, &mut display);
     let expected: Vec<_> = display.pages().cloned().collect();
-    for loading in [false, true] {
-        for &pos in &desired.sections {
-            if loading {
-                server.reload_section(&pages, pos, &mut hub).unwrap();
-            } else {
-                server.unload_section(&pages, pos, &mut hub).unwrap();
+    // The last case parks and reloads the same page before the next visual poll.
+    for transitions in [&[false][..], &[true][..], &[false, true][..]] {
+        for &loading in transitions {
+            for &pos in &desired.sections {
+                if loading {
+                    server.reload_section(&pages, pos, &mut hub).unwrap();
+                } else {
+                    server.unload_section(&pages, pos, &mut hub).unwrap();
+                }
             }
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -45,7 +48,11 @@ fn unchanged_terrain_remains_visible_while_parking_and_reloading() {
             hub.poll(&mut server).unwrap();
             for message in drain(&mut client).0 {
                 if let ServerMessage::Terrain(update) = message {
-                    assert!(update.unavailable.is_empty());
+                    assert!(
+                        update.unavailable.is_empty(),
+                        "unexpected unavailable terrain after {transitions:?}: {:?}",
+                        update.unavailable
+                    );
                     display.apply(update).unwrap();
                 }
             }
