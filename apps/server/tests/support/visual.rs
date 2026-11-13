@@ -1,10 +1,10 @@
 //! Saved, edited terrain outside a two-section simulation window.
 #[path = "interest.rs"]
 #[allow(dead_code)]
-mod interest;
+pub mod interest;
 #[path = "streaming.rs"]
 #[allow(dead_code)]
-mod streaming;
+pub mod streaming;
 use crate::support::Directory;
 pub use interest::{actor, connect, drain, send};
 use std::{

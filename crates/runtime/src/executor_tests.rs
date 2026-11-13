@@ -96,7 +96,9 @@ fn shared_process_pressure_retries_and_finished_output_transfers_its_reservation
                 bytes: 8,
             })
         });
-    wait(|| executor.usage().running == 0 && executor.usage().queued == 0);
+    // Usage counters are sampled separately: the worker can start between the
+    // running and queued observations. Wait for the result this test transfers.
+    wait(|| job.state.result.lock().expect("job result lock").is_some());
     let held = memory
         .reserve(MemoryClass::Mesh, 8, EvictionRank::Pinned)
         .unwrap();

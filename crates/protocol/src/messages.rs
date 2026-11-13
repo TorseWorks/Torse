@@ -1,6 +1,6 @@
 use torse_codec::{Decoder, EncodeResult, Encoder, wire::Wire};
 use torse_types::*;
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 /// Negotiated separately from [`PROTOCOL_VERSION`] and from world payloads.
 pub const CONTROL_API_VERSION: u16 = 1;
 /// Movement sequencing is independent of ordinary action requests.
@@ -120,6 +120,7 @@ pub enum ServerMessage<O, S, C> {
     Interest(ReplicaBatch<C>),
     /// Versioned, entity-free terrain outside simulation residency.
     Terrain(TerrainUpdate<S>),
+    Light(TerrainLightUpdate),
     Rejected(RejectCode),
     Player(PlayerUpdate),
     /// The offered control API was accepted for this connection.
@@ -265,6 +266,10 @@ impl<O: Wire, S: Wire, C: Wire> Wire for ServerMessage<O, S, C> {
                 10u8.write(e)?;
                 update.write(e)
             }
+            Self::Light(update) => {
+                11u8.write(e)?;
+                update.write(e)
+            }
             Self::Rejected(reason) => {
                 5u8.write(e)?;
                 reason.write(e)
@@ -302,6 +307,7 @@ impl<O: Wire, S: Wire, C: Wire> Wire for ServerMessage<O, S, C> {
             4 => Ok(Self::Batch(Wire::read(d)?)),
             9 => Ok(Self::Interest(Wire::read(d)?)),
             10 => Ok(Self::Terrain(Wire::read(d)?)),
+            11 => Ok(Self::Light(Wire::read(d)?)),
             5 => Ok(Self::Rejected(Wire::read(d)?)),
             6 => Ok(Self::Player(Wire::read(d)?)),
             7 => Ok(Self::ControlReady {

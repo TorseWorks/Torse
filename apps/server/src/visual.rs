@@ -248,10 +248,159 @@ pub(crate) struct VisualSession {
     unavailable: BTreeMap<SectionPos, TerrainUnavailable>,
     observed: BTreeMap<SectionPos, Stamp>,
     sent: BTreeMap<SectionPos, Digest>,
+    light_sent: BTreeMap<SectionPos, u64>,
+    light_seq: u64,
     reserved_bytes: u64,
     _memory: Option<MemoryLease>,
 }
 impl VisualSession {
+    pub(crate) fn desired_positions(&self) -> Vec<SectionPos> {
+        self.desired.sections.iter().copied().collect()
+    }
+    pub(crate) fn check_request(&self, desired: &ReplicaScope) -> Result<(), Fault> {
+        self.approved
+            .check_desired(desired, self.limits.max_sections)?;
+        self.generation
+            .checked_add(1)
+            .ok_or_else(|| Fault::resource_limit("visual generation exhausted"))?;
+        Ok(())
+    }
+    fn light_page(
+        &self,
+        id: u128,
+        field: &crate::lighting::HostLightField,
+        host: &ExecutionHost,
+        pos: SectionPos,
+    ) -> Option<TerrainLight> {
+        let cached = self.cache.get(&pos)?;
+        if cached.stamp != stamp(host, pos) {
+            return None;
+        }
+        let light = field.publication(id, pos, host)?;
+        Some(TerrainLight {
+            pos,
+            terrain: cached.digest,
+            generation: light.generation,
+            rules: light.rules_version,
+            complete: light.emitted.is_complete() && light.sky.is_complete(),
+            emitted: light.emitted.levels().to_vec(),
+            sky: light.sky.levels().to_vec(),
+        })
+    }
+    pub(crate) fn attach_lights(
+        &mut self,
+        id: u128,
+        field: &crate::lighting::HostLightField,
+        host: &ExecutionHost,
+        update: &mut TerrainUpdate<ReplicaSnapshot>,
+    ) {
+        let mut bytes = update
+            .pages
+            .iter()
+            .map(|p| terrain_bytes(&p.terrain))
+            .sum::<u64>();
+        for page in &mut update.pages {
+            let pos = page.terrain.sections[0].pos;
+            let Some(publication) = field.publication(id, pos, host) else {
+                continue;
+            };
+            let cost = 128
+                + publication.emitted.levels().len() as u64
+                + publication.sky.levels().len() as u64;
+            if bytes.saturating_add(cost) > self.limits.batch_bytes {
+                continue;
+            }
+            let Some(light) = self.light_page(id, field, host, pos) else {
+                continue;
+            };
+            bytes += cost;
+            self.light_sent.insert(pos, light.generation);
+            page.light = Some(light);
+        }
+    }
+    pub(crate) fn light_update(
+        &mut self,
+        id: u128,
+        field: &crate::lighting::HostLightField,
+        host: &ExecutionHost,
+        budget: OutputBudget,
+        codec: torse_codec::CodecLimits,
+    ) -> Result<Option<TerrainLightUpdate>, Fault> {
+        if self.reset {
+            return Ok(None);
+        }
+        let mut pages = Vec::new();
+        let mut bytes = 0u64;
+        for &pos in &self.desired.sections {
+            let Some(cached) = self.cache.get(&pos) else {
+                continue;
+            };
+            if self.sent.get(&pos) != Some(&cached.digest) {
+                continue;
+            }
+            let Some(publication) = field.publication(id, pos, host) else {
+                continue;
+            };
+            if self.light_sent.get(&pos) == Some(&publication.generation) {
+                continue;
+            }
+            let cost = 128
+                + publication.emitted.levels().len() as u64
+                + publication.sky.levels().len() as u64;
+            if pages.len() == self.limits.pages_per_poll
+                || bytes.saturating_add(cost) > self.limits.batch_bytes
+            {
+                break;
+            }
+            if let Some(light) = self.light_page(id, field, host, pos) {
+                bytes += cost;
+                pages.push(light);
+            }
+        }
+        if pages.is_empty() {
+            return Ok(None);
+        }
+        let seq = self
+            .light_seq
+            .checked_add(1)
+            .ok_or_else(|| Fault::resource_limit("visual light sequence"))?;
+        let mut message = crate::network::ServerMessage::Light(TerrainLightUpdate {
+            binding: self.binding,
+            interest_generation: self.generation,
+            seq,
+            pages,
+        });
+        loop {
+            match wire::measure_inner(&message, budget, codec) {
+                Ok(_) => break,
+                Err(error) if error.code == FaultCode::ResourceLimit => {
+                    let crate::network::ServerMessage::Light(update) = &mut message else {
+                        unreachable!()
+                    };
+                    if update.pages.len() == 1 {
+                        return Err(error);
+                    }
+                    update.pages.truncate(update.pages.len() / 2);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let crate::network::ServerMessage::Light(update) = message else {
+            unreachable!()
+        };
+        for light in &update.pages {
+            self.light_sent.insert(light.pos, light.generation);
+        }
+        self.light_seq = seq;
+        Ok(Some(update))
+    }
+    pub(crate) fn defer_inline_lights(&mut self, update: &mut TerrainUpdate<ReplicaSnapshot>) {
+        for page in &mut update.pages {
+            if let Some(light) = page.light.take() {
+                self.light_sent.remove(&light.pos);
+            }
+        }
+    }
     pub(crate) fn new(
         host: &ExecutionHost,
         pages: SectionPages,
@@ -382,6 +531,8 @@ impl VisualSession {
             unavailable: BTreeMap::new(),
             observed: BTreeMap::new(),
             sent: BTreeMap::new(),
+            light_sent: BTreeMap::new(),
+            light_seq: 0,
             reserved_bytes: charge,
             _memory: memory,
         })
@@ -403,6 +554,8 @@ impl VisualSession {
             .checked_add(1)
             .ok_or_else(|| Fault::resource_limit("visual generation exhausted"))?;
         self.seq = 0;
+        self.light_seq = 0;
+        self.light_sent.clear();
         self.reset = true;
         self.desired = desired;
         self.dirty.clear();
@@ -417,6 +570,7 @@ impl VisualSession {
         }
         self.dirty.remove(&pos);
         self.sent.remove(&pos);
+        self.light_sent.remove(&pos);
     }
     pub(crate) fn refresh(&mut self) -> Result<(), Fault> {
         self.request(self.desired.clone(), self.center, true)
@@ -671,6 +825,7 @@ impl VisualSession {
             }
             bytes += cost;
             pages.push(TerrainPage {
+                light: None,
                 at: through,
                 digest: cached.digest,
                 terrain: cached.page.clone(),

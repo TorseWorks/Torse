@@ -263,6 +263,7 @@ struct Peer<T> {
     control_link: Option<control::PeerLink>,
 }
 pub struct NetworkHub<T> {
+    lighting: Option<(crate::lighting::HostLightField, usize)>,
     peers: BTreeMap<u128, Peer<T>>,
     next: u128,
     sessions: SessionRegistry,
@@ -341,6 +342,7 @@ impl<T: Transport> NetworkHub<T> {
         }
         Ok(Self {
             peers: BTreeMap::new(),
+            lighting: None,
             next: 1,
             sessions: SessionRegistry::new(
                 limits
@@ -920,6 +922,12 @@ impl<T: Transport> NetworkHub<T> {
             server.poll_residency(self)?;
         }
         let tick = server.authority()?.resume_point().tick;
+        if let Some((lighting, work)) = &mut self.lighting
+            && let Err(error) = lighting.poll(server.authority()?, *work)
+            && error.code != FaultCode::ResourceLimit
+        {
+            return Err(error);
+        }
         let control_bytes = self.control_reserve();
         let mut control = self.control.take();
         let mut users: BTreeSet<_> = self
@@ -1082,7 +1090,13 @@ impl<T: Transport> NetworkHub<T> {
                             Self::send(peer, ServerMessage::Batch(batch), self.limits)?;
                         }
                     }
-                    Self::poll_visual(peer, server, self.limits)?;
+                    Self::poll_visual(
+                        *peer_id,
+                        peer,
+                        server,
+                        self.limits,
+                        self.lighting.as_ref().map(|(f, _)| f),
+                    )?;
                 }
                 peer.transport.poll()
             })();
@@ -1107,6 +1121,9 @@ impl<T: Transport> NetworkHub<T> {
             .map(|(id, _)| *id)
             .collect();
         for id in dead {
+            if let Some((field, _)) = &mut self.lighting {
+                field.unsubscribe(id);
+            }
             let mut peer = self.peers.remove(&id).expect("peer exists");
             if let Some(plane) = &mut self.control {
                 Self::release_control(plane, id, &peer);
