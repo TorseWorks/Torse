@@ -4,6 +4,8 @@
 
 ## 世界、客户端与图形
 
+[共享光场验证与测量](lighting/shared-20261113/README.md)记录内容身份、增量光照、双客户端、真实文件路线及Vulkan绘制结果。
+
 | 记录 | 内容 |
 |---|---|
 | [技术实验](foundation/M0-experiments.md) | 内容编译、ECS、Wasmtime与GPU初始化 |
