@@ -1,0 +1,2 @@
+adapter=NVIDIA GeForce RTX 4060 Laptop GPU backend=Vulkan present=none
+input_peak_bytes=2388,reserved_bytes=176427008,io_pending=false

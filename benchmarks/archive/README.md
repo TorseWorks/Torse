@@ -4,7 +4,7 @@
 
 ## 世界、客户端与图形
 
-[共享光场验证与测量](lighting/shared-20261113/README.md)记录内容身份、增量光照、双客户端、真实文件路线及Vulkan绘制结果。
+[共享光场验证与测量](lighting/shared-20261113/README.md)记录内容身份、增量光照与双客户端；[完整线格式预算复测](lighting/shared-wire-budget-20261113/README.md)记录最终发送路径的真实文件路线及Vulkan绘制结果。
 
 | 记录 | 内容 |
 |---|---|
