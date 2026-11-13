@@ -323,6 +323,8 @@ impl VisualSession {
         id: u128,
         field: &crate::lighting::HostLightField,
         host: &ExecutionHost,
+        budget: OutputBudget,
+        codec: torse_codec::CodecLimits,
     ) -> Result<Option<TerrainLightUpdate>, Fault> {
         if self.reset {
             return Ok(None);
@@ -362,16 +364,42 @@ impl VisualSession {
             .light_seq
             .checked_add(1)
             .ok_or_else(|| Fault::resource_limit("visual light sequence"))?;
-        for light in &pages {
-            self.light_sent.insert(light.pos, light.generation);
-        }
-        self.light_seq = seq;
-        Ok(Some(TerrainLightUpdate {
+        let mut message = crate::network::ServerMessage::Light(TerrainLightUpdate {
             binding: self.binding,
             interest_generation: self.generation,
             seq,
             pages,
-        }))
+        });
+        loop {
+            match wire::measure_inner(&message, budget, codec) {
+                Ok(_) => break,
+                Err(error) if error.code == FaultCode::ResourceLimit => {
+                    let crate::network::ServerMessage::Light(update) = &mut message else {
+                        unreachable!()
+                    };
+                    if update.pages.len() == 1 {
+                        return Err(error);
+                    }
+                    update.pages.truncate(update.pages.len() / 2);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let crate::network::ServerMessage::Light(update) = message else {
+            unreachable!()
+        };
+        for light in &update.pages {
+            self.light_sent.insert(light.pos, light.generation);
+        }
+        self.light_seq = seq;
+        Ok(Some(update))
+    }
+    pub(crate) fn defer_inline_lights(&mut self, update: &mut TerrainUpdate<ReplicaSnapshot>) {
+        for page in &mut update.pages {
+            if let Some(light) = page.light.take() {
+                self.light_sent.remove(&light.pos);
+            }
+        }
     }
     pub(crate) fn new(
         host: &ExecutionHost,

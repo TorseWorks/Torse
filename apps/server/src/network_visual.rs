@@ -170,10 +170,29 @@ impl<T: Transport> NetworkHub<T> {
                 if let Some(lighting) = lighting {
                     visual.attach_lights(id, lighting, server.authority()?, &mut update);
                 }
-                Self::send(peer, ServerMessage::Terrain(update), limits)?;
+                let inline = update.pages.iter().any(|page| page.light.is_some());
+                let mut message = ServerMessage::Terrain(update);
+                if inline
+                    && let Err(error) = wire::measure_inner(&message, limits.budget, limits.codec)
+                {
+                    if error.code != FaultCode::ResourceLimit {
+                        return Err(error);
+                    }
+                    let ServerMessage::Terrain(update) = &mut message else {
+                        unreachable!()
+                    };
+                    visual.defer_inline_lights(update);
+                }
+                Self::send(peer, message, limits)?;
             } else if peer.transport.output_idle()
                 && let Some(lighting) = lighting
-                && let Some(update) = visual.light_update(id, lighting, server.authority()?)?
+                && let Some(update) = visual.light_update(
+                    id,
+                    lighting,
+                    server.authority()?,
+                    limits.budget,
+                    limits.codec,
+                )?
             {
                 Self::send(peer, ServerMessage::Light(update), limits)?;
             }

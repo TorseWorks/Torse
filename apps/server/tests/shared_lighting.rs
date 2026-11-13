@@ -386,6 +386,98 @@ fn light_cache_denial_keeps_the_connection_and_terrain_delivery_alive() {
     assert_eq!(hub.shared_light_diagnostics().unwrap().published, 0);
 }
 
+#[test]
+fn inline_light_that_exceeds_the_wire_item_budget_is_deferred_without_disconnect() {
+    use torse_net::{
+        MemoryTransport,
+        terrain::{TerrainLimits, TerrainMirror},
+    };
+    use torse_server::{
+        bootstrap as base,
+        network::*,
+        visual::{VisualTerrainApproval, VisualTerrainLimits},
+    };
+    use torse_sim::replica::ReplicaScope;
+    let dir = Directory::new();
+    let (mut world, actions) = base::world().unwrap();
+    let stone = world
+        .registry()
+        .default_state(&base::key("base:stone"))
+        .unwrap();
+    world
+        .store_mut()
+        .edit(BlockPos::new(1, 1, 1), stone)
+        .unwrap();
+    let mut server = fixture::create_with_world(&dir, (world, actions));
+    let pages = fixture::pages(&dir);
+    let target = SectionPos::ZERO;
+    let scope = ReplicaScope {
+        sections: [target].into(),
+    };
+    let mut network = base::network_limits();
+    network.budget.max_items = 9000;
+    let mut hub = NetworkHub::<MemoryTransport>::new(server.binding(), network).unwrap();
+    let mut light = limits();
+    light.pages_per_poll = 64;
+    hub.enable_shared_lighting(&server, pages.clone(), light, 1_000_000)
+        .unwrap();
+    let (id, mut client, _, _) = interest::attach(&mut hub, &mut server, scope.clone());
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages,
+        VisualTerrainApproval::rectangular(target, target).unwrap(),
+        scope,
+        target,
+        VisualTerrainLimits {
+            max_sections: 1,
+            cache_bytes: 128 * 1024,
+            io_bytes: 32 * 1024 * 1024,
+            batch_bytes: 64 * 1024,
+            pages_per_poll: 1,
+        },
+    )
+    .unwrap();
+    let mut mirror = TerrainMirror::new(
+        server.binding(),
+        16,
+        server.authority().unwrap().world().store().bounds(),
+        TerrainLimits {
+            max_sections: 1,
+            max_bytes: 128 * 1024,
+        },
+        None,
+    )
+    .unwrap();
+    let start = Instant::now();
+    let mut deferred = false;
+    loop {
+        hub.poll(&mut server).unwrap();
+        for message in interest::drain(&mut client).0 {
+            match message {
+                ServerMessage::Terrain(update) => {
+                    for page in &update.pages {
+                        deferred |= page.light.is_none();
+                    }
+                    mirror.apply(update).unwrap();
+                }
+                ServerMessage::Light(update) => {
+                    mirror.apply_light(update).unwrap();
+                }
+                _ => {}
+            }
+        }
+        if mirror.light(target).is_some() {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10));
+        std::thread::yield_now();
+    }
+    assert!(deferred);
+    assert!(hub.contains(id));
+    assert_eq!(hub.shared_light_diagnostics().unwrap().published, 1);
+}
+
 /// CPU-ready measurements, not a claim about a monitor's first displayed frame.
 #[test]
 #[ignore = "release fixed-route measurement"]
