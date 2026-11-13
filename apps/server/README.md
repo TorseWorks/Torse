@@ -12,7 +12,7 @@
 
 当前窗口页数、缓存、在途I/O、批次内页面的逻辑字节和每次页数均独立受限。含控制元数据的完整编码消息受网络输出预算限制。共享MemoryPool在启用前预留缓存、I/O、三份批次工作空间和控制元数据。`visual_terrain_diagnostics`报告逻辑缓存和固定预留，不代表RSS。缓存不足时优先保留近中心页，其余明确返回Budget，避免循环逐出重读。客户端默认4096页、64MiB，可在首条Terrain前设置预算。场景与GPU另受自身预算约束。
 
-协议6增加Terrain流，双方须同时升级，存档不变，见[格式](../../crates/protocol/FORMAT.md)。客户端将远景接入派生场景、网格和上传，近景覆盖远景，独立显示不修改权威复制镜像。
+协议7在Terrain流上增加匹配光照及独立Light更新，双方须同时升级，存档不变，见[格式](../../crates/protocol/FORMAT.md)。客户端将远景接入派生场景、网格和上传，近景覆盖远景，独立显示不修改权威复制镜像。
 
 `cargo run --release -p torse-server --example visual_terrain_baseline -- NEW_OUTPUT_DIRECTORY`使用公共文件夹具测量24个已保存稠密分区，2个模拟驻留分区与8页显示窗的直行、掉头和回访。CSV记录CPU镜像首批/全批可用时间、最长poll、传输字节和逻辑内存；不等同于显示器呈现时间或RSS。回归另覆盖近景切换、恢复、损坏修复、积压和内存释放。
 
@@ -162,7 +162,7 @@ cargo test -p torse-server --test event_budget --locked
 
 WorkPlan支持携带TransactionGroup。Mod机器自有状态与库存规划器返回的事务按来源组成一个任务，连同新唤醒共同预留、发布和刷盘。冻结任务保存稳定成员，恢复不重跑已规划或已结算的Guest。库存拒绝保留机器完成前的进度，不登记该计划的新唤醒；陷阱重试次数由持久事件载荷记录，停机以没有后续唤醒表示。ModStats只供诊断，不影响恢复后的执行。验证见[Mod原子执行](../../benchmarks/archive/mods/M4-mod-atomic.md)。
 
-持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本4、读版本1至4，快照写版本2、读版本1和2，应用协议为版本6。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。主程序仍使用有限范围，显式装卸接口另见下文，未进行硬件断电验收。
+持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本4、读版本1至4，快照写版本2、读版本1和2，应用协议为版本7。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。主程序仍使用有限范围，显式装卸接口另见下文，未进行硬件断电验收。
 
 ## 运行态与批量刷盘
 
@@ -176,7 +176,7 @@ Server的Tick驱动默认每批1条，可用`set_commit_batch_limit`设置1到10
 
 复现对照与故障验证见[运行态与批量提交](../../benchmarks/archive/performance/M6-runtime-commit.md)。当前简单事务的并行预验证实验未显示收益，因此继续使用串行事务准备与发布。
 
-NetworkHub通过应用协议版本6接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线、增量及移动确认都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权镜像、编辑请求、独立移动输入和预测校正。双向TLS与按用户授权已接入，明文演示限制在回环地址。
+NetworkHub通过应用协议版本7接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线、增量及移动确认都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权镜像、编辑请求、独立移动输入和预测校正。双向TLS与按用户授权已接入，明文演示限制在回环地址。
 
 ## 批量驻留
 
@@ -443,3 +443,12 @@ do not establish stable observer overhead or any speedup. CPU time was not separ
 此接口区别于`set_residency_batch_pages`的有界前缀组提交。已有驻留、权限、tick和事件处理接口不变。提交布局版本4及兼容边界见[Execution载荷](../../crates/codec/EXECUTION.md)。复跑安装与恢复基准：`cargo test --release -p torse-server --test atomic_install --locked release_atomic_column_install_comparison -- --ignored --nocapture --test-threads=1`。该夹具使用一列24个均匀石块分区和实际文件后端，并直接统计journal追加与同步调用；不包含生成、传输或客户端呈现耗时。
 
 [20261110]同机实测：Windows 11 10.0.26200，WD Blue SN580 1TB NVMe SSD，Rust 1.93.1，Release，单进程文件后端，交替顺序各六轮。24分区逐个安装中位数8.601ms，原子批次0.7395ms，单分区0.6765ms；整批约为单次1.09倍，较逐个安装快11.63倍。安装吞吐分别约2790和32454分区/秒。实际journal追加及同步调用从24次降为1次；新建checkpoint和输入页构造不在计时区间内，准备、发布、日志追加与同步均在区间内，每轮随后重开核对完整状态。夹具没有生成、传输或50ms tick循环，不能据此推断集成地形列吞吐；未进行硬件断电测试。原始样本、配置和源码指纹见[测量数据](../../benchmarks/archive/residency/atomic-20261110/environment.json)与[逐轮样本](../../benchmarks/archive/residency/atomic-20261110/samples.json)。
+
+
+## 宿主共享光照
+
+`NetworkHub::enable_shared_lighting`在显示会话之前显式装配一个`HostLightField`。宿主内部可读依赖范围由当前目标的15格水平边界及世界高度决定，独立限制输入页、输入字节、每次捕获页数、消费者关联、求解器工作量及缓存。来源文件通过一个有界后台队列读取并校验，权威线程重查绑定和来源标记。显示批准仍逐连接校验，计算依赖不授予交互或数据发送权限。默认关闭。
+
+驻留页、可信生成Section及已验证SnapshotSection经`LightTerrain`转换为同一原生内容身份。身份不含驻留修订号或来源类型。未知不作空气；缺失邻界生成不完整结果，来源损坏使结果失效。重新验证相同内容允许复用原发布。文件缓存需要宿主显式refresh才重新读盘发现外部文件篡改；不可变文件在首次读取时校验摘要。关闭会等待当前文件操作结束，不提供操作系统级取消。
+
+`SharedLightField`按目标合并消费者，原子发布天光和方块光。保留有界求解状态，编辑时分步扫描变更区段，光值增减沿实际变化的邻接前沿传播；天光重扫有界垂直列。依赖、规则或绑定变化会拒绝晚到结果。`LightFieldDiagnostics`区分启动、增量启动、传播访问、发布、陈旧取消、待办及缓存峰值；缓存包含保留求解器，工作预留不代表RSS。`shared_light_resources`另报输入峰值、I/O在途状态及固定预留。预算拒绝暂停对应目标，显式refresh或兴趣变更后重试，不持续冷算，也不阻断网络Hub服务。活跃消费者只保存兴趣和发送代数，输出积压不阻止共享计算或其他连接发送。

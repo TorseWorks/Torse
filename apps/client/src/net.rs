@@ -324,6 +324,13 @@ impl<T: Transport> Connection<T> {
                 }
                 Ok(Some(NetEvent::Increment(changes)))
             }
+            ServerMessage::Light(update) => {
+                let terrain = self
+                    .terrain
+                    .as_mut()
+                    .ok_or_else(|| Fault::invalid_data("light before terrain"))?;
+                Ok(Some(NetEvent::Terrain(terrain.apply_light(update)?)))
+            }
             ServerMessage::Terrain(update) => {
                 let near = self
                     .mirror
@@ -545,6 +552,7 @@ mod tests {
                 retained: vec![],
             }),
             pages: vec![TerrainPage {
+                light: None,
                 at,
                 digest: Digest([1; 32]),
                 terrain: far.clone(),

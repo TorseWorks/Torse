@@ -275,6 +275,9 @@ impl Scene {
     ) -> Result<bool, String> {
         for pos in positions {
             if near.sections.iter().any(|s| s.pos == pos) {
+                if let Some(lighting) = self.lighting.as_mut() {
+                    lighting.remove_remote(pos);
+                }
                 continue;
             }
             let page = terrain.page(pos);
@@ -292,6 +295,11 @@ impl Scene {
             };
             if !self.try_apply_changes(&changes)? {
                 return Ok(false);
+            }
+            if let Some(mut lighting) = self.lighting.take() {
+                let result = lighting.install_remote(self, pos, terrain.light(pos));
+                self.lighting = Some(lighting);
+                result?;
             }
         }
         Ok(true)

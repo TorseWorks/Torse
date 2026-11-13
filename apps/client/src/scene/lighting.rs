@@ -112,6 +112,19 @@ struct Pending {
     result: Option<LightSection>,
     _memory: Option<MemoryLease>,
 }
+struct Remote {
+    data: torse_types::TerrainLight,
+    revision: Option<torse_types::Revision>,
+    load: Option<u64>,
+    generation: u64,
+    _memory: Option<MemoryLease>,
+}
+impl Remote {
+    fn valid(&self, scene: &Scene, pos: SectionPos) -> bool {
+        self.revision == scene.authority.store().revision(pos)
+            && self.load == scene.load_generations.get(&pos).copied()
+    }
+}
 struct Cached {
     // Presentation keeps the previous complete image while a replacement is
     // calculated. This is never used by authoritative lighting queries.
@@ -128,6 +141,7 @@ impl Cached {
     }
 }
 pub(super) struct Lighting {
+    remote: BTreeMap<SectionPos, Remote>,
     binding: Binding,
     entries: [BTreeMap<SectionPos, Cached>; 2],
     cache_bytes: [usize; 2],
@@ -138,16 +152,70 @@ pub(super) struct Lighting {
     pub generation: u64,
 }
 impl Lighting {
-    pub fn changed_sections(&self, since: u64) -> impl Iterator<Item = SectionPos> + '_ {
-        self.entries.iter().flat_map(move |entries| {
-            entries
+    pub(super) fn remove_remote(&mut self, pos: SectionPos) {
+        self.remote.remove(&pos);
+    }
+    #[cfg(test)]
+    pub(super) fn has_remote(&self, pos: SectionPos) -> bool {
+        self.remote.contains_key(&pos)
+    }
+    pub(super) fn install_remote(
+        &mut self,
+        scene: &Scene,
+        pos: SectionPos,
+        data: Option<&torse_types::TerrainLight>,
+    ) -> Result<(), String> {
+        if let Some(data) = data {
+            let bytes = 128 + data.emitted.len() as u64 + data.sky.len() as u64;
+            let retained = self
+                .remote
                 .iter()
-                .filter_map(move |(pos, entry)| (entry.generation > since).then_some(*pos))
-        })
+                .filter(|(p, _)| **p != pos)
+                .map(|(_, r)| 128 + r.data.emitted.len() + r.data.sky.len())
+                .sum::<usize>();
+            if retained.saturating_add(bytes as usize) > CACHE_BYTES {
+                return Err("remote light cache budget".into());
+            }
+            let lease = self
+                .memory
+                .as_ref()
+                .map(|p| p.reserve(MemoryClass::Mesh, bytes, EvictionRank::Pinned))
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            self.advance_generation()?;
+            self.remote.insert(
+                pos,
+                Remote {
+                    data: data.clone(),
+                    revision: scene.authority.store().revision(pos),
+                    load: scene.load_generations.get(&pos).copied(),
+                    generation: self.generation,
+                    _memory: lease,
+                },
+            );
+        } else if self.remote.remove(&pos).is_some() {
+            self.advance_generation()?;
+        }
+        Ok(())
+    }
+    pub fn changed_sections(&self, since: u64) -> impl Iterator<Item = SectionPos> + '_ {
+        self.entries
+            .iter()
+            .flat_map(move |entries| {
+                entries
+                    .iter()
+                    .filter_map(move |(pos, entry)| (entry.generation > since).then_some(*pos))
+            })
+            .chain(
+                self.remote
+                    .iter()
+                    .filter_map(move |(p, r)| (r.generation > since).then_some(*p)),
+            )
     }
     pub fn new(binding: Binding, memory: Option<MemoryPool>) -> Result<Self, String> {
         Ok(Self {
             binding,
+            remote: BTreeMap::new(),
             entries: [BTreeMap::new(), BTreeMap::new()],
             cache_bytes: [0; 2],
             pending: None,
@@ -165,6 +233,7 @@ impl Lighting {
         Ok(())
     }
     pub fn step(&mut self, scene: &Scene, work: usize) -> Result<(), String> {
+        self.remote.retain(|pos, entry| entry.valid(scene, *pos));
         let store = scene.authority.store();
         let registry = scene.authority.registry();
         if !self
@@ -306,6 +375,13 @@ impl Lighting {
             .filter(|target| scene.sections.contains(target))
             .chain(scene.sections.iter())
         {
+            if self
+                .remote
+                .get(target)
+                .is_some_and(|entry| entry.valid(scene, *target))
+            {
+                continue;
+            }
             if store.revision(*target).is_none()
                 || !matches!(
                     store.phase(*target),
@@ -356,6 +432,13 @@ impl Lighting {
     pub fn complete(&self, scene: &Scene) -> bool {
         self.pending.is_none()
             && scene.sections.iter().all(|pos| {
+                if self
+                    .remote
+                    .get(pos)
+                    .is_some_and(|entry| entry.valid(scene, *pos))
+                {
+                    return true;
+                }
                 scene.authority.store().revision(*pos).is_some()
                     && self
                         .entries
@@ -363,8 +446,10 @@ impl Lighting {
                         .all(|entries| entries.get(pos).is_some_and(|entry| entry.current))
             })
     }
-    pub fn view<'a>(&'a self, scene: &Scene) -> View<'a> {
+    pub fn view<'a>(&'a self, scene: &'a Scene) -> View<'a> {
         View {
+            remote: &self.remote,
+            scene,
             grids: [&self.entries[0], &self.entries[1]],
             side: scene.side,
             bounds: scene.authority.store().bounds(),
@@ -372,6 +457,9 @@ impl Lighting {
         }
     }
     pub fn stamp(&self, target: SectionPos) -> [u64; 2] {
+        if let Some(remote) = self.remote.get(&target) {
+            return [remote.generation; 2];
+        }
         std::array::from_fn(|kind| {
             self.entries[kind]
                 .get(&target)
@@ -380,6 +468,8 @@ impl Lighting {
     }
 }
 pub(super) struct View<'a> {
+    remote: &'a BTreeMap<SectionPos, Remote>,
+    scene: &'a Scene,
     grids: [&'a BTreeMap<SectionPos, Cached>; 2],
     side: u32,
     bounds: WorldBounds,
@@ -448,6 +538,18 @@ impl View<'_> {
         let Ok((section, local)) = pos.to_section(self.side) else {
             return None;
         };
+        if let Some(remote) = self
+            .remote
+            .get(&section)
+            .filter(|r| r.valid(self.scene, section))
+        {
+            let levels = if kind == 0 {
+                &remote.data.emitted
+            } else {
+                &remote.data.sky
+            };
+            return Some(levels[torse_world::linear_index(self.side, local)]);
+        }
         self.grids[kind]
             .get(&section)
             .map(|entry| entry.levels[torse_world::linear_index(self.side, local)])

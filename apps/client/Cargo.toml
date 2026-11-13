@@ -29,3 +29,7 @@ torse-world = { path = "../../crates/world" }
 torse-world-services = { path = "../../crates/world_services" }
 wgpu = { version = "=30.0.1", default-features = false, features = ["dx12", "metal", "vulkan", "wgsl", "std"] }
 winit = { version = "=0.30.12", features = ["serde"] }
+
+[dev-dependencies]
+torse-server = { path = "../server" }
+torse-storage = { path = "../../crates/storage" }

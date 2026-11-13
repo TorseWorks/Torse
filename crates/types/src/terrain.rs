@@ -22,6 +22,27 @@ pub struct TerrainPage<S> {
     pub digest: Digest,
     /// Exactly one terrain section, with no entities or private runtime state.
     pub terrain: S,
+    pub light: Option<TerrainLight>,
+}
+
+/// Derived light for exactly one terrain content identity. Generation orders
+/// boundary-only changes even while the target's terrain digest is unchanged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerrainLight {
+    pub pos: SectionPos,
+    pub terrain: Digest,
+    pub generation: u64,
+    pub rules: u32,
+    pub complete: bool,
+    pub emitted: Vec<u8>,
+    pub sky: Vec<u8>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerrainLightUpdate {
+    pub binding: Binding,
+    pub interest_generation: u64,
+    pub seq: u64,
+    pub pages: Vec<TerrainLight>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
