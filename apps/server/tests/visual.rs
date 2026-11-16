@@ -9,6 +9,94 @@ use torse_sim::replica::ReplicaScope;
 use torse_types::*;
 
 #[test]
+fn unchanged_terrain_remains_visible_while_parking_and_reloading() {
+    let dir = Directory::new();
+    let (mut server, pages, _) = create(&dir);
+    let desired = scope(2, 2);
+    for &pos in &desired.sections {
+        server
+            .reload_section(&pages, pos, &mut torse_server::NoReplicas)
+            .unwrap();
+    }
+    let (mut hub, id, mut client, _, _) = connect(&mut server, scope(0, 1));
+    let mut display = mirror(&server);
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages.clone(),
+        approval(),
+        desired.clone(),
+        SectionPos::new(2, 0, 0),
+        limits(),
+    )
+    .unwrap();
+    fill(&mut hub, &mut server, &mut client, &mut display);
+    let expected: Vec<_> = display.pages().cloned().collect();
+    // The last case parks and reloads the same page before the next visual poll.
+    for transitions in [&[false][..], &[true][..], &[false, true][..]] {
+        for &loading in transitions {
+            for &pos in &desired.sections {
+                if loading {
+                    server.reload_section(&pages, pos, &mut hub).unwrap();
+                } else {
+                    server.unload_section(&pages, pos, &mut hub).unwrap();
+                }
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            hub.poll(&mut server).unwrap();
+            for message in drain(&mut client).0 {
+                if let ServerMessage::Terrain(update) = message {
+                    assert!(
+                        update.unavailable.is_empty(),
+                        "unexpected unavailable terrain after {transitions:?}: {:?}",
+                        update.unavailable
+                    );
+                    display.apply(update).unwrap();
+                }
+            }
+            assert_eq!(display.pages().cloned().collect::<Vec<_>>(), expected);
+            if !hub.visual_terrain_diagnostics(id).unwrap().io_pending {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+    // A proven transition retains the old page across dispatch. A failed
+    // verification still explicitly removes it.
+    let pos = SectionPos::new(2, 0, 0);
+    server.unload_section(&pages, pos, &mut hub).unwrap();
+    let digest = server.authority().unwrap().parked_sections()[&pos].digest;
+    std::fs::write(pages.path(digest), b"damaged after parking").unwrap();
+    hub.poll(&mut server).unwrap();
+    for message in drain(&mut client).0 {
+        if let ServerMessage::Terrain(update) = message {
+            assert!(update.unavailable.is_empty());
+            display.apply(update).unwrap();
+        }
+    }
+    assert!(display.page(pos).is_some());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while display.page(pos).is_some() {
+        hub.poll(&mut server).unwrap();
+        for message in drain(&mut client).0 {
+            if let ServerMessage::Terrain(update) = message {
+                assert!(
+                    update
+                        .unavailable
+                        .contains(&(pos, TerrainUnavailable::Corrupt))
+                );
+                display.apply(update).unwrap();
+            }
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+}
+
+#[test]
 fn full_height_explicit_approval_delivers_only_the_requested_pages() {
     let dir = Directory::new();
     let (mut server, pages, expected) = create(&dir);
