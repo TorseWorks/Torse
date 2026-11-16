@@ -6,6 +6,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+sha2 = "0.10"
 torse-types = { path = "../types" }
 torse-world = { path = "../world" }
 

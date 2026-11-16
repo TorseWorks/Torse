@@ -2263,6 +2263,7 @@ mod tests {
                     retained: vec![],
                 }),
                 pages: vec![TerrainPage {
+                    light: None,
                     at,
                     digest: Digest([1; 32]),
                     terrain: far,
@@ -2298,10 +2299,51 @@ mod tests {
         scene.try_apply_display(&near, &terrain, [pos]).unwrap();
         assert!(!query(&scene, BlockPos::new(33, 0, 1)));
     }
+    #[test]
+    fn matching_shared_light_changes_the_display_mesh_and_near_override_removes_it() {
+        let (mut scene, mut near, mut terrain) = display_fixture();
+        let pos = SectionPos::new(2, 0, 0);
+        scene.enable_lighting().unwrap();
+        scene.try_apply_display(&near, &terrain, [pos]).unwrap();
+        scene.refresh_meshes();
+        let before = scene.section_geometry(pos).unwrap().clone();
+        terrain
+            .apply_light(torse_types::TerrainLightUpdate {
+                binding: torse_types::Binding {
+                    world: torse_types::WorldId(7),
+                    epoch: torse_types::WorldEpoch(1),
+                    compatibility: Scene::compatibility().unwrap(),
+                },
+                interest_generation: 1,
+                seq: 1,
+                pages: vec![torse_types::TerrainLight {
+                    pos,
+                    terrain: torse_types::Digest([1; 32]),
+                    generation: 1,
+                    rules: 1,
+                    complete: true,
+                    emitted: vec![15; 4096],
+                    sky: vec![0; 4096],
+                }],
+            })
+            .unwrap();
+        scene.try_apply_display(&near, &terrain, [pos]).unwrap();
+        scene.refresh_meshes();
+        let lit = scene.section_geometry(pos).unwrap();
+        assert!(Scene::vertex_bytes(&before.0) != Scene::vertex_bytes(&lit.0));
+        assert!(scene.lighting.as_ref().unwrap().stamp(pos)[0] > 0);
+        near.sections.push(SnapshotSection {
+            pos,
+            cells: SnapshotCells::Uniform(BlockStateId::EMPTY),
+        });
+        scene.try_apply_display(&near, &terrain, [pos]).unwrap();
+        assert!(!scene.lighting.as_ref().unwrap().has_remote(pos));
+    }
     #[cfg(feature = "gpu-tests")]
     #[test]
     fn display_page_mesh_reaches_the_gpu_and_offscreen_readback() {
-        let (mut scene, near, terrain) = display_fixture();
+        let (mut scene, near, mut terrain) = display_fixture();
+        scene.enable_lighting().unwrap();
         let pos = SectionPos::new(2, 0, 0);
         let mut renderer = crate::renderer::Renderer::new(128, 128).unwrap();
         renderer.set_palette(scene.palette());
@@ -2333,6 +2375,49 @@ mod tests {
         println!(
             "display apply, mesh, upload, offscreen readback and PNG write ms={:.4}",
             ready.as_secs_f64() * 1000.
+        );
+        let update = torse_types::TerrainLightUpdate {
+            binding: torse_types::Binding {
+                world: torse_types::WorldId(7),
+                epoch: torse_types::WorldEpoch(1),
+                compatibility: Scene::compatibility().unwrap(),
+            },
+            interest_generation: 1,
+            seq: 1,
+            pages: vec![torse_types::TerrainLight {
+                pos,
+                terrain: torse_types::Digest([1; 32]),
+                generation: 1,
+                rules: 1,
+                complete: true,
+                emitted: vec![15; 4096],
+                sky: vec![15; 4096],
+            }],
+        };
+        let start = std::time::Instant::now();
+        terrain.apply_light(update).unwrap();
+        scene.try_apply_display(&near, &terrain, [pos]).unwrap();
+        scene.refresh_meshes();
+        let (vertices, indices) = scene.section_geometry(pos).unwrap();
+        assert!(renderer.upload_section(pos, &Scene::vertex_bytes(&vertices), &indices));
+        assert!(renderer.render(camera.view_projection(1.), camera.eye));
+        let light = dir.join("shared-light.png");
+        renderer.save_png(light.to_str().unwrap()).unwrap();
+        let duration = start.elapsed();
+        let c = torse_assets::texture::Atlas::decode(&std::fs::read(light).unwrap()).unwrap();
+        let changed = b
+            .pixels()
+            .chunks_exact(4)
+            .zip(c.pixels().chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            changed > 100,
+            "shared light must change rendered pixels: {changed}"
+        );
+        println!(
+            "shared light apply, mesh, upload, offscreen readback and PNG write ms={:.4}; changed_pixels={changed}",
+            duration.as_secs_f64() * 1000.
         );
     }
 
