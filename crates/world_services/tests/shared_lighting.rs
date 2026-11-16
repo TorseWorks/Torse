@@ -58,6 +58,7 @@ fn setup() -> (LightTerrain, BlockStateRegistry, SharedLightField) {
         LightFieldLimits {
             sections: 16,
             cache_bytes: 1_000_000,
+            solver_cache_bytes: 10_000_000,
             consumers: 4,
             interests: 32,
             job: job_limits(),
@@ -87,6 +88,66 @@ fn emitter(registry: &BlockStateRegistry) -> BlockStateId {
     registry
         .default_state(&ContentKey::parse("base:glass").unwrap())
         .unwrap()
+}
+
+#[test]
+fn full_height_column_reuses_one_solver_across_section_pages_and_edits() {
+    let (mut terrain, registry, _) = setup();
+    let binding = terrain.binding();
+    let lower = SectionPos::ZERO;
+    let upper = SectionPos::new(0, 1, 0);
+    let mut field = SharedLightField::new(
+        binding,
+        LightFieldLimits {
+            sections: 2,
+            cache_bytes: 128 * 1024,
+            solver_cache_bytes: 10_000_000,
+            consumers: 1,
+            interests: 2,
+            job: job_limits(),
+        },
+    )
+    .unwrap();
+    field.subscribe(1, &[lower, upper]).unwrap();
+    for (edit, state) in [emitter(&registry), BlockStateId::EMPTY]
+        .into_iter()
+        .enumerate()
+    {
+        terrain
+            .insert(upper, Section::new(4, state).unwrap(), &registry)
+            .unwrap();
+        field.inputs_changed(&terrain, &registry);
+        settle(&mut field, &terrain, &registry);
+        for target in [lower, upper] {
+            let output = field.publication(1, target, &terrain, &registry).unwrap();
+            for (sky, result) in [(false, &output.emitted), (true, &output.sky)] {
+                let prepare = if sky {
+                    LightJob::prepare_sky
+                } else {
+                    LightJob::prepare
+                };
+                let mut reference =
+                    prepare(binding, &terrain, &registry, target, job_limits()).unwrap();
+                while !reference
+                    .poll(binding, &terrain, &registry, 20_000)
+                    .unwrap()
+                {}
+                let expected = reference.finish(binding, &terrain, &registry).unwrap();
+                assert_eq!(result.levels(), expected.levels());
+            }
+        }
+        let d = field.diagnostics();
+        assert_eq!(d.started, (edit + 1) as u64);
+        assert_eq!(d.incremental_started, edit as u64);
+        assert_eq!(d.column_reuses, (edit + 1) as u64);
+        assert_eq!(d.published, ((edit + 1) * 2) as u64);
+        assert!(d.cache_peak <= 128 * 1024);
+        assert!(d.solver_cache_bytes > 128 * 1024);
+        assert!(d.solver_cache_peak <= 10_000_000);
+    }
+    field.unsubscribe(1);
+    assert_eq!(field.diagnostics().solver_cache_bytes, 0);
+    assert_eq!(field.diagnostics().cache_bytes, 0);
 }
 
 #[test]
@@ -425,6 +486,7 @@ fn cache_denial_parks_work_until_explicit_retry_instead_of_recomputing_each_poll
         LightFieldLimits {
             sections: 1,
             cache_bytes: 1,
+            solver_cache_bytes: 10_000_000,
             consumers: 2,
             interests: 2,
             job: job_limits(),
@@ -519,6 +581,7 @@ fn shared_light_edit_measurement() {
         LightFieldLimits {
             sections: 1,
             cache_bytes: 16 * 1024 * 1024,
+            solver_cache_bytes: 16 * 1024 * 1024,
             consumers: 2,
             interests: 2,
             job,

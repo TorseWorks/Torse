@@ -8,8 +8,8 @@ use std::{
 use torse_types::*;
 use torse_world::{ArchiveManifest, SectionPhase, Snapshot, SnapshotArchive};
 use torse_world_services::lighting::{
-    LightFieldDiagnostics, LightFieldLimits, LightPublication, LightSource, LightTerrain,
-    SharedLightField,
+    LightFieldDiagnostics, LightFieldLimits, LightOptics, LightOpticsTable, LightPublication,
+    LightSource, LightTerrain, SharedLightField,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -74,6 +74,7 @@ impl Drop for Loader {
 pub struct HostLightField {
     terrain: LightTerrain,
     field: SharedLightField,
+    optics: Option<Arc<LightOpticsTable>>,
     limits: HostLightLimits,
     interests: BTreeMap<u128, BTreeSet<SectionPos>>,
     needed: BTreeSet<SectionPos>,
@@ -108,6 +109,29 @@ impl HostLightField {
         pages: SectionPages,
         limits: HostLightLimits,
     ) -> Result<Self, Fault> {
+        Self::with_optics(host, pages, limits, None)
+    }
+
+    pub fn new_with_optics(
+        host: &ExecutionHost,
+        pages: SectionPages,
+        limits: HostLightLimits,
+        optics: Arc<LightOpticsTable>,
+    ) -> Result<Self, Fault> {
+        Self::with_optics(host, pages, limits, Some(optics))
+    }
+
+    fn with_optics(
+        host: &ExecutionHost,
+        pages: SectionPages,
+        limits: HostLightLimits,
+        optics: Option<Arc<LightOpticsTable>>,
+    ) -> Result<Self, Fault> {
+        if optics.as_ref().is_some_and(|table| {
+            table.registry_identity() != host.world().registry().authority_digest()
+        }) {
+            return Err(Fault::invalid_data("light optics registry mismatch"));
+        }
         if limits.pages_per_poll == 0 || limits.pages_per_poll > 64 {
             return Err(Fault::resource_limit("light ingestion limit"));
         }
@@ -122,6 +146,7 @@ impl HostLightField {
         let field = SharedLightField::new(host.binding(), limits.field)?;
         let reserve = (limits.input_bytes as u64)
             .checked_add(limits.field.cache_bytes as u64)
+            .and_then(|n| n.checked_add(limits.field.solver_cache_bytes as u64))
             .and_then(|n| n.checked_add(field.diagnostics().work_reservation))
             .and_then(|n| n.checked_add(pages.budget().max_bytes.checked_mul(4)?))
             .and_then(|n| n.checked_add(limits.input_sections as u64 * 512))
@@ -156,6 +181,7 @@ impl HostLightField {
         Ok(Self {
             terrain,
             field,
+            optics,
             limits,
             interests: BTreeMap::new(),
             needed: BTreeSet::new(),
@@ -274,6 +300,12 @@ impl HostLightField {
     pub fn diagnostics(&self) -> LightFieldDiagnostics {
         self.field.diagnostics()
     }
+    pub fn optics_identity(&self) -> Digest {
+        self.optics.as_deref().map_or(
+            self.terrain.binding().compatibility.rules_digest,
+            LightOpticsTable::identity,
+        )
+    }
     pub fn input_bytes(&self) -> usize {
         self.terrain.allocated_bytes()
     }
@@ -296,8 +328,12 @@ impl HostLightField {
         if host.binding() != self.terrain.binding() {
             return None;
         }
+        let optics: &dyn LightOptics = match self.optics.as_deref() {
+            Some(table) => table,
+            None => host.world().registry(),
+        };
         self.field
-            .publication(consumer, target, &self.terrain, host.world().registry())
+            .publication(consumer, target, &self.terrain, optics)
             .filter(|publication| {
                 publication
                     .sky
@@ -452,8 +488,11 @@ impl HostLightField {
                 }
             }
         }
-        self.field
-            .inputs_changed(&self.terrain, host.world().registry());
+        let optics: &dyn LightOptics = match self.optics.as_deref() {
+            Some(table) => table,
+            None => host.world().registry(),
+        };
+        self.field.inputs_changed(&self.terrain, optics);
         self.input_peak = self.input_peak.max(self.input_bytes());
         // A transient source handover must not replace reusable light with a
         // calculation against unknown terrain while verification is pending.
@@ -466,10 +505,7 @@ impl HostLightField {
         }
         // Ordinary invalidation cancels stale work; it is not a server failure.
         let stale = self.field.diagnostics().stale;
-        match self
-            .field
-            .poll(&self.terrain, host.world().registry(), work)
-        {
+        match self.field.poll(&self.terrain, optics, work) {
             Err(e)
                 if e.code == FaultCode::InvalidData && self.field.diagnostics().stale > stale =>
             {

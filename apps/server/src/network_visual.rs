@@ -17,6 +17,35 @@ impl<T: Transport> NetworkHub<T> {
         limits: crate::lighting::HostLightLimits,
         work_per_poll: usize,
     ) -> Result<(), Fault> {
+        self.configure_shared_lighting(server, pages, limits, work_per_poll, None)
+    }
+
+    /// Opt in with an immutable table whose identity clients configure locally.
+    pub fn enable_shared_lighting_with_optics<
+        J: CommitJournal<ExecutionModel>,
+        S: HostCheckpointStore<ExecutionModel>,
+    >(
+        &mut self,
+        server: &Server<ExecutionHost, J, S>,
+        pages: SectionPages,
+        limits: crate::lighting::HostLightLimits,
+        work_per_poll: usize,
+        optics: std::sync::Arc<torse_world_services::lighting::LightOpticsTable>,
+    ) -> Result<(), Fault> {
+        self.configure_shared_lighting(server, pages, limits, work_per_poll, Some(optics))
+    }
+
+    fn configure_shared_lighting<
+        J: CommitJournal<ExecutionModel>,
+        S: HostCheckpointStore<ExecutionModel>,
+    >(
+        &mut self,
+        server: &Server<ExecutionHost, J, S>,
+        pages: SectionPages,
+        limits: crate::lighting::HostLightLimits,
+        work_per_poll: usize,
+        optics: Option<std::sync::Arc<torse_world_services::lighting::LightOpticsTable>>,
+    ) -> Result<(), Fault> {
         if self.lighting.is_some()
             || self.peers.values().any(|p| p.visual.is_some())
             || work_per_poll == 0
@@ -27,10 +56,14 @@ impl<T: Transport> NetworkHub<T> {
                 "shared lighting must precede display sessions",
             ));
         }
-        self.lighting = Some((
-            crate::lighting::HostLightField::new(server.authority()?, pages, limits)?,
-            work_per_poll,
-        ));
+        let host = server.authority()?;
+        let field = match optics {
+            Some(table) => {
+                crate::lighting::HostLightField::new_with_optics(host, pages, limits, table)
+            }
+            None => crate::lighting::HostLightField::new(host, pages, limits),
+        }?;
+        self.lighting = Some((field, work_per_poll));
         Ok(())
     }
     pub fn shared_light_diagnostics(

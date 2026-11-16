@@ -33,6 +33,8 @@ pub struct TerrainLight {
     pub terrain: Digest,
     pub generation: u64,
     pub rules: u32,
+    /// Identity of the immutable optical table used by both channels.
+    pub optics: Digest,
     pub complete: bool,
     pub emitted: Vec<u8>,
     pub sky: Vec<u8>,

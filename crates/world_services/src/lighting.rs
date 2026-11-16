@@ -10,12 +10,14 @@ use torse_types::{Binding, BlockPos, Digest, Fault, SectionPos};
 
 mod source;
 pub use source::{LightInputVersion, LightSource};
+mod optics;
+pub use optics::{LightOptics, LightOpticsTable, OpticalState};
 mod terrain;
 pub use terrain::LightTerrain;
 mod incremental;
 mod shared;
 pub use shared::{LightFieldDiagnostics, LightFieldLimits, LightPublication, SharedLightField};
-use torse_world::{BlockStateRegistry, SectionPhase, SectionStore, TerrainQuery, WorldBounds};
+use torse_world::{SectionPhase, SectionStore, TerrainQuery, WorldBounds};
 
 pub const MAX_LIGHT: u8 = 15;
 pub const LIGHT_RULES_VERSION: u32 = 1;
@@ -53,7 +55,7 @@ struct Dependency {
 struct Observation {
     binding: Binding,
     rules: u32,
-    content: Digest,
+    optics: Digest,
     side: u32,
     bounds: WorldBounds,
     dependencies: Vec<Dependency>,
@@ -63,12 +65,12 @@ impl Observation {
         &self,
         binding: Binding,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
     ) -> bool {
         self.binding == binding
             && store.binding().is_none_or(|b| b == binding)
             && self.rules == store.rules_version()
-            && self.content == registry.authority_digest()
+            && self.optics == optics.identity()
             && self.side == store.side()
             && self.bounds == store.bounds()
             && self
@@ -136,9 +138,9 @@ impl LightSection {
         &self,
         binding: Binding,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
     ) -> bool {
-        self.observed.valid(binding, store, registry)
+        self.observed.valid(binding, store, optics)
     }
 }
 
@@ -163,11 +165,11 @@ impl LightJob {
     pub fn prepare(
         binding: Binding,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
         target: SectionPos,
         limits: LightLimits,
     ) -> Result<Self, Fault> {
-        Self::prepare_kind(binding, store, registry, target, limits, false)
+        Self::prepare_kind(binding, store, optics, target, limits, false, false)
     }
 
     /// Skylight seeds vertical columns from the world ceiling. Missing cells
@@ -175,20 +177,21 @@ impl LightJob {
     pub fn prepare_sky(
         binding: Binding,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
         target: SectionPos,
         limits: LightLimits,
     ) -> Result<Self, Fault> {
-        Self::prepare_kind(binding, store, registry, target, limits, true)
+        Self::prepare_kind(binding, store, optics, target, limits, true, true)
     }
 
-    fn prepare_kind(
+    pub(super) fn prepare_kind(
         binding: Binding,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
         target: SectionPos,
         limits: LightLimits,
         sky: bool,
+        full_height: bool,
     ) -> Result<Self, Fault> {
         SectionStore::new(store.side(), store.bounds()).map_err(invalid)?;
         if store.rules_version() == 0 || store.binding().is_some_and(|b| b != binding) {
@@ -216,9 +219,14 @@ impl LightJob {
             .checked_add(side + 14, side + 14, side + 14)
             .map_err(invalid)?;
         let bounds = store.bounds();
+        if base.y >= bounds.max_y || base.y.saturating_add(side - 1) < bounds.min_y {
+            return Err(Fault::invalid_data(
+                "lighting target is outside world bounds",
+            ));
+        }
         let origin = BlockPos::new(
             min.x,
-            if sky {
+            if full_height {
                 bounds.min_y
             } else {
                 min.y.max(bounds.min_y)
@@ -227,7 +235,7 @@ impl LightJob {
         );
         let last = BlockPos::new(
             max.x,
-            if sky {
+            if full_height {
                 bounds.max_y - 1
             } else {
                 max.y.min(bounds.max_y - 1)
@@ -294,7 +302,7 @@ impl LightJob {
             observed: Observation {
                 binding,
                 rules: store.rules_version(),
-                content: registry.authority_digest(),
+                optics: optics.identity(),
                 side: store.side(),
                 bounds,
                 dependencies,
@@ -324,14 +332,14 @@ impl LightJob {
         &mut self,
         binding: Binding,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
         work: usize,
     ) -> Result<bool, Fault> {
-        if self.failed || !self.observed.valid(binding, store, registry) {
+        if self.failed || !self.observed.valid(binding, store, optics) {
             self.failed = true;
             return Err(Fault::invalid_data("lighting observation changed"));
         }
-        let result = self.advance(store, registry, work);
+        let result = self.advance(store, optics, work);
         if result.is_err() {
             self.failed = true;
         }
@@ -340,11 +348,11 @@ impl LightJob {
     fn advance(
         &mut self,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
         work: usize,
     ) -> Result<bool, Fault> {
         if self.incremental.as_ref().is_some_and(|i| i.scan.is_some()) {
-            return self.advance_update(store, registry, work);
+            return self.advance_update(store, optics, work);
         }
         for _ in 0..work {
             if self.seeded < self.levels.len() {
@@ -365,13 +373,12 @@ impl LightJob {
                         direct_absorption = 0;
                     }
                     TerrainQuery::Ready(state) => {
-                        let light = registry
-                            .light_transport(state)
+                        let light = optics
+                            .state(state)
                             .ok_or_else(|| Fault::invalid_data("unregistered lighting state"))?;
-                        self.absorption[index] =
-                            (light.absorption * 15.0).ceil().clamp(1.0, 15.0) as u8;
-                        let level = (light.emission * 15.0).round() as u8;
-                        direct_absorption = (light.absorption * 15.0).ceil() as u8;
+                        self.absorption[index] = light.absorption.max(1);
+                        let level = light.emission;
+                        direct_absorption = light.absorption;
                         self.levels[index] = if self.sky { 0 } else { level };
                         if level > 0 && !self.sky {
                             self.push(level, index)?;
@@ -457,26 +464,36 @@ impl LightJob {
         self,
         binding: Binding,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
     ) -> Result<LightSection, Fault> {
-        self.capture(binding, store, registry)
+        self.capture_at(self.target, binding, store, optics)
     }
-    pub(super) fn capture(
+    pub(super) fn capture_at(
         &self,
+        target: SectionPos,
         binding: Binding,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
     ) -> Result<LightSection, Fault> {
         if self.failed
             || self.seeded != self.levels.len()
             || !self.queue.is_empty()
             || self.incremental.as_ref().is_some_and(|i| i.scan.is_some())
-            || !self.observed.valid(binding, store, registry)
+            || !self.observed.valid(binding, store, optics)
         {
             return Err(Fault::invalid_data("lighting job is incomplete or stale"));
         }
         let side = self.observed.side;
-        let base = section_origin(self.target, i64::from(side))?;
+        let base = section_origin(target, i64::from(side))?;
+        if target.x != self.target.x
+            || target.z != self.target.z
+            || base.y > self.origin.y + (self.dims[1] - 1) as i64
+            || base.y.saturating_add(i64::from(side) - 1) < self.origin.y
+        {
+            return Err(Fault::invalid_data(
+                "light target is outside the solved column",
+            ));
+        }
         let mut levels = Vec::with_capacity((side as usize).pow(3));
         for y in 0..side {
             for z in 0..side {
@@ -501,7 +518,7 @@ impl LightJob {
             }
         }
         Ok(LightSection {
-            target: self.target,
+            target,
             observed: self.observed.clone(),
             levels,
             complete: self.complete,
@@ -525,11 +542,11 @@ impl LightCache {
         &self,
         binding: Binding,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
         target: SectionPos,
     ) -> Option<&LightSection> {
         let (_, data) = self.entries.get(&target)?;
-        (binding == self.binding && data.validate(binding, store, registry)).then_some(data)
+        (binding == self.binding && data.validate(binding, store, optics)).then_some(data)
     }
     pub fn new(binding: Binding, max_sections: usize, max_bytes: usize) -> Result<Self, Fault> {
         if max_sections == 0 || max_sections > 32768 || max_bytes == 0 {
@@ -553,9 +570,9 @@ impl LightCache {
         &mut self,
         section: LightSection,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
     ) -> Result<LightStamp, Fault> {
-        if !section.validate(self.binding, store, registry) {
+        if !section.validate(self.binding, store, optics) {
             return Err(Fault::invalid_data("stale light publication"));
         }
         let previous = self
@@ -590,20 +607,21 @@ impl LightCache {
         stamp: LightStamp,
         binding: Binding,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
     ) -> bool {
         self.binding == binding
             && stamp.binding == binding
             && stamp.cache == self.identity
-            && self.entries.get(&stamp.target).is_some_and(|(g, s)| {
-                *g == stamp.generation && s.validate(binding, store, registry)
-            })
+            && self
+                .entries
+                .get(&stamp.target)
+                .is_some_and(|(g, s)| *g == stamp.generation && s.validate(binding, store, optics))
     }
     pub fn sample(
         &self,
         binding: Binding,
         store: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
         pos: BlockPos,
     ) -> LightQuery {
         if !store.bounds().contains_y(pos.y) {
@@ -615,7 +633,7 @@ impl LightCache {
         let Some((_, data)) = self.entries.get(&section) else {
             return LightQuery::Pending;
         };
-        if binding != self.binding || !data.validate(binding, store, registry) {
+        if binding != self.binding || !data.validate(binding, store, optics) {
             return LightQuery::Pending;
         }
         let index = torse_world::linear_index(store.side(), local);

@@ -285,6 +285,7 @@ impl VisualSession {
             terrain: cached.digest,
             generation: light.generation,
             rules: light.rules_version,
+            optics: field.optics_identity(),
             complete: light.emitted.is_complete() && light.sky.is_complete(),
             emitted: light.emitted.levels().to_vec(),
             sky: light.sky.levels().to_vec(),

@@ -12,7 +12,9 @@ use torse_server::{
     lighting::{HostLightField, HostLightLimits, LightInputStatus},
 };
 use torse_types::*;
-use torse_world_services::lighting::{LightFieldLimits, LightLimits};
+use torse_world_services::lighting::{
+    LightFieldLimits, LightLimits, LightOpticsTable, OpticalState,
+};
 use visual_fixture::{interest, streaming as fixture};
 
 fn limits() -> HostLightLimits {
@@ -23,6 +25,7 @@ fn limits() -> HostLightLimits {
         field: LightFieldLimits {
             sections: 8,
             cache_bytes: 12_000_000,
+            solver_cache_bytes: 12_000_000,
             consumers: 4,
             interests: 32,
             job: LightLimits {
@@ -158,7 +161,13 @@ fn shared_display_light_reaches_fast_peer_while_other_peer_keeps_output_pending(
     };
     use torse_sim::replica::ReplicaScope;
     let dir = Directory::new();
-    let mut server = fixture::create(&dir);
+    let (mut world, actions) = base::world().unwrap();
+    let stone = world
+        .registry()
+        .default_state(&ContentKey::parse("base:stone").unwrap())
+        .unwrap();
+    world.store_mut().edit(BlockPos::ZERO, stone).unwrap();
+    let mut server = fixture::create_with_world(&dir, (world, actions));
     let pages = fixture::pages(&dir);
     let target = SectionPos::ZERO;
     let scope = ReplicaScope {
@@ -166,7 +175,24 @@ fn shared_display_light_reaches_fast_peer_while_other_peer_keeps_output_pending(
     };
     let mut hub =
         NetworkHub::<MemoryTransport>::new(server.binding(), base::network_limits()).unwrap();
-    hub.enable_shared_lighting(&server, pages.clone(), limits(), 20_000)
+    let registry = server.authority().unwrap().world().registry();
+    let mut states = vec![
+        OpticalState {
+            absorption: 15,
+            emission: 13
+        };
+        registry.state_count() as usize
+    ];
+    states[0] = OpticalState::default();
+    let table = Arc::new(LightOpticsTable::new(registry, 1, states.clone()).unwrap());
+    let identity = table.identity();
+    assert_ne!(
+        LightOpticsTable::new(registry, 2, states)
+            .unwrap()
+            .identity(),
+        identity
+    );
+    hub.enable_shared_lighting_with_optics(&server, pages.clone(), limits(), 20_000, table)
         .unwrap();
     let (slow, mut slow_client, _, _) = interest::attach(&mut hub, &mut server, scope.clone());
     let (fast, mut fast_client, _, _) = interest::attach(&mut hub, &mut server, scope.clone());
@@ -200,6 +226,7 @@ fn shared_display_light_reaches_fast_peer_while_other_peer_keeps_output_pending(
         None,
     )
     .unwrap();
+    mirror.set_light_optics(identity).unwrap();
     let start = Instant::now();
     loop {
         hub.poll(&mut server).unwrap();
@@ -224,6 +251,8 @@ fn shared_display_light_reaches_fast_peer_while_other_peer_keeps_output_pending(
     assert_eq!(hub.shared_light_diagnostics().unwrap().published, 1);
     assert_eq!(hub.shared_light_diagnostics().unwrap().pending, 0);
     let generation = mirror.light(target).unwrap().generation;
+    assert_eq!(mirror.light(target).unwrap().optics, identity);
+    assert!(mirror.light(target).unwrap().emitted.contains(&13));
     // Drain the slow peer only after the other peer has finished.
     let mut other = TerrainMirror::new(
         server.binding(),
@@ -236,6 +265,7 @@ fn shared_display_light_reaches_fast_peer_while_other_peer_keeps_output_pending(
         None,
     )
     .unwrap();
+    other.set_light_optics(identity).unwrap();
     loop {
         for message in interest::drain(&mut slow_client).0 {
             match message {

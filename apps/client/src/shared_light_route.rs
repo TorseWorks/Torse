@@ -33,6 +33,7 @@ fn shared_light_route_to_offscreen_draw() {
             input_bytes: 8 * 1024 * 1024,
             pages_per_poll: 1,
             field: LightFieldLimits {
+                solver_cache_bytes: 64 * 1024 * 1024,
                 sections: 8,
                 cache_bytes: 64 * 1024 * 1024,
                 consumers: 4,

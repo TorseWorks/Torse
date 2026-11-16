@@ -23,6 +23,7 @@ pub struct TerrainMirror {
     generation: u64,
     seq: u64,
     light_seq: u64,
+    light_optics: Digest,
     through: CommitCursor,
     desired: BTreeSet<SectionPos>,
     pages: BTreeMap<SectionPos, TerrainPage<ReplicaSnapshot>>,
@@ -97,6 +98,7 @@ impl TerrainMirror {
             generation: 0,
             seq: 0,
             light_seq: 0,
+            light_optics: binding.compatibility.rules_digest,
             through: CommitCursor::initial(binding.world),
             desired: BTreeSet::new(),
             pages: BTreeMap::new(),
@@ -107,6 +109,16 @@ impl TerrainMirror {
     }
     pub fn desired(&self) -> &BTreeSet<SectionPos> {
         &self.desired
+    }
+    /// Select a locally trusted table before accepting any display updates.
+    pub fn set_light_optics(&mut self, identity: Digest) -> Result<(), Fault> {
+        if self.generation != 0 {
+            return Err(Fault::invalid_data(
+                "light optics require a fresh display mirror",
+            ));
+        }
+        self.light_optics = identity;
+        Ok(())
     }
     pub fn accounted_bytes(&self) -> u64 {
         self.bytes
@@ -145,6 +157,9 @@ impl TerrainMirror {
         }
         let mut bytes = self.bytes;
         for page in &update.pages {
+            if page.optics != self.light_optics {
+                continue;
+            }
             if let Some(old) = self.pages.get(&page.pos)
                 && old.digest == page.terrain
                 && self.page(page.pos).is_some()
@@ -163,7 +178,7 @@ impl TerrainMirror {
         }
         let mut changed = Vec::new();
         for page in update.pages {
-            if self.page(page.pos).is_none() {
+            if page.optics != self.light_optics || self.page(page.pos).is_none() {
                 continue;
             }
             if let Some(old) = self.pages.get_mut(&page.pos)
@@ -260,11 +275,14 @@ impl TerrainMirror {
         }
         let mut incoming = BTreeMap::new();
         let mut input_bytes = 0u64;
-        for page in update.pages {
+        for mut page in update.pages {
             if let Some(light) = &page.light {
                 validate_light(light, self.side)?;
                 if light.pos != page.terrain.sections[0].pos || light.terrain != page.digest {
                     return Err(invalid());
+                }
+                if light.optics != self.light_optics {
+                    page.light = None;
                 }
             }
             let pos = page.terrain.sections[0].pos;

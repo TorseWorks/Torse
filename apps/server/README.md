@@ -174,7 +174,7 @@ cargo test -p torse-server --test event_budget --locked
 
 WorkPlan支持携带TransactionGroup。Mod机器自有状态与库存规划器返回的事务按来源组成一个任务，连同新唤醒共同预留、发布和刷盘。冻结任务保存稳定成员，恢复不重跑已规划或已结算的Guest。库存拒绝保留机器完成前的进度，不登记该计划的新唤醒；陷阱重试次数由持久事件载荷记录，停机以没有后续唤醒表示。ModStats只供诊断，不影响恢复后的执行。验证见[Mod原子执行](../../benchmarks/archive/mods/M4-mod-atomic.md)。
 
-持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本4或5、读版本1至5，快照写版本2、读版本1和2，应用协议为版本7。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。主程序仍使用有限范围，显式装卸接口另见下文，未进行硬件断电验收。
+持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本4或5、读版本1至5，快照写版本2、读版本1和2，应用协议为版本8。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。主程序仍使用有限范围，显式装卸接口另见下文，未进行硬件断电验收。
 
 ## 运行态与批量刷盘
 
@@ -188,7 +188,7 @@ Server的Tick驱动默认每批1条，可用`set_commit_batch_limit`设置1到10
 
 复现对照与故障验证见[运行态与批量提交](../../benchmarks/archive/performance/M6-runtime-commit.md)。当前简单事务的并行预验证实验未显示收益，因此继续使用串行事务准备与发布。
 
-NetworkHub通过应用协议版本7接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线、增量及移动确认都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权镜像、编辑请求、独立移动输入和预测校正。双向TLS与按用户授权已接入，明文演示限制在回环地址。
+NetworkHub通过应用协议版本8接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线、增量及移动确认都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权镜像、编辑请求、独立移动输入和预测校正。双向TLS与按用户授权已接入，明文演示限制在回环地址。
 
 ## 批量驻留
 
@@ -463,4 +463,6 @@ do not establish stable observer overhead or any speedup. CPU time was not separ
 
 驻留页、可信生成Section及已验证SnapshotSection经`LightTerrain`转换为同一原生内容身份。身份不含驻留修订号或来源类型。未知不作空气；缺失邻界生成不完整结果，来源损坏使结果失效。重新验证相同内容允许复用原发布。文件缓存需要宿主显式refresh才重新读盘发现外部文件篡改；不可变文件在首次读取时校验摘要。关闭会等待当前文件操作结束，不提供操作系统级取消。
 
-`SharedLightField`按目标合并消费者，原子发布天光和方块光。保留有界求解状态，编辑时分步扫描变更区段，光值增减沿实际变化的邻接前沿传播；天光重扫有界垂直列。依赖、规则或绑定变化会拒绝晚到结果。`LightFieldDiagnostics`区分启动、增量启动、传播访问、发布、陈旧取消、待办及缓存峰值；缓存包含保留求解器，工作预留不代表RSS。`shared_light_resources`另报输入峰值、I/O在途状态及固定预留。预算拒绝暂停对应目标，显式refresh或兴趣变更后重试，不持续冷算，也不阻断网络Hub服务。活跃消费者只保存兴趣和发送代数，输出积压不阻止共享计算或其他连接发送。
+`SharedLightField`按水平Section列求解方块光和天光，范围从世界底到世界顶，同列不同高度复用同一已完成求解并独立发布。编辑使相应依赖失效，保留的求解状态分步扫描变化区段，并沿受影响的传播前沿更新。`LightFieldLimits.cache_bytes`限制已发布的Section页，`solver_cache_bytes`另限保留求解器，设为0时求解结束后释放缓冲。两个通道在途求解按 `2 * job.bytes` 单独预留。`LightFieldDiagnostics`分别报告发布页与保留求解器的字节数和峰值、同列复用次数，以及工作预留；这些数值不等于RSS。预算拒绝暂停对应目标，显式refresh或兴趣变更后重试。活跃消费者只保存兴趣和发送代数，输出积压不阻止共享计算或其他连接发送。
+
+宿主可用`LightOpticsTable::new`创建只读光学表，再通过`NetworkHub::enable_shared_lighting_with_optics`装配。表身份由版本、内容注册表身份和按状态排列的光学系数共同确定。自定义客户端需在首个显示更新前用`TerrainMirror::set_light_optics`配置本地预期身份。内置表默认使用绑定的权威规则摘要，光照页同时携带规则版本和表身份。
