@@ -1,0 +1,8 @@
+OS: Windows 11 26200 x86_64
+CPU: Ryzen 7 7840H
+Storage: WD Blue SN580 1TB NVMe, NTFS
+Power plan: Balanced
+Build: Rust 1.93.1 x86_64-pc-windows-msvc, locked dependencies, Release
+Journal: real file backend
+Base executable SHA-256: 0e30ce0b39f9c7add67588212ef6e45028fb415f806934e07eaa2cd41160ba7e
+Candidate executable SHA-256: 6bba06626afe6cb0e5768dfda3e6cdaab20637634a25edffb5e1029f2aaacf38

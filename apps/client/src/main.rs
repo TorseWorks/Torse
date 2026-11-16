@@ -14,6 +14,11 @@ mod pick;
 mod renderer;
 mod scene;
 mod settings;
+#[cfg(all(test, feature = "gpu-tests"))]
+mod shared_light_route;
+#[cfg(all(test, feature = "gpu-tests"))]
+#[path = "../../server/tests/support/mod.rs"]
+mod support;
 mod texture;
 mod ui;
 mod window;

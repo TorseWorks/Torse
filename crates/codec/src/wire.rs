@@ -14,6 +14,7 @@ use torse_world::*;
 pub const EXECUTION_VERSION: u16 = 1;
 pub const EXECUTION_COMMIT_VERSION: u16 = 4;
 const PARKED_EXECUTION_COMMIT_VERSION: u16 = 6;
+pub const PACKED_EXECUTION_COMMIT_VERSION: u16 = 5;
 pub const EXECUTION_SNAPSHOT_VERSION: u16 = 2;
 pub trait Wire: Sized {
     fn write(&self, out: &mut Encoder<'_>) -> EncodeResult<()>;
@@ -1026,17 +1027,24 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
         };
         let mut encoder = Encoder::new(out, b, self.limits);
         encoder.count_items(1)?;
-        encoder.write_u16(
-            if v.changes
+        let parking = v
+            .changes
+            .sections
+            .first()
+            .is_some_and(|change| !change.load);
+        let packed = !parking
+            && v.changes
                 .sections
-                .first()
-                .is_some_and(|change| !change.load)
-            {
-                PARKED_EXECUTION_COMMIT_VERSION
-            } else {
-                EXECUTION_COMMIT_VERSION
-            },
-        )?;
+                .iter()
+                .any(|change| crate::snapshot::has_packable_cells(&change.page));
+        encoder.packed_snapshot_cells = packed;
+        encoder.write_u16(if parking {
+            PARKED_EXECUTION_COMMIT_VERSION
+        } else if packed {
+            PACKED_EXECUTION_COMMIT_VERSION
+        } else {
+            EXECUTION_COMMIT_VERSION
+        })?;
         v.write(&mut encoder)?;
         encoder.finish();
         Ok(())
@@ -1084,6 +1092,10 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
                 },
             },
             EXECUTION_COMMIT_VERSION | PARKED_EXECUTION_COMMIT_VERSION => {
+                ModelCommit::<M>::read(&mut d)?
+            }
+            PACKED_EXECUTION_COMMIT_VERSION => {
+                d.packed_snapshot_cells = true;
                 ModelCommit::<M>::read(&mut d)?
             }
             _ => return Err(Fault::incompatible("execution commit version")),

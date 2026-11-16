@@ -4,6 +4,8 @@
 
 ## 世界、客户端与图形
 
+[共享光场验证与测量](lighting/shared-20261113/README.md)记录内容身份、增量光照与双客户端；[完整线格式预算复测](lighting/shared-wire-budget-20261113/README.md)记录最终发送路径的真实文件路线及Vulkan绘制结果。
+
 | 记录 | 内容 |
 |---|---|
 | [技术实验](foundation/M0-experiments.md) | 内容编译、ECS、Wasmtime与GPU初始化 |
@@ -77,6 +79,8 @@
 | [分区存储压缩](persistence/M3-section-compression.md) | 分区存储压缩 |
 | [持久分区装卸](persistence/M3-section-streaming.md) | 持久分区装卸 |
 | [生成整列直接停放对照](residency/generated-parking-20261112.md) | 真实文件页与日志同步、宿主调用及索引增长 |
+| [稠密分区恢复对照](residency/dense-install-tail-20261111.md) | 混合密度整列安装、恢复准备优化和耐久等待 |
+| [整列安装日志压缩对照](residency/dense-install-journal-20261111.md) | 日志追加与同步分项、实际写入量和恢复验证 |
 | [会话范围与旧订阅失效](persistence/M3-session-scope.md) | 会话范围与旧订阅失效 |
 | [快照结构校验验证](persistence/M3-snapshot-validation.md) | 快照结构校验验证 |
 

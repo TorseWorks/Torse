@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut csv = fs::File::create(out.join("samples.csv"))?;
     writeln!(
         csv,
-        "tick,x,z,dense_pages,entities,input_prepare_ns,host_total_ns,kernel_total_ns,page_prepare_ns,validation_ns,encoding_ns,publication_ns,durable_wait_ns,flush_requests,stored_sections"
+        "tick,x,z,dense_pages,entities,input_prepare_ns,host_total_ns,kernel_total_ns,page_prepare_ns,validation_ns,encoding_ns,publication_ns,durable_wait_ns,journal_append_ns,journal_sync_ns,journal_bytes,flush_requests,stored_sections"
     )?;
     let dir = support::Directory::new();
     let (mut server, pages, template) = create(dir.acquire())?;
@@ -114,18 +114,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let host_ns = host.elapsed().as_nanos();
                 assert!(matches!(result, CommitStep::Durable(_)));
                 let d = server.section_install_diagnostics();
-                let encoding = profiler.totals()[Stage::Encoding as usize].total_ns;
+                let totals = profiler.totals();
+                let encoding = totals[Stage::Encoding as usize].total_ns;
+                let append = totals[Stage::JournalAppend as usize];
+                let sync = totals[Stage::JournalSync as usize];
                 let calls = server.flush_metrics().calls - before.calls;
                 assert_eq!(calls, 1);
+                assert_eq!(append.calls, 1);
+                assert_eq!(sync.calls, 1);
                 writeln!(
                     csv,
-                    "{tick},{},{z},{dense},{entities},{input_ns},{host_ns},{},{},{},{encoding},{},{},{calls},{}",
+                    "{tick},{},{z},{dense},{entities},{input_ns},{host_ns},{},{},{},{encoding},{},{},{},{},{},{calls},{}",
                     next + 2,
                     d.elapsed.as_nanos(),
                     d.page_preparation.as_nanos(),
                     d.validation.as_nanos(),
                     d.commit.as_nanos().saturating_sub(encoding),
                     d.durability_wait.as_nanos(),
+                    append.total_ns,
+                    sync.total_ns,
+                    append.bytes,
                     server.authority()?.world().store().len()
                 )?;
                 samples += 1;

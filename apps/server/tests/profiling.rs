@@ -79,13 +79,20 @@ fn profiling_preserves_log_bytes_conflicts_and_recovered_execution() {
         Stage::Encoding,
         Stage::Publication,
         Stage::Flush,
+        Stage::JournalAppend,
+        Stage::JournalSync,
     ] {
         assert_eq!(profile.totals[stage as usize].calls, 20);
     }
     drop(measured);
     drop(plain);
+    let measured_log = std::fs::read(measured_dir.0.join("journal.log")).unwrap();
     assert_eq!(
-        std::fs::read(measured_dir.0.join("journal.log")).unwrap(),
+        profile.totals[Stage::JournalAppend as usize].bytes,
+        measured_log.len() as u64
+    );
+    assert_eq!(
+        measured_log,
         std::fs::read(plain_dir.0.join("journal.log")).unwrap(),
     );
     let (world, actions) = base::world().unwrap();
@@ -209,6 +216,8 @@ fn failed_encoding_and_flush_keep_the_existing_publication_gates() {
             assert_eq!(server.durability().through.0, 0);
             assert_eq!(profiler.totals()[Stage::Publication as usize].calls, 1);
             assert_eq!(profiler.totals()[Stage::Flush as usize].calls, 1);
+            assert_eq!(profiler.totals()[Stage::JournalAppend as usize].calls, 1);
+            assert_eq!(profiler.totals()[Stage::JournalSync as usize].calls, 0);
         }
         assert!(profiler.totals()[Stage::Encoding as usize].calls > 0);
     }

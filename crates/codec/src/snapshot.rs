@@ -28,6 +28,24 @@ use crate::{Decoder, EncodeResult, Encoder};
 // Section cell tags.
 const CELLS_UNIFORM: u8 = 0;
 const CELLS_DENSE: u8 = 1;
+const CELLS_PACKED: u8 = 2;
+
+fn symbols_per_byte(states: &[StateEntry]) -> Option<usize> {
+    match states.len() {
+        1 => Some(8),
+        2..=3 => Some(4),
+        4..=15 => Some(2),
+        _ => None,
+    }
+}
+
+pub(crate) fn has_packable_cells(value: &Snapshot) -> bool {
+    symbols_per_byte(&value.states).is_some()
+        && value
+            .sections
+            .iter()
+            .any(|s| matches!(&s.cells, SnapshotCells::Dense(cells) if cells.len() > 1))
+}
 
 /// Minimum widths used to reject impossible counts before allocation.
 const MIN_STATE_BYTES: usize = 2 + 1 + 4; // id, key length, value count
@@ -67,7 +85,7 @@ pub(crate) fn write_snapshot(out: &mut Encoder<'_>, value: &Snapshot) -> EncodeR
     out.write_i64(value.bounds.min_y)?;
     out.write_i64(value.bounds.max_y)?;
     write_states(out, &value.states)?;
-    write_sections(out, &value.sections, cells)?;
+    write_sections(out, &value.sections, cells, &value.states)?;
     write_entities(out, &value.entities)?;
     out.write_u128(value.next_entity_id)?;
     // Preserve the codec's earlier, more specific ordering and resource errors.
@@ -85,7 +103,7 @@ pub(crate) fn read_snapshot(input: &mut Decoder<'_>) -> EncodeResult<Snapshot> {
     let max_y = input.read_i64()?;
     let bounds = WorldBounds::new(min_y, max_y).map_err(|error| invalid(error.to_string()))?;
     let states = read_states(input)?;
-    let sections = read_sections(input, cells)?;
+    let sections = read_sections(input, cells, &states)?;
     let entities = read_entities(input)?;
     let next_entity_id = input.read_u128()?;
     let snapshot = Snapshot {
@@ -158,6 +176,7 @@ fn write_sections(
     out: &mut Encoder<'_>,
     sections: &[SnapshotSection],
     cells: usize,
+    states: &[StateEntry],
 ) -> EncodeResult<()> {
     write_items(out, sections.len(), "section")?;
     let mut previous = None;
@@ -181,8 +200,16 @@ fn write_sections(
                     )));
                 }
                 out.ensure(1 + 2 * cells as u64)?;
-                out.write_u8(CELLS_DENSE)?;
-                write_dense(out, list)?;
+                if out.packed_snapshot_cells
+                    && cells > 1
+                    && let Some(per_byte) = symbols_per_byte(states)
+                {
+                    out.write_u8(CELLS_PACKED)?;
+                    write_packed(out, list, states, per_byte)?;
+                } else {
+                    out.write_u8(CELLS_DENSE)?;
+                    write_dense(out, list)?;
+                }
             }
         }
     }
@@ -201,7 +228,90 @@ fn write_dense(out: &mut Encoder<'_>, cells: &[BlockStateId]) -> EncodeResult<()
     Ok(())
 }
 
-fn read_sections(input: &mut Decoder<'_>, cells: usize) -> EncodeResult<Vec<SnapshotSection>> {
+fn write_packed(
+    out: &mut Encoder<'_>,
+    cells: &[BlockStateId],
+    states: &[StateEntry],
+    per_byte: usize,
+) -> EncodeResult<()> {
+    out.charge_saved_bytes(cells.len() * 2 - cells.len().div_ceil(per_byte))?;
+    if let [state] = states {
+        // The enclosing snapshot validates the original cells before finishing,
+        // including IDs that are neither empty nor the declared state.
+        return write_symbols(out, cells, per_byte, |cell| Ok(u8::from(cell == state.id)));
+    }
+    write_symbols(out, cells, per_byte, |cell| {
+        if cell.is_empty() {
+            Ok(0)
+        } else {
+            states
+                .binary_search_by_key(&cell, |entry| entry.id)
+                .map(|index| index as u8 + 1)
+                .map_err(|_| invalid("packed cell references an undefined state"))
+        }
+    })
+}
+
+fn write_symbols(
+    out: &mut Encoder<'_>,
+    cells: &[BlockStateId],
+    per_byte: usize,
+    symbol: impl Fn(BlockStateId) -> EncodeResult<u8>,
+) -> EncodeResult<()> {
+    let bits = 8 / per_byte;
+    let mut buffer = [0u8; 256];
+    for chunk in cells.chunks(buffer.len() * per_byte) {
+        for (byte, group) in buffer.iter_mut().zip(chunk.chunks(per_byte)) {
+            *byte = 0;
+            for (index, &state) in group.iter().enumerate() {
+                *byte |= symbol(state)? << (index * bits);
+            }
+        }
+        out.write(&buffer[..chunk.len().div_ceil(per_byte)])?;
+    }
+    Ok(())
+}
+
+fn read_packed(
+    input: &mut Decoder<'_>,
+    cells: usize,
+    states: &[StateEntry],
+) -> EncodeResult<SnapshotCells> {
+    let per_byte = symbols_per_byte(states)
+        .ok_or_else(|| invalid("packed section state table exceeds symbol range"))?;
+    let bits = 8 / per_byte;
+    let bytes = input.read(cells.div_ceil(per_byte))?;
+    let tail = cells % per_byte;
+    if tail != 0 && bytes.last().is_some_and(|byte| byte >> (tail * bits) != 0) {
+        return Err(invalid("packed section has nonzero padding"));
+    }
+    charge_vec::<BlockStateId>(input, cells)?;
+    let mut dictionary = [BlockStateId::EMPTY; 16];
+    for (slot, state) in dictionary[1..].iter_mut().zip(states) {
+        *slot = state.id;
+    }
+    let dictionary = &dictionary[..=states.len()];
+    let mask = (1 << bits) - 1;
+    let symbols = bytes
+        .iter()
+        .flat_map(|byte| (0..per_byte).map(move |index| (byte >> (index * bits)) & mask))
+        .take(cells);
+    let mut values = Vec::with_capacity(cells);
+    for symbol in symbols {
+        let state = dictionary
+            .get(usize::from(symbol))
+            .copied()
+            .ok_or_else(|| invalid("packed section contains an undefined symbol"))?;
+        values.push(state);
+    }
+    Ok(SnapshotCells::Dense(values))
+}
+
+fn read_sections(
+    input: &mut Decoder<'_>,
+    cells: usize,
+    states: &[StateEntry],
+) -> EncodeResult<Vec<SnapshotSection>> {
     let count = read_items(input, MIN_SECTION_BYTES, "section")?;
     charge_vec::<SnapshotSection>(input, count)?;
     let mut sections: Vec<SnapshotSection> = Vec::with_capacity(count);
@@ -220,6 +330,9 @@ fn read_sections(input: &mut Decoder<'_>, cells: usize) -> EncodeResult<Vec<Snap
                     .map(|pair| BlockStateId(u16::from_le_bytes([pair[0], pair[1]])))
                     .collect();
                 SnapshotCells::Dense(list)
+            }
+            CELLS_PACKED if input.packed_snapshot_cells && cells > 1 => {
+                read_packed(input, cells, states)?
             }
             tag => return Err(invalid(format!("unknown section cell tag {tag}"))),
         };
@@ -284,4 +397,62 @@ fn read_components(input: &mut Decoder<'_>) -> EncodeResult<Vec<SnapshotComponen
         components.push(SnapshotComponent { schema, fields });
     }
     Ok(components)
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+    use crate::CodecLimits;
+    use torse_types::{ContentKey, FaultCode, OutputBudget};
+
+    fn states(count: u16) -> Vec<StateEntry> {
+        (1..=count)
+            .map(|id| StateEntry {
+                id: BlockStateId(2 * id),
+                block: ContentKey::parse("test:block").unwrap(),
+                values: vec![],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn packed_widths_preserve_sparse_ids_and_charge_expanded_cells() {
+        let limits = CodecLimits {
+            max_frame_bytes: 4096,
+            max_field_bytes: 4096,
+            max_depth: 8,
+        };
+        let budget = OutputBudget::new(64, 4096);
+        for count in [1, 2, 3, 4, 15] {
+            let states = states(count);
+            let per_byte = symbols_per_byte(&states).unwrap();
+            let cells: Vec<_> = (0..125)
+                .map(|i| BlockStateId(2 * (i % (count + 1))))
+                .collect();
+            let mut bytes = Vec::new();
+            let mut encoder = Encoder::new(&mut bytes, budget, limits);
+            write_packed(&mut encoder, &cells, &states, per_byte).unwrap();
+            assert_eq!(encoder.guard().used_bytes(), 250);
+            encoder.finish();
+            assert_eq!(bytes.len(), cells.len().div_ceil(per_byte));
+            let mut decoder = Decoder::new(&bytes, budget, limits);
+            assert_eq!(
+                read_packed(&mut decoder, cells.len(), &states).unwrap(),
+                SnapshotCells::Dense(cells)
+            );
+            let mut decoder = Decoder::new(&bytes, OutputBudget::new(64, 249), limits);
+            assert!(matches!(
+                read_packed(&mut decoder, 125, &states),
+                Err(e) if e.code == FaultCode::ResourceLimit
+            ));
+            let mut decoder = Decoder::new(&bytes[..bytes.len() - 1], budget, limits);
+            assert!(read_packed(&mut decoder, 125, &states).is_err());
+            *bytes.last_mut().unwrap() |= 0x80;
+            let mut decoder = Decoder::new(&bytes, budget, limits);
+            assert!(read_packed(&mut decoder, 125, &states).is_err());
+        }
+        let mut decoder = Decoder::new(&[3], budget, limits);
+        assert!(read_packed(&mut decoder, 4, &states(2)).is_err());
+        assert!(symbols_per_byte(&states(16)).is_none());
+    }
 }

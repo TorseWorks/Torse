@@ -3069,7 +3069,9 @@ dependencies = [
  "torse-protocol",
  "torse-render",
  "torse-runtime",
+ "torse-server",
  "torse-sim",
+ "torse-storage",
  "torse-types",
  "torse-ui",
  "torse-world",
@@ -3253,6 +3255,7 @@ dependencies = [
  "torse-storage",
  "torse-types",
  "torse-world",
+ "torse-world-services",
 ]
 
 [[package]]
@@ -3329,6 +3332,7 @@ dependencies = [
 name = "torse-world-services"
 version = "0.1.0"
 dependencies = [
+ "sha2",
  "torse-content",
  "torse-types",
  "torse-world",
