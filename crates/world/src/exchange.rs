@@ -22,9 +22,11 @@
 use std::collections::BTreeMap;
 
 use torse_types::{
-    BlockPos, CommitMeta, ContentKey, EntityId, ResumePoint, SectionPos, SnapshotMeta,
+    BlockPos, CommitMeta, ContentKey, EntityId, Fault, OutputBudget, ResumePoint, SectionPos,
+    SnapshotMeta,
 };
 
+use crate::archive::{ArchiveManifest, SnapshotArchive};
 use crate::component::{ComponentSchemas, ComponentSet, ComponentValue};
 use crate::entity::{ComponentBatch, ComponentEdit, EntityMove, EntityStore, Position};
 use crate::registry::{BlockStateId, BlockStateRegistry};
@@ -467,6 +469,35 @@ impl Snapshot {
         schemas: &ComponentSchemas,
     ) -> Result<RestoredWorld, ExchangeError> {
         self.validate_structure()?;
+        self.restore_validated(registry, schemas)
+    }
+
+    /// Restore a durable snapshot after checking its canonical structure,
+    /// archive budget and component persistence policy.
+    pub fn restore_persistent_with_budget(
+        &self,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+        budget: OutputBudget,
+    ) -> Result<RestoredWorld, Fault> {
+        SnapshotArchive::validate_legacy(self, &ArchiveManifest::default(), budget)?;
+        for component in self.entities.iter().flat_map(|entity| &entity.components) {
+            if !schemas
+                .persists(&component.schema)
+                .map_err(|error| Fault::invalid_data(error.to_string()))?
+            {
+                return Err(Fault::invalid_data("page contains transient components"));
+            }
+        }
+        self.restore_validated(registry, schemas)
+            .map_err(|error| Fault::invalid_data(error.to_string()))
+    }
+
+    fn restore_validated(
+        &self,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+    ) -> Result<RestoredWorld, ExchangeError> {
         schemas
             .validate_compatibility(self.meta.compatibility)
             .map_err(|error| ExchangeError::Store {

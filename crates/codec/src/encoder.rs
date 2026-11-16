@@ -15,6 +15,7 @@ pub struct Encoder<'a> {
     limits: CodecLimits,
     guard: BudgetGuard,
     committed: bool,
+    pub(crate) packed_snapshot_cells: bool,
 }
 
 impl<'a> Encoder<'a> {
@@ -26,6 +27,7 @@ impl<'a> Encoder<'a> {
             limits,
             guard: BudgetGuard::new(budget),
             committed: false,
+            packed_snapshot_cells: false,
         }
     }
 
@@ -86,6 +88,11 @@ impl<'a> Encoder<'a> {
     /// Count logical entries such as objects or collection elements.
     pub fn count_items(&mut self, items: u32) -> EncodeResult<()> {
         self.guard.charge_items(items)
+    }
+
+    /// Keep the original byte quota when the durable layout uses fewer bytes.
+    pub(crate) fn charge_saved_bytes(&mut self, bytes: usize) -> EncodeResult<()> {
+        self.guard.charge_bytes(bytes as u64)
     }
 
     /// Bytes appended by this encoder so far.

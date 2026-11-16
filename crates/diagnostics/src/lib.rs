@@ -18,16 +18,20 @@ pub enum Stage {
     Publication,
     Projection,
     Flush,
+    JournalAppend,
+    JournalSync,
 }
 
 impl Stage {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Planning,
         Self::Preparation,
         Self::Encoding,
         Self::Publication,
         Self::Projection,
         Self::Flush,
+        Self::JournalAppend,
+        Self::JournalSync,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -38,6 +42,8 @@ impl Stage {
             Self::Publication => "publication",
             Self::Projection => "projection",
             Self::Flush => "flush",
+            Self::JournalAppend => "journal_append",
+            Self::JournalSync => "journal_sync",
         }
     }
 }
@@ -60,7 +66,7 @@ pub struct Sample {
 
 #[derive(Clone, Debug)]
 pub struct Profile {
-    pub totals: [StageTotal; 6],
+    pub totals: [StageTotal; Stage::ALL.len()],
     /// Completion order; nested children precede their parent.
     pub samples: Vec<Sample>,
     /// Totals still include samples beyond the fixed retention limit.
@@ -83,7 +89,7 @@ impl SerialProfiler {
     pub fn new(max_samples: usize) -> Self {
         Self(Some(Arc::new(Mutex::new(State {
             profile: Profile {
-                totals: [StageTotal::default(); 6],
+                totals: [StageTotal::default(); Stage::ALL.len()],
                 samples: Vec::with_capacity(max_samples),
                 discarded_samples: 0,
             },
@@ -112,7 +118,7 @@ impl SerialProfiler {
     pub fn profile(&self) -> Profile {
         let Some(state) = &self.0 else {
             return Profile {
-                totals: [StageTotal::default(); 6],
+                totals: [StageTotal::default(); Stage::ALL.len()],
                 samples: Vec::new(),
                 discarded_samples: 0,
             };
@@ -126,14 +132,14 @@ impl SerialProfiler {
         if let Some(state) = &self.0 {
             let mut data = state.lock().expect("serial profiler lock");
             assert_eq!(data.active, 0, "clear requires completed serial spans");
-            data.profile.totals = [StageTotal::default(); 6];
+            data.profile.totals = [StageTotal::default(); Stage::ALL.len()];
             data.profile.samples.clear();
             data.profile.discarded_samples = 0;
             data.accounted_ns = 0;
         }
     }
 
-    pub fn totals(&self) -> [StageTotal; 6] {
+    pub fn totals(&self) -> [StageTotal; Stage::ALL.len()] {
         self.0
             .as_ref()
             .map(|state| state.lock().expect("serial profiler lock").profile.totals)
@@ -207,7 +213,10 @@ mod tests {
         );
         profiler.clear();
         assert!(profiler.profile().samples.is_empty());
-        assert_eq!(profiler.profile().totals, [StageTotal::default(); 6]);
+        assert_eq!(
+            profiler.profile().totals,
+            [StageTotal::default(); Stage::ALL.len()]
+        );
     }
 
     #[test]

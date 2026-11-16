@@ -3,8 +3,8 @@ use torse_content::{
     m0_fixture_pack,
 };
 use torse_types::{
-    CommitCursor, CommitSeq, Compatibility, ContentKey, Digest, EntityId, ReplicationDeclaration,
-    ResumePoint, SectionPos, SnapshotMeta, Tick, WorldId,
+    CommitCursor, CommitSeq, Compatibility, ContentKey, Digest, EntityId, FaultCode, OutputBudget,
+    ReplicationDeclaration, ResumePoint, SectionPos, SnapshotMeta, Tick, WorldId,
 };
 use torse_world::*;
 fn key(id: &str) -> ContentKey {
@@ -90,17 +90,16 @@ fn fixture() -> (Snapshot, BlockStateRegistry, ComponentSchemas) {
     )
 }
 fn rejected(snapshot: &Snapshot, registry: &BlockStateRegistry, schemas: &ComponentSchemas) {
+    let budget = OutputBudget::new(100_000, 8_000_000);
     assert!(snapshot.validate_structure().is_err());
     assert!(snapshot.restore(registry, schemas).is_err());
-    assert!(snapshot.persistent_view(schemas).is_err());
     assert!(
-        SnapshotArchive::import_legacy(
-            snapshot,
-            ArchiveManifest::default(),
-            torse_types::OutputBudget::new(100_000, 8_000_000)
-        )
-        .is_err()
+        snapshot
+            .restore_persistent_with_budget(registry, schemas, budget)
+            .is_err()
     );
+    assert!(snapshot.persistent_view(schemas).is_err());
+    assert!(SnapshotArchive::import_legacy(snapshot, ArchiveManifest::default(), budget).is_err());
 }
 
 #[test]
@@ -223,6 +222,28 @@ fn depth_nodes_and_bytes_are_checked_before_runtime_only_projection() {
     rejected(&value, &registry, &schemas);
     let projected = base.persistent_view(&schemas).unwrap();
     assert_eq!(projected.entities[0].components.len(), 1);
+    let budget = OutputBudget::new(100_000, 8_000_000);
+    assert!(matches!(
+        base.restore_persistent_with_budget(&registry, &schemas, budget),
+        Err(error) if error.code == FaultCode::InvalidData
+    ));
+    assert!(matches!(
+        projected.restore_persistent_with_budget(&registry, &schemas, OutputBudget::new(1, 128)),
+        Err(error) if error.code == FaultCode::ResourceLimit
+    ));
+    let restored = projected
+        .restore_persistent_with_budget(&registry, &schemas, budget)
+        .unwrap();
+    assert_eq!(
+        Snapshot::capture(
+            projected.meta,
+            &restored.store,
+            &restored.entities,
+            &registry
+        )
+        .unwrap(),
+        *projected
+    );
 }
 
 #[test]

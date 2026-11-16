@@ -219,22 +219,32 @@ impl Section {
         }
         let mut seen = [0u64; 1024];
         let mut distinct = 0;
+        let first = cells[0];
+        let mut second = first;
         for id in &cells {
             let word = &mut seen[id.0 as usize / 64];
             let bit = 1u64 << (id.0 % 64);
             if *word & bit == 0 {
                 *word |= bit;
                 distinct += 1;
+                if distinct == 2 {
+                    second = *id;
+                }
             }
             if distinct > crate::MAX_PALETTE_STATES {
                 break;
             }
         }
+        let packed = match distinct {
+            2 => crate::PaletteCells::build_binary(&cells, first, second),
+            3..=crate::MAX_PALETTE_STATES => {
+                crate::PaletteCells::build(cells.iter().copied(), cells.len())
+            }
+            _ => None,
+        };
         let storage = if distinct == 1 {
-            SectionStorage::Uniform(cells[0])
-        } else if distinct <= crate::MAX_PALETTE_STATES
-            && let Some(packed) = crate::PaletteCells::build(cells.iter().copied(), cells.len())
-        {
+            SectionStorage::Uniform(first)
+        } else if let Some(packed) = packed {
             SectionStorage::Palette(Box::new(packed))
         } else {
             SectionStorage::Dense(cells.into())
@@ -602,13 +612,21 @@ mod tests {
 
     #[test]
     fn imported_cells_match_dense_compaction_for_all_storage_classes() {
-        for states in [1, 2, 17, 257, 300] {
-            let cells: Vec<_> = (0..4096)
-                .map(|i| BlockStateId((i % states) as u16))
+        for (side, states) in [
+            (16u32, 1),
+            (2, 2),
+            (5, 2),
+            (16, 2),
+            (16, 17),
+            (16, 257),
+            (16, 300),
+        ] {
+            let cells: Vec<_> = (0..(side as usize).pow(3))
+                .map(|i| BlockStateId(u16::MAX - (i % states) as u16))
                 .collect();
             let expected =
-                Section::from_storage(16, SectionStorage::Dense(cells.clone().into())).unwrap();
-            let actual = Section::from_cells(16, cells).unwrap();
+                Section::from_storage(side, SectionStorage::Dense(cells.clone().into())).unwrap();
+            let actual = Section::from_cells(side, cells).unwrap();
             assert_eq!(actual.storage(), expected.storage());
             assert_eq!(actual.revision(), expected.revision());
         }

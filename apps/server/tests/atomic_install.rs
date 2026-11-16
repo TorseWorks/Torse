@@ -299,7 +299,9 @@ fn partial_append_and_failed_sync_recover_zero_or_whole_batch_above_confirmed_fl
         ));
         let floor = server.authority().unwrap().cursor().seq.0;
         counts.fail.store(mode, Ordering::SeqCst);
-        let batch = column(server.authority().unwrap(), 3, true);
+        let mut batch = column(server.authority().unwrap(), 3, true);
+        batch[0].sections[0].cells =
+            SnapshotCells::Dense((0..4096).map(|i| BlockStateId((i % 2) as u16)).collect());
         assert!(
             server
                 .install_section_batch(&pages, batch, &mut NoReplicas)
