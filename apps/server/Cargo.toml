@@ -20,6 +20,7 @@ torse-storage = { path = "../../crates/storage" }
 torse-types = { path = "../../crates/types" }
 torse-sim = { path = "../../crates/sim" }
 torse-world = { path = "../../crates/world" }
+torse-world-services = { path = "../../crates/world_services" }
 torse-protocol = { path = "../../crates/protocol" }
 torse-net = { path = "../../crates/net" }
 

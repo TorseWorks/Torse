@@ -1,0 +1,51 @@
+{
+  "date": "2026-11-13",
+  "source_commit": "adb65812491e555e61c5ab84003f628895886978",
+  "os": "Windows 11 Pro 10.0.26200",
+  "cpu": "Intel Core i9-14900HX",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "gpu_backend": "Vulkan",
+  "rust": "1.93.1",
+  "route": [
+    2,
+    3,
+    4,
+    5,
+    6,
+    5,
+    4,
+    3,
+    2
+  ],
+  "profiles": {
+    "cpu-route": "release",
+    "edits": "release",
+    "gpu-route-release": "release"
+  },
+  "gpu_resolution": [
+    128,
+    128
+  ],
+  "gpu_draw_timing_includes": [
+    "mirror apply",
+    "scene apply",
+    "mesh",
+    "upload",
+    "render",
+    "GPU readback",
+    "PNG write"
+  ],
+  "timing_limits": [
+    "one process per fixture",
+    "no thread affinity",
+    "no monitor present timestamp",
+    "in-process GPU route pauses host while drawing",
+    "incomplete boundary results retained",
+    "logical accounting is not RSS"
+  ],
+  "commands": [
+    "cargo test --release -p torse-world-services --test shared_lighting shared_light_edit_measurement --locked -- --ignored --nocapture",
+    "cargo test --release -p torse-server --test shared_lighting shared_light_fixed_route_measurement --locked -- --ignored --nocapture",
+    "cargo test --release -p torse-client --features gpu-tests shared_light_route_to_offscreen_draw --locked -- --ignored --nocapture"
+  ]
+}

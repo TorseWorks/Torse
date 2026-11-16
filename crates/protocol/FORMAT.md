@@ -1,10 +1,10 @@
-# 应用协议版本6
+# 应用协议版本7
 
 ## 独立显示地形
 
-版本6追加Terrain标签10。Hello拒绝版本1至5，双方须同时升级；codec/wire版本1与存档格式不变。近景仍使用Seed/Batch/Interest。Terrain不包含实体，不授予交互权限。
+版本6追加Terrain标签10，版本7增加匹配光照及Light标签11。Hello拒绝版本1至6，双方须同时升级；codec/wire版本1与存档格式不变。近景仍使用Seed/Batch/Interest。Terrain不包含实体，不授予交互权限。
 
-TerrainUpdate字段依次为Binding、generation:u64、seq:u64、through:CommitCursor、reset:Option<TerrainReset>、pages:Vec<TerrainPage<S>>、unavailable:Vec<(SectionPos,TerrainUnavailable)>。TerrainReset为有序唯一sections和retained:Vec<(SectionPos,Digest)>。TerrainPage为at:CommitCursor、digest:Digest、terrain:S；S含单个分区、使用到的状态字典和空实体列表。Digest为地形投影wire编码的SHA-256内容标记。可用性标签为0 Pending、1 Missing、2 Corrupt、3 Budget。
+TerrainUpdate字段依次为Binding、generation:u64、seq:u64、through:CommitCursor、reset:Option<TerrainReset>、pages:Vec<TerrainPage<S>>、unavailable:Vec<(SectionPos,TerrainUnavailable)>。TerrainReset为有序唯一sections和retained:Vec<(SectionPos,Digest)>。TerrainPage为at:CommitCursor、digest:Digest、terrain:S、light:Option<TerrainLight>；S含单个分区、使用到的状态字典和空实体列表。Digest为地形投影wire编码的SHA-256内容标记。可用性标签为0 Pending、1 Missing、2 Corrupt、3 Budget。
 
 范围替换提高generation，从seq=1和reset开始；同代seq连续增长，through可相等但不能倒退。新范围只能保留reset列出且标记一致的页；保留证明确认内容在through仍有效。其他旧页清除。近景变化设置显示页版本下界，晚到页低于下界时隐藏，近景始终优先。非法绑定、重复、乱序、无效引用和超额输入原子拒绝，应用丢弃连接镜像并重连，宿主重新批准范围。
 
@@ -14,7 +14,7 @@ TerrainUpdate字段依次为Binding、generation:u64、seq:u64、through:CommitC
 
 | 客户端标签 | 字段顺序 |
 |---|---|
-| 0 Hello | protocol_version:u16=6、Compatibility |
+| 0 Hello | protocol_version:u16=7、Compatibility |
 | 1 Request | RequestSeq:u64、泛型输入I |
 | 2 Subscribe | SectionPos的有界Vec |
 | 3 Unsubscribe | SubscriptionId:u128 |
@@ -37,6 +37,7 @@ TerrainUpdate字段依次为Binding、generation:u64、seq:u64、through:CommitC
 | 8 ControlAck | seq:u64、accepted:bool |
 | 9 Interest | ReplicaBatch<C>，其中presentation必须为空 |
 | 10 Terrain | TerrainUpdate<S>，只读地形独立顺序流 |
+| 11 Light | TerrainLightUpdate，匹配地形内容的区段光照更新 |
 
 接纳状态为0 + target_tick:u64、1表示Duplicate、2 + RejectCode表示Rejected。元数据和容器按codec显式基础编码，应用层本版绑定I=Call、O=Reply、S=ReplicaSnapshot、C=ReplicaChanges，见../codec/EXECUTION.md。
 
@@ -66,7 +67,7 @@ Ping仅在Hello成功后接纳，没有响应、不占RequestSeq、不写日志�
 
 应用时序须满足`idle_ticks * tick_period >= 3 * heartbeat_interval`。演示配置为1200个Tick、50毫秒一个Tick、10秒心跳，空闲上限为60秒。停发后仍按原空闲规则回收连接。未握手连接也受空闲上限约束，Ping不能延长其占位。
 
-Ping在应用协议版本2加入，当前协议版本6在Hello阶段拒绝旧版本混用。codec/wire版本保持1，既有标签顺序、存档及执行记录布局不变；未知消息标签仍拒绝。
+Ping在应用协议版本2加入，当前协议版本7在Hello阶段拒绝旧版本混用。codec/wire版本保持1，既有标签顺序、存档及执行记录布局不变；未知消息标签仍拒绝。
 
 ## 提交呈现事件
 
@@ -93,3 +94,10 @@ Seed只包含状态。重连、订阅重建和新epoch都从新基线开始，�
 修改批准权限前，Transport::output_idle须确认没有未交付的应用/TLS缓冲；MemoryTransport检查共享出站队列，TCP检查未完成帧和TLS待写记录，未知适配器默认返回false。非空、竞争或未知状态直接关闭并清空连接，客户端重连取Seed，不能跳过协议控制帧或截断帧继续运行。已被对端读取或Socket接受的数据无法撤回，空闲判定不表示网络对端已确认接收。库宿主绕过NetworkHub调用change_session_interest时须自行执行同样的下游输出屏障。
 
 范围进入尚未驻留的页、驻留失效、超预算和编码/发送失败可能要求重建基线或关闭；协议不保存兴趣历史，不追溯播放事件。所有成功切换仍受既有快照、复制输出和连接预算限制，未确认世界进度不外发。
+
+
+## 共享区段光照（协议7）
+
+版本7在TerrainPage的terrain之后增加light:Option<TerrainLight>，与版本6不兼容；Hello必须精确匹配版本，双方同时升级，存档格式不变。TerrainLight依次为pos:SectionPos、terrain:Digest、generation:u64、rules:u32、complete:bool、emitted:Vec<u8>、sky:Vec<u8>。两个数组按地形线性次序排列，各恰好side³项，值为0..15；generation非零，当前rules为1。terrain引用当前地形页摘要，generation同时区分邻界依赖变化。
+
+Light消息依次为binding:Binding、interest_generation:u64、seq:u64、pages:Vec<TerrainLight>。pages按坐标严格递增；兴趣代数必须等于当前Terrain代数，seq从1连续增加，在Terrain重置后重新开始。接收端原子拒绝非法内容、丢失或乱序消息并要求重建显示基线；结构有效但地形摘要不匹配或发布代数陈旧的结果丢弃，不安装或保留载荷。发送端先发送地形；首批没有已就绪匹配光照时地形不等待。光照待就绪后独立发送，接收端不为光照提前激活地形。远景光照不改变权威镜像，近景覆盖远景时移除远景光照。

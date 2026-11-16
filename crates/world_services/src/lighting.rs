@@ -6,10 +6,19 @@
 //! Skylight additionally observes bounded columns up to the world ceiling.
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use torse_types::{Binding, BlockPos, Digest, Fault, Revision, SectionPos};
+use torse_types::{Binding, BlockPos, Digest, Fault, SectionPos};
+
+mod source;
+pub use source::{LightInputVersion, LightSource};
+mod terrain;
+pub use terrain::LightTerrain;
+mod incremental;
+mod shared;
+pub use shared::{LightFieldDiagnostics, LightFieldLimits, LightPublication, SharedLightField};
 use torse_world::{BlockStateRegistry, SectionPhase, SectionStore, TerrainQuery, WorldBounds};
 
 pub const MAX_LIGHT: u8 = 15;
+pub const LIGHT_RULES_VERSION: u32 = 1;
 static NEXT_CACHE: AtomicU64 = AtomicU64::new(1);
 
 fn next_cache_identity(counter: &AtomicU64) -> Result<u64, Fault> {
@@ -37,27 +46,35 @@ pub struct LightLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Dependency {
     pos: SectionPos,
-    revision: Option<Revision>,
-    readable: bool,
+    version: LightInputVersion,
 }
 
 #[derive(Clone, Debug)]
 struct Observation {
     binding: Binding,
+    rules: u32,
     content: Digest,
     side: u32,
     bounds: WorldBounds,
     dependencies: Vec<Dependency>,
 }
 impl Observation {
-    fn valid(&self, binding: Binding, store: &SectionStore, registry: &BlockStateRegistry) -> bool {
+    fn valid(
+        &self,
+        binding: Binding,
+        store: &(impl LightSource + ?Sized),
+        registry: &BlockStateRegistry,
+    ) -> bool {
         self.binding == binding
+            && store.binding().is_none_or(|b| b == binding)
+            && self.rules == store.rules_version()
             && self.content == registry.authority_digest()
             && self.side == store.side()
             && self.bounds == store.bounds()
-            && self.dependencies.iter().all(|d| {
-                store.revision(d.pos) == d.revision && readable(store, d.pos) == d.readable
-            })
+            && self
+                .dependencies
+                .iter()
+                .all(|d| store.version(d.pos) == d.version)
     }
     fn bytes(&self) -> usize {
         self.dependencies.capacity() * size_of::<Dependency>()
@@ -89,6 +106,19 @@ pub struct LightSection {
     complete: bool,
 }
 impl LightSection {
+    pub fn dependencies(&self) -> impl Iterator<Item = SectionPos> + '_ {
+        self.observed.dependencies.iter().map(|d| d.pos)
+    }
+    pub fn rules_version(&self) -> u32 {
+        self.observed.rules
+    }
+    pub fn input_version(&self) -> Option<LightInputVersion> {
+        self.observed
+            .dependencies
+            .iter()
+            .find(|d| d.pos == self.target)
+            .map(|d| d.version)
+    }
     /// Borrow resolved cells in the store's linear order after validating this observation.
     pub fn levels(&self) -> &[u8] {
         &self.levels
@@ -105,7 +135,7 @@ impl LightSection {
     pub fn validate(
         &self,
         binding: Binding,
-        store: &SectionStore,
+        store: &(impl LightSource + ?Sized),
         registry: &BlockStateRegistry,
     ) -> bool {
         self.observed.valid(binding, store, registry)
@@ -127,11 +157,12 @@ pub struct LightJob {
     failed: bool,
     sky: bool,
     sky_columns: Vec<u8>,
+    incremental: Option<incremental::Incremental>,
 }
 impl LightJob {
     pub fn prepare(
         binding: Binding,
-        store: &SectionStore,
+        store: &(impl LightSource + ?Sized),
         registry: &BlockStateRegistry,
         target: SectionPos,
         limits: LightLimits,
@@ -143,7 +174,7 @@ impl LightJob {
     /// block the column. Lateral propagation still loses at least one level.
     pub fn prepare_sky(
         binding: Binding,
-        store: &SectionStore,
+        store: &(impl LightSource + ?Sized),
         registry: &BlockStateRegistry,
         target: SectionPos,
         limits: LightLimits,
@@ -153,13 +184,20 @@ impl LightJob {
 
     fn prepare_kind(
         binding: Binding,
-        store: &SectionStore,
+        store: &(impl LightSource + ?Sized),
         registry: &BlockStateRegistry,
         target: SectionPos,
         limits: LightLimits,
         sky: bool,
     ) -> Result<Self, Fault> {
-        if !readable(store, target) {
+        SectionStore::new(store.side(), store.bounds()).map_err(invalid)?;
+        if store.rules_version() == 0 || store.binding().is_some_and(|b| b != binding) {
+            return Err(Fault::invalid_data("incompatible lighting source"));
+        }
+        if !matches!(
+            store.version(target),
+            LightInputVersion::Content(_) | LightInputVersion::Resident { readable: true, .. }
+        ) {
             return Err(Fault::invalid_data("lighting target is not loaded"));
         }
         if limits.cells == 0
@@ -230,7 +268,7 @@ impl LightJob {
         let bytes = size_of::<Self>()
             + cells * 2
             + frontier * size_of::<(u8, u32)>()
-            + deps * size_of::<Dependency>()
+            + 2 * deps * size_of::<Dependency>()
             + (store.side() as usize).pow(3)
             + size_of::<LightSection>()
             + if sky { dims[0] * dims[2] } else { 0 };
@@ -246,8 +284,7 @@ impl LightJob {
                     let pos = SectionPos::new(x, y, z);
                     dependencies.push(Dependency {
                         pos,
-                        revision: store.revision(pos),
-                        readable: readable(store, pos),
+                        version: store.version(pos),
                     });
                 }
             }
@@ -256,6 +293,7 @@ impl LightJob {
             target,
             observed: Observation {
                 binding,
+                rules: store.rules_version(),
                 content: registry.authority_digest(),
                 side: store.side(),
                 bounds,
@@ -276,6 +314,7 @@ impl LightJob {
             } else {
                 Vec::new()
             },
+            incremental: None,
         })
     }
 
@@ -284,7 +323,7 @@ impl LightJob {
     pub fn poll(
         &mut self,
         binding: Binding,
-        store: &SectionStore,
+        store: &(impl LightSource + ?Sized),
         registry: &BlockStateRegistry,
         work: usize,
     ) -> Result<bool, Fault> {
@@ -300,10 +339,13 @@ impl LightJob {
     }
     fn advance(
         &mut self,
-        store: &SectionStore,
+        store: &(impl LightSource + ?Sized),
         registry: &BlockStateRegistry,
         work: usize,
     ) -> Result<bool, Fault> {
+        if self.incremental.as_ref().is_some_and(|i| i.scan.is_some()) {
+            return self.advance_update(store, registry, work);
+        }
         for _ in 0..work {
             if self.seeded < self.levels.len() {
                 let index = if self.sky {
@@ -344,6 +386,10 @@ impl LightJob {
                     if level > 0 {
                         self.push(level, index)?;
                     }
+                }
+                if let Some(incremental) = self.incremental.as_mut() {
+                    incremental.seeds[index] = self.levels[index];
+                    incremental.direct[index] = direct_absorption;
                 }
                 self.seeded += 1;
             } else if let Some((level, index)) = self.queue.pop() {
@@ -410,12 +456,21 @@ impl LightJob {
     pub fn finish(
         self,
         binding: Binding,
-        store: &SectionStore,
+        store: &(impl LightSource + ?Sized),
+        registry: &BlockStateRegistry,
+    ) -> Result<LightSection, Fault> {
+        self.capture(binding, store, registry)
+    }
+    pub(super) fn capture(
+        &self,
+        binding: Binding,
+        store: &(impl LightSource + ?Sized),
         registry: &BlockStateRegistry,
     ) -> Result<LightSection, Fault> {
         if self.failed
             || self.seeded != self.levels.len()
             || !self.queue.is_empty()
+            || self.incremental.as_ref().is_some_and(|i| i.scan.is_some())
             || !self.observed.valid(binding, store, registry)
         {
             return Err(Fault::invalid_data("lighting job is incomplete or stale"));
@@ -447,7 +502,7 @@ impl LightJob {
         }
         Ok(LightSection {
             target: self.target,
-            observed: self.observed,
+            observed: self.observed.clone(),
             levels,
             complete: self.complete,
         })
@@ -469,7 +524,7 @@ impl LightCache {
     pub fn section(
         &self,
         binding: Binding,
-        store: &SectionStore,
+        store: &(impl LightSource + ?Sized),
         registry: &BlockStateRegistry,
         target: SectionPos,
     ) -> Option<&LightSection> {
@@ -497,7 +552,7 @@ impl LightCache {
     pub fn publish(
         &mut self,
         section: LightSection,
-        store: &SectionStore,
+        store: &(impl LightSource + ?Sized),
         registry: &BlockStateRegistry,
     ) -> Result<LightStamp, Fault> {
         if !section.validate(self.binding, store, registry) {
@@ -534,7 +589,7 @@ impl LightCache {
         &self,
         stamp: LightStamp,
         binding: Binding,
-        store: &SectionStore,
+        store: &(impl LightSource + ?Sized),
         registry: &BlockStateRegistry,
     ) -> bool {
         self.binding == binding
@@ -547,7 +602,7 @@ impl LightCache {
     pub fn sample(
         &self,
         binding: Binding,
-        store: &SectionStore,
+        store: &(impl LightSource + ?Sized),
         registry: &BlockStateRegistry,
         pos: BlockPos,
     ) -> LightQuery {

@@ -7,7 +7,7 @@
 //! - [`collision`] answers and moves against block collision shapes.
 //!
 //! Navigation provides a bounded lattice search with caller-supplied traversal policy.
-//! Lighting provides bounded emitted-light jobs and revision-checked derived caches.
+//! Lighting provides bounded sky/emission jobs, content-validated inputs and shared incremental fields.
 //! Streaming policy remains an application responsibility.
 
 #![forbid(unsafe_code)]

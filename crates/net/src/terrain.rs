@@ -22,6 +22,7 @@ pub struct TerrainMirror {
     limits: TerrainLimits,
     generation: u64,
     seq: u64,
+    light_seq: u64,
     through: CommitCursor,
     desired: BTreeSet<SectionPos>,
     pages: BTreeMap<SectionPos, TerrainPage<ReplicaSnapshot>>,
@@ -95,6 +96,7 @@ impl TerrainMirror {
             limits,
             generation: 0,
             seq: 0,
+            light_seq: 0,
             through: CommitCursor::initial(binding.world),
             desired: BTreeSet::new(),
             pages: BTreeMap::new(),
@@ -120,6 +122,67 @@ impl TerrainMirror {
             .iter()
             .filter(|(pos, p)| self.floors.get(pos).is_none_or(|floor| p.at.seq >= *floor))
             .map(|(_, p)| &p.terrain)
+    }
+    pub fn light(&self, pos: SectionPos) -> Option<&TerrainLight> {
+        self.pages
+            .get(&pos)
+            .filter(|_| self.page(pos).is_some())
+            .and_then(|p| p.light.as_ref())
+    }
+    /// Structural failures are atomic. A well-formed light page for another
+    /// terrain version is discarded without installing or retaining its buffers.
+    pub fn apply_light(&mut self, update: TerrainLightUpdate) -> Result<TerrainChanges, Fault> {
+        if update.binding != self.binding
+            || update.interest_generation != self.generation
+            || update.seq != self.light_seq.checked_add(1).ok_or_else(invalid)?
+            || update.pages.len() > self.limits.max_sections
+            || !sorted(update.pages.iter().map(|p| p.pos))
+        {
+            return Err(invalid());
+        }
+        for page in &update.pages {
+            validate_light(page, self.side)?;
+        }
+        let mut bytes = self.bytes;
+        for page in &update.pages {
+            if let Some(old) = self.pages.get(&page.pos)
+                && old.digest == page.terrain
+                && self.page(page.pos).is_some()
+                && old
+                    .light
+                    .as_ref()
+                    .is_none_or(|l| l.generation < page.generation)
+            {
+                bytes = bytes
+                    .saturating_sub(light_bytes(old.light.as_ref()))
+                    .saturating_add(light_bytes(Some(page)));
+            }
+        }
+        if bytes > self.limits.max_bytes {
+            return Err(Fault::resource_limit("display light cache budget"));
+        }
+        let mut changed = Vec::new();
+        for page in update.pages {
+            if self.page(page.pos).is_none() {
+                continue;
+            }
+            if let Some(old) = self.pages.get_mut(&page.pos)
+                && old.digest == page.terrain
+                && old
+                    .light
+                    .as_ref()
+                    .is_none_or(|l| l.generation < page.generation)
+            {
+                changed.push(page.pos);
+                old.light = Some(page);
+            }
+        }
+        self.bytes = bytes;
+        self.light_seq = update.seq;
+        Ok(TerrainChanges {
+            changed,
+            removed: Vec::new(),
+        })
     }
     /// A delayed far response cannot overwrite newer near terrain. Keep its
     /// content hidden until a sufficiently fresh page or retained-content proof.
@@ -198,6 +261,12 @@ impl TerrainMirror {
         let mut incoming = BTreeMap::new();
         let mut input_bytes = 0u64;
         for page in update.pages {
+            if let Some(light) = &page.light {
+                validate_light(light, self.side)?;
+                if light.pos != page.terrain.sections[0].pos || light.terrain != page.digest {
+                    return Err(invalid());
+                }
+            }
             let pos = page.terrain.sections[0].pos;
             input_bytes = input_bytes.saturating_add(terrain_bytes(&page.terrain));
             if input_bytes > self.limits.max_bytes {
@@ -233,7 +302,20 @@ impl TerrainMirror {
             {
                 continue;
             }
-            incoming.insert(pos, TerrainPage { terrain, ..page });
+            let mut checked = TerrainPage { terrain, ..page };
+            if let Some(old) = self
+                .pages
+                .get(&pos)
+                .filter(|old| old.digest == checked.digest)
+                && let Some(light) = &old.light
+                && checked
+                    .light
+                    .as_ref()
+                    .is_some_and(|incoming| incoming.generation < light.generation)
+            {
+                checked.light = Some(light.clone());
+            }
+            incoming.insert(pos, checked);
         }
         let keep = |pos: &SectionPos| {
             desired.contains(pos)
@@ -247,12 +329,12 @@ impl TerrainMirror {
             .filter(|(pos, _)| keep(pos))
             .fold(0u64, |n, (_, p)| {
                 n.saturating_add(terrain_bytes(&p.terrain))
+                    .saturating_add(light_bytes(p.light.as_ref()))
             })
-            .saturating_add(
-                incoming
-                    .values()
-                    .fold(0u64, |n, p| n.saturating_add(terrain_bytes(&p.terrain))),
-            )
+            .saturating_add(incoming.values().fold(0u64, |n, p| {
+                n.saturating_add(terrain_bytes(&p.terrain))
+                    .saturating_add(light_bytes(p.light.as_ref()))
+            }))
             .saturating_add(desired.len() as u64 * 128);
         if bytes > self.limits.max_bytes {
             return Err(Fault::resource_limit("display terrain cache budget"));
@@ -283,11 +365,30 @@ impl TerrainMirror {
         self.floors.retain(|p, _| self.desired.contains(p));
         self.bytes = bytes;
         self.generation = update.generation;
+        if update.reset.is_some() {
+            self.light_seq = 0;
+        }
         self.seq = update.seq;
         self.through = update.through;
         changes.changed.sort_unstable();
         changes.changed.dedup();
         changes.removed.sort_unstable();
         Ok(changes)
+    }
+}
+fn light_bytes(page: Option<&TerrainLight>) -> u64 {
+    page.map_or(0, |p| 128 + p.emitted.len() as u64 + p.sky.len() as u64)
+}
+fn validate_light(page: &TerrainLight, side: u32) -> Result<(), Fault> {
+    let cells = (side as usize).pow(3);
+    if page.rules != 1
+        || page.generation == 0
+        || page.emitted.len() != cells
+        || page.sky.len() != cells
+        || page.emitted.iter().chain(&page.sky).any(|&v| v > 15)
+    {
+        Err(invalid())
+    } else {
+        Ok(())
     }
 }
