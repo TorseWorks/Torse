@@ -78,6 +78,7 @@
 | [只读兼容预检](persistence/M3-readonly-preflight.md) | 只读兼容预检 |
 | [分区存储压缩](persistence/M3-section-compression.md) | 分区存储压缩 |
 | [持久分区装卸](persistence/M3-section-streaming.md) | 持久分区装卸 |
+| [生成整列直接停放对照](residency/generated-parking-20261112.md) | 真实文件页与日志同步、宿主调用及索引增长 |
 | [稠密分区恢复对照](residency/dense-install-tail-20261111.md) | 混合密度整列安装、恢复准备优化和耐久等待 |
 | [整列安装日志压缩对照](residency/dense-install-journal-20261111.md) | 日志追加与同步分项、实际写入量和恢复验证 |
 | [会话范围与旧订阅失效](persistence/M3-session-scope.md) | 会话范围与旧订阅失效 |

@@ -17,6 +17,7 @@ impl<C: StorageCodec<ExecutionModel> + Clone> FileServer<ExecutionHost, C> {
         retain: usize,
     ) -> Result<PageCollection, Fault> {
         if retain == 0
+            || self.parking.is_some()
             || !self.authority()?.residency_ready(false)
             || self
                 .residency
@@ -44,6 +45,14 @@ impl<C: StorageCodec<ExecutionModel> + Clone> FileServer<ExecutionHost, C> {
             Ok(())
         })?;
         self.journal.visit_retained(|record| {
+            for section in record
+                .changes
+                .sections
+                .iter()
+                .filter(|section| !section.load)
+            {
+                trace(section.reference.digest)?;
+            }
             if let Some(section) = record.changes.section
                 && !section.fresh
             {

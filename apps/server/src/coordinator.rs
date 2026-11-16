@@ -102,6 +102,7 @@ pub struct Server<A: HostAuthority, J, S> {
     pub(crate) profiler: SerialProfiler,
     pub(crate) commit_batch_limit: u32,
     pub(crate) residency: Option<crate::residency::ResidencyScheduler>,
+    pub(crate) parking: Option<crate::parking::ParkingJob>,
     pub(crate) storage_memory: Option<torse_types::MemoryLease>,
     _directory: WorldDirectory,
 }
@@ -162,6 +163,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
             profiler: SerialProfiler::default(),
             commit_batch_limit: 1,
             residency: None,
+            parking: None,
             storage_memory: None,
             _directory: directory,
         })

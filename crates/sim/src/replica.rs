@@ -247,6 +247,13 @@ impl ReplicaSource {
         Ok(publication)
     }
 
+    pub fn publish_parked_sections(
+        &mut self,
+        prepared: crate::streaming::PreparedSections,
+    ) -> Result<Publication, CommitFault> {
+        self.world.publish_parked_sections(prepared)
+    }
+
     pub fn new(
         world: WorldAuthority,
         binding: Binding,

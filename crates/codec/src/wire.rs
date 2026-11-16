@@ -13,6 +13,7 @@ use torse_world::*;
 
 pub const EXECUTION_VERSION: u16 = 1;
 pub const EXECUTION_COMMIT_VERSION: u16 = 4;
+const PARKED_EXECUTION_COMMIT_VERSION: u16 = 6;
 pub const PACKED_EXECUTION_COMMIT_VERSION: u16 = 5;
 pub const EXECUTION_SNAPSHOT_VERSION: u16 = 2;
 pub trait Wire: Sized {
@@ -1026,13 +1027,20 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
         };
         let mut encoder = Encoder::new(out, b, self.limits);
         encoder.count_items(1)?;
-        let packed = v
+        let parking = v
             .changes
             .sections
-            .iter()
-            .any(|change| crate::snapshot::has_packable_cells(&change.page));
+            .first()
+            .is_some_and(|change| !change.load);
+        let packed = !parking
+            && v.changes
+                .sections
+                .iter()
+                .any(|change| crate::snapshot::has_packable_cells(&change.page));
         encoder.packed_snapshot_cells = packed;
-        encoder.write_u16(if packed {
+        encoder.write_u16(if parking {
+            PARKED_EXECUTION_COMMIT_VERSION
+        } else if packed {
             PACKED_EXECUTION_COMMIT_VERSION
         } else {
             EXECUTION_COMMIT_VERSION
@@ -1048,7 +1056,8 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
         let mut d = Decoder::new(v, b, self.limits);
         d.charge_items(1)?;
         d.charge_bytes(size_of::<ModelCommit<M>>() as u64)?;
-        let v = match d.read_u16()? {
+        let version = d.read_u16()?;
+        let v = match version {
             EXECUTION_VERSION => CommitRecord {
                 meta: Wire::read(&mut d)?,
                 changes: ExecutionChanges {
@@ -1082,13 +1091,24 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
                     sections: Vec::new(),
                 },
             },
-            EXECUTION_COMMIT_VERSION => ModelCommit::<M>::read(&mut d)?,
+            EXECUTION_COMMIT_VERSION | PARKED_EXECUTION_COMMIT_VERSION => {
+                ModelCommit::<M>::read(&mut d)?
+            }
             PACKED_EXECUTION_COMMIT_VERSION => {
                 d.packed_snapshot_cells = true;
                 ModelCommit::<M>::read(&mut d)?
             }
             _ => return Err(Fault::incompatible("execution commit version")),
         };
+        let parking = version == PARKED_EXECUTION_COMMIT_VERSION;
+        if (parking && (v.changes.sections.is_empty() || v.changes.section.is_some()))
+            || v.changes
+                .sections
+                .iter()
+                .any(|change| change.load == parking)
+        {
+            return Err(invalid("execution commit section operation"));
+        }
         if !d.is_complete() {
             return Err(invalid("trailing execution commit bytes"));
         }

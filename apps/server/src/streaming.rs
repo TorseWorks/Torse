@@ -208,6 +208,13 @@ mod cost_tests {
 }
 
 impl ExecutionHost {
+    pub(crate) fn queue_parked_sections(
+        &mut self,
+        changes: Vec<SectionChange>,
+    ) -> Result<(), Fault> {
+        self.section_pending = Some(self.prepare_section_batch(changes)?);
+        Ok(())
+    }
     pub fn parked_sections(&self) -> &BTreeMap<SectionPos, ParkedSection> {
         &self.parked
     }
@@ -293,6 +300,11 @@ impl ExecutionHost {
         &self,
         change: SectionChange,
     ) -> Result<ExecutionPrepared, Fault> {
+        if change.fresh && !change.load {
+            return Err(Fault::invalid_data(
+                "direct parking requires a generated batch",
+            ));
+        }
         let _codec = self
             .memory_pool()
             .map(|pool| {
@@ -340,8 +352,9 @@ impl ExecutionHost {
         Ok(prepared)
     }
     fn check_residency(&self, change: &SectionChange) -> Result<(), Fault> {
+        let unload = !change.load && !change.fresh;
         if !self.at_tick_boundary()
-            || (!change.load && !self.pending.is_empty())
+            || (unload && !self.pending.is_empty())
             || self.frozen.is_some()
             || self.stopping.is_some()
             || self.section_pending.is_some()
@@ -351,7 +364,7 @@ impl ExecutionHost {
             ));
         }
         check_reference(change, &self.parked)?;
-        if !change.load
+        if unload
             && self.runtime.events.iter().any(|event| {
                 event
                     .event
@@ -366,7 +379,7 @@ impl ExecutionHost {
         if change.load && self.world().store().len() >= MAX_RESIDENT {
             return Err(Fault::resource_limit("resident section capacity"));
         }
-        if !change.load {
+        if unload {
             let mut candidate = self.parked.clone();
             candidate.insert(change.page.sections[0].pos, change.reference.clone());
             wire::measure_inner(&candidate, self.limits.runtime, self.limits.codec)?;
@@ -374,7 +387,7 @@ impl ExecutionHost {
         Ok(())
     }
 
-    fn prepare_section_batch(
+    pub(super) fn prepare_section_batch(
         &self,
         changes: Vec<SectionChange>,
     ) -> Result<ExecutionPrepared, Fault> {
@@ -383,11 +396,21 @@ impl ExecutionHost {
                 "generated batch exceeds section limit",
             ));
         }
-        if self.world().store().len().saturating_add(changes.len()) > MAX_RESIDENT {
+        let load = changes[0].load;
+        if changes
+            .iter()
+            .any(|change| !change.fresh || change.load != load)
+        {
+            return Err(Fault::invalid_data("mixed generated batch operation"));
+        }
+        if load && self.world().store().len().saturating_add(changes.len()) > MAX_RESIDENT {
             return Err(Fault::resource_limit("resident section capacity"));
         }
         for change in &changes {
             self.check_residency(change)?;
+        }
+        if !load {
+            check_parked_additions(&self.parked, &changes, self.limits)?;
         }
         let _codec = self
             .memory_pool()
@@ -401,10 +424,14 @@ impl ExecutionHost {
             .transpose()?;
         // Bound the full input before the world decodes or clones individual pages.
         let sections_cost = wire::measure_inner(&changes, self.limits.runtime, self.limits.codec)?;
-        let world = self.world().prepare_generated_sections_iter(
-            changes.iter().map(|c| &c.page),
-            self.limits.runtime,
-        )?;
+        let pages = changes.iter().map(|c| &c.page);
+        let world = if load {
+            self.world()
+                .prepare_generated_sections_iter(pages, self.limits.runtime)?
+        } else {
+            self.world()
+                .prepare_parked_sections(pages, self.limits.runtime)?
+        };
         let meta = world.meta();
         let empty = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
             .map_err(|e| Fault::invalid_data(e.to_string()))?;
@@ -446,6 +473,32 @@ pub(crate) fn reference(page: &Snapshot, digest: Digest) -> ParkedSection {
         entities: page.entities.iter().map(|e| e.id).collect(),
     }
 }
+fn check_parked_additions(
+    parked: &BTreeMap<SectionPos, ParkedSection>,
+    changes: &[SectionChange],
+    limits: ExecutionLimits,
+) -> Result<(), Fault> {
+    let additions: BTreeMap<_, _> = changes
+        .iter()
+        .map(|change| (change.page.sections[0].pos, change.reference.clone()))
+        .collect();
+    let budget = limits.runtime;
+    let base = wire::measure_inner(parked, budget, limits.codec)?;
+    let added = wire::measure_inner(&additions, budget, limits.codec)?;
+    if additions.len() != changes.len()
+        || base
+            .encoded_bytes
+            .saturating_add(added.encoded_bytes.saturating_sub(4))
+            > budget
+                .max_bytes
+                .min(u64::from(limits.codec.max_frame_bytes))
+        || base.owned_bytes.saturating_add(added.owned_bytes) > budget.max_bytes
+        || base.items.saturating_add(added.items) > budget.max_items
+    {
+        return Err(Fault::resource_limit("parked section index budget"));
+    }
+    Ok(())
+}
 fn check_reference(
     change: &SectionChange,
     parked: &BTreeMap<SectionPos, ParkedSection>,
@@ -457,7 +510,7 @@ fn check_reference(
     }
     let pos = change.page.sections[0].pos;
     let valid = if change.fresh {
-        change.load && !parked.contains_key(&pos)
+        !parked.contains_key(&pos)
     } else if change.load {
         parked.get(&pos) == Some(&change.reference)
     } else {
@@ -592,10 +645,11 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         pos: SectionPos,
         sink: &mut impl InvalidationSink,
     ) -> Result<CommitStep, Fault> {
-        if self
-            .residency
-            .as_ref()
-            .is_some_and(|scheduler| !scheduler.is_idle())
+        if self.parking.is_some()
+            || self
+                .residency
+                .as_ref()
+                .is_some_and(|scheduler| !scheduler.is_idle())
         {
             return Err(Fault::invalid_data("page I/O is in flight"));
         }
@@ -747,6 +801,11 @@ impl ExecutionRecovery<'_> {
         record: CommitRecord<ExecutionChanges>,
     ) -> Result<(), Fault> {
         let change = record.changes.section.as_ref().expect("section replay");
+        if change.fresh && !change.load {
+            return Err(Fault::invalid_data(
+                "direct parking requires a generated batch",
+            ));
+        }
         let before = self
             .runtime
             .as_ref()
@@ -852,18 +911,30 @@ impl ExecutionRecovery<'_> {
             .section_pages
             .as_ref()
             .ok_or_else(|| Fault::invalid_data("missing section pages"))?;
+        let load = changes.sections[0].load;
         for change in &changes.sections {
             check_reference(change, &self.parked)?;
             if !change.fresh
-                || !change.load
+                || change.load != load
                 || store.digest(&change.page)? != change.reference.digest
             {
                 return Err(Fault::invalid_data("invalid generated batch page"));
             }
         }
         let pages: Vec<_> = changes.sections.iter().map(|c| c.page.clone()).collect();
-        self.recovery
-            .replay_generated_sections(&changes.world, &pages, self.limits.runtime)
+        if load {
+            self.recovery
+                .replay_generated_sections(&changes.world, &pages, self.limits.runtime)
+        } else {
+            check_parked_additions(&self.parked, &changes.sections, self.limits)?;
+            self.recovery
+                .replay_parked_sections(&changes.world, &pages, self.limits.runtime)?;
+            for change in &changes.sections {
+                self.parked
+                    .insert(change.page.sections[0].pos, change.reference.clone());
+            }
+            Ok(())
+        }
     }
 
     pub(super) fn validate_parked(&self) -> Result<(), Fault> {
