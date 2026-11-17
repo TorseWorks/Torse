@@ -1915,7 +1915,10 @@ impl ApplicationHandler for WindowApp {
             let handshake = connection
                 .set_terrain_limits(torse_net::terrain::TerrainLimits {
                     max_sections: 4096,
-                    max_bytes: (self.config.memory_mib * 1024 * 1024 / 8).min(64 * 1024 * 1024),
+                    max_bytes: (self.config.memory_mib * 1024 * 1024 / 8)
+                        .min(64 * 1024 * 1024)
+                        .saturating_sub(4 * 1024 * 1024),
+                    metadata_bytes: 4096_u64 * 1024,
                 })
                 .and_then(|()| connection.attach_memory(self.memory.clone()))
                 .and_then(|()| connection.hello(compatibility))

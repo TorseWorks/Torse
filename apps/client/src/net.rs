@@ -92,7 +92,8 @@ impl<T: Transport> Connection<T> {
             light_optics,
             terrain_limits: TerrainLimits {
                 max_sections: 4096,
-                max_bytes: 64 * 1024 * 1024,
+                max_bytes: 60 * 1024 * 1024,
+                metadata_bytes: 4096_u64 * 1024,
             },
             subscription_pending: false,
             request_seq: 0,
@@ -150,14 +151,36 @@ impl<T: Transport> Connection<T> {
     }
     /// Configure before the first display update; changing a live cache requires reconnecting.
     pub fn set_terrain_limits(&mut self, limits: TerrainLimits) -> Result<(), Fault> {
-        if self.terrain.is_some()
-            || limits.max_sections == 0
-            || limits.max_sections > 16384
-            || limits.max_bytes < 4096
-        {
+        if self.terrain.is_some() {
             return Err(Fault::invalid_data("invalid display cache configuration"));
         }
+        limits.reservation_bytes()?;
         self.terrain_limits = limits;
+        Ok(())
+    }
+
+    /// Configure explicit transport/decoder budgets before the first welcome.
+    /// The transport's own frame and queue limits must also cover these frames.
+    pub fn set_frame_limits(
+        &mut self,
+        budget: OutputBudget,
+        limits: CodecLimits,
+    ) -> Result<(), Fault> {
+        if self.mirror.is_some()
+            || self.terrain.is_some()
+            || self.last_ping.is_some()
+            || budget.max_items == 0
+            || budget.max_bytes < 4096
+            || limits.max_frame_bytes < 4096
+            || limits.max_field_bytes == 0
+            || limits.max_depth == 0
+        {
+            return Err(Fault::invalid_data(
+                "invalid connection frame configuration",
+            ));
+        }
+        self.budget = budget;
+        self.limits = limits;
         Ok(())
     }
 
@@ -452,6 +475,13 @@ impl Connection<torse_net::TcpTransport> {
             None => torse_net::TcpTransport::new(stream, limits)?,
         };
         let mut connection = Connection::new(transport);
+        connection.set_frame_limits(
+            OutputBudget {
+                max_items: 200_000,
+                max_bytes: limits.frame as u64,
+            },
+            codec_limits(),
+        )?;
         connection.tls_configuration = tls_configuration;
         Ok(connection)
     }
@@ -511,6 +541,76 @@ mod tests {
     use torse_net::{MemoryTransport, TransportLimits};
 
     #[test]
+    fn configured_connection_receives_full_height_control_without_expanding_near_state() {
+        use torse_types::*;
+        use torse_world::WorldBounds;
+        let (client, mut server) = MemoryTransport::pair(default_limits()).unwrap();
+        let mut connection = Connection::new(client);
+        let budget = OutputBudget {
+            max_items: 2_000_000,
+            max_bytes: 8 * 1024 * 1024,
+        };
+        connection.set_frame_limits(budget, codec_limits()).unwrap();
+        connection
+            .set_terrain_limits(TerrainLimits {
+                max_sections: 131_072,
+                max_bytes: 4096,
+                metadata_bytes: 128 * 1024 * 1024,
+            })
+            .unwrap();
+        let binding = Binding {
+            world: WorldId(7),
+            epoch: WorldEpoch(1),
+            compatibility: crate::scene::Scene::compatibility().unwrap(),
+        };
+        let at = CommitCursor::initial(binding.world);
+        let near = ReplicaSnapshot {
+            side: 16,
+            bounds: WorldBounds::new(-64, 320).unwrap(),
+            states: Vec::new(),
+            sections: Vec::new(),
+            entities: Vec::new(),
+        };
+        connection
+            .handle(
+                ServerMessage::Seed(torse_sim::replica::WorldReplicaSeed {
+                    binding,
+                    subscription: SubscriptionId(1),
+                    baseline: at,
+                    state: near.clone(),
+                }),
+                Instant::now(),
+            )
+            .unwrap();
+        let sections: Vec<_> = (-32..=32)
+            .flat_map(|x| {
+                (-4..20).flat_map(move |y| (-32..=32).map(move |z| SectionPos::new(x, y, z)))
+            })
+            .collect();
+        let message = ServerMessage::Terrain(TerrainUpdate {
+            binding,
+            generation: 1,
+            seq: 1,
+            through: at,
+            reset: Some(TerrainReset {
+                sections,
+                retained: Vec::new(),
+            }),
+            pages: Vec::new(),
+            unavailable: Vec::new(),
+        });
+        let mut bytes = Vec::new();
+        wire::encode(&message, &mut bytes, budget, codec_limits()).unwrap();
+        server.send(bytes).unwrap();
+        let events = connection.poll().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(connection.terrain().unwrap().desired().len(), 101_400);
+        assert_eq!(connection.terrain().unwrap().cached_bytes(), 0);
+        assert_eq!(connection.snapshot(), Some(&near));
+        assert!(connection.set_frame_limits(budget, codec_limits()).is_err());
+    }
+
+    #[test]
     fn terrain_wire_delivery_keeps_the_near_mirror_and_rejects_replayed_updates() {
         use torse_types::*;
         use torse_world::*;
@@ -520,6 +620,7 @@ mod tests {
             .set_terrain_limits(TerrainLimits {
                 max_sections: 8,
                 max_bytes: 1024 * 1024,
+                metadata_bytes: 8_u64 * 1024,
             })
             .unwrap();
         let binding = Binding {

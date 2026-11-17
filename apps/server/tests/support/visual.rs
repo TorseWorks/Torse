@@ -46,6 +46,7 @@ pub fn limits() -> VisualTerrainLimits {
         io_bytes: base::budget().max_bytes * 4,
         batch_bytes: 128 * 1024,
         pages_per_poll: 2,
+        control_bytes: 64 * 1024,
     }
 }
 pub fn create(
@@ -111,6 +112,7 @@ pub fn mirror(server: &base::Files) -> TerrainMirror {
         TerrainLimits {
             max_sections: 8,
             max_bytes: 256 * 1024,
+            metadata_bytes: 8_u64 * 1024,
         },
         None,
     )

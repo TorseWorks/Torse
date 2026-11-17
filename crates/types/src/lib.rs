@@ -25,7 +25,8 @@ mod replication;
 mod spatial;
 mod terrain;
 pub use terrain::{
-    TerrainLight, TerrainLightUpdate, TerrainPage, TerrainReset, TerrainUnavailable, TerrainUpdate,
+    MAX_TERRAIN_INTEREST_SECTIONS, TerrainLight, TerrainLightUpdate, TerrainPage, TerrainReset,
+    TerrainUnavailable, TerrainUpdate,
 };
 mod validation;
 
