@@ -89,7 +89,11 @@ impl<J: torse_storage::CommitJournal<ExecutionModel>, S: HostCheckpointStore<Exe
             .map(|e| (e.id, e))
             .collect();
         for (pos, reference) in &snapshot.parked {
-            let page = pages.get(reference.digest)?;
+            let raw = pages.get(reference.digest)?;
+            let page = match crate::execution::streaming::bind_parked_page(&raw, reference)? {
+                std::borrow::Cow::Borrowed(_) => raw,
+                std::borrow::Cow::Owned(page) => page,
+            };
             if page.sections[0].pos != *pos
                 || page.entities.iter().map(|e| e.id).collect::<Vec<_>>() != reference.entities
                 || page.meta.cursor.world != snapshot.world.meta.cursor.world

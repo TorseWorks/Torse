@@ -14,6 +14,7 @@ use torse_world::*;
 pub const EXECUTION_VERSION: u16 = 1;
 pub const EXECUTION_COMMIT_VERSION: u16 = 4;
 const PARKED_EXECUTION_COMMIT_VERSION: u16 = 6;
+const BOUND_PARKING_COMMIT_VERSION: u16 = 7;
 pub const PACKED_EXECUTION_COMMIT_VERSION: u16 = 5;
 pub const EXECUTION_SNAPSHOT_VERSION: u16 = 2;
 pub trait Wire: Sized {
@@ -1038,8 +1039,18 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
                 .iter()
                 .any(|change| crate::snapshot::has_packable_cells(&change.page));
         encoder.packed_snapshot_cells = packed;
-        encoder.write_u16(if parking {
-            PARKED_EXECUTION_COMMIT_VERSION
+        let bound_load = v.changes.section.as_ref().is_some_and(|change| {
+            change.load
+                && !change.fresh
+                && change
+                    .page
+                    .entities
+                    .iter()
+                    .map(|entity| entity.id)
+                    .ne(change.reference.entities.iter().copied())
+        });
+        encoder.write_u16(if parking || bound_load {
+            BOUND_PARKING_COMMIT_VERSION
         } else if packed {
             PACKED_EXECUTION_COMMIT_VERSION
         } else {
@@ -1091,16 +1102,17 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
                     sections: Vec::new(),
                 },
             },
-            EXECUTION_COMMIT_VERSION | PARKED_EXECUTION_COMMIT_VERSION => {
-                ModelCommit::<M>::read(&mut d)?
-            }
+            EXECUTION_COMMIT_VERSION
+            | PARKED_EXECUTION_COMMIT_VERSION
+            | BOUND_PARKING_COMMIT_VERSION => ModelCommit::<M>::read(&mut d)?,
             PACKED_EXECUTION_COMMIT_VERSION => {
                 d.packed_snapshot_cells = true;
                 ModelCommit::<M>::read(&mut d)?
             }
             _ => return Err(Fault::incompatible("execution commit version")),
         };
-        let parking = version == PARKED_EXECUTION_COMMIT_VERSION;
+        let parking = version == PARKED_EXECUTION_COMMIT_VERSION
+            || (version == BOUND_PARKING_COMMIT_VERSION && !v.changes.sections.is_empty());
         if (parking && (v.changes.sections.is_empty() || v.changes.section.is_some()))
             || v.changes
                 .sections
@@ -1108,6 +1120,33 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
                 .any(|change| change.load == parking)
         {
             return Err(invalid("execution commit section operation"));
+        }
+        let remapped = |change: &SectionChange| {
+            change
+                .page
+                .entities
+                .iter()
+                .map(|entity| entity.id)
+                .ne(change.reference.entities.iter().copied())
+        };
+        if version == BOUND_PARKING_COMMIT_VERSION {
+            if !parking
+                && !v
+                    .changes
+                    .section
+                    .as_ref()
+                    .is_some_and(|change| change.load && !change.fresh && remapped(change))
+            {
+                return Err(invalid("execution commit parked identity binding"));
+            }
+        } else if v
+            .changes
+            .section
+            .iter()
+            .chain(&v.changes.sections)
+            .any(remapped)
+        {
+            return Err(invalid("legacy execution commit page identity"));
         }
         if !d.is_complete() {
             return Err(invalid("trailing execution commit bytes"));

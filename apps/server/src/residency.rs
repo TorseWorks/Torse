@@ -1,7 +1,8 @@
 //! Nonblocking residency scheduling with one bounded, world-owned page I/O worker.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use torse_storage::CommitJournal;
 use torse_types::*;
 use torse_world::{Snapshot, WorldBounds};
@@ -9,6 +10,9 @@ use torse_world::{Snapshot, WorldBounds};
 use crate::execution::{ExecutionHost, ExecutionModel};
 use crate::section_pages::SectionPages;
 use crate::{CommitStep, GenerationIdentity, HostCheckpointStore, InvalidationSink, Server};
+
+mod retire;
+use retire::RetireWorker;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ResidencyConfig {
@@ -60,6 +64,15 @@ pub struct ResidencyBatchReport {
     pub durability: Durability,
     pub blocked: Option<StageError>,
     pub failure: Option<(SectionPos, Fault)>,
+    /// Page-file data barriers newly completed by a retirement batch.
+    pub page_file_syncs: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ResidencyIoDiagnostics {
+    pub read_pending: bool,
+    pub retirement_age: Option<Duration>,
+    pub retirement_reserved_bytes: u64,
 }
 
 enum Request {
@@ -192,6 +205,12 @@ pub(crate) struct ResidencyScheduler {
     identity: Option<GenerationIdentity>,
     desired: BTreeSet<SectionPos>,
     worker: Worker,
+    retire_worker: RetireWorker,
+    retire_charge: u64,
+    retire_memory: Option<MemoryLease>,
+    retire_ready: Option<retire::RetireResult>,
+    retire_observed: BTreeMap<SectionPos, Revision>,
+    retire_started: Option<Instant>,
     busy: bool,
     ready: Option<Completed>,
     batch_ready: Vec<(SectionPos, Result<Completed, Fault>)>,
@@ -229,6 +248,7 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         // Drop any previous worker under the same lease, before starting another one.
         self.residency.take();
         let worker = Worker::new(pages.clone(), generator.clone())?;
+        let retire_worker = RetireWorker::new(pages.clone())?;
         self.residency = Some(ResidencyScheduler {
             binding: self.binding(),
             config,
@@ -237,6 +257,12 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
             identity,
             desired,
             worker,
+            retire_worker,
+            retire_charge: 0,
+            retire_memory: None,
+            retire_ready: None,
+            retire_observed: BTreeMap::new(),
+            retire_started: None,
             busy: false,
             ready: None,
             batch_ready: Vec::new(),
@@ -265,8 +291,19 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         self.residency.as_ref().map(|scheduler| &scheduler.desired)
     }
 
-    /// Opt into at most 1024 prepared load/install pages per dispatch and durable
-    /// batch. max_io_bytes still caps the entire batch, including worker results.
+    pub fn residency_io_diagnostics(&self) -> Option<ResidencyIoDiagnostics> {
+        let scheduler = self.residency.as_ref()?;
+        Some(ResidencyIoDiagnostics {
+            read_pending: scheduler.busy
+                || scheduler.ready.is_some()
+                || !scheduler.batch_ready.is_empty(),
+            retirement_age: scheduler.retire_started.map(|start| start.elapsed()),
+            retirement_reserved_bytes: scheduler.retire_charge,
+        })
+    }
+
+    /// Opt into at most 1024 prepared load, install or retire pages per dispatch.
+    /// max_io_bytes caps combined in-flight read and retirement reservations.
     /// Configure only when idle; default remains the original one-page path.
     pub fn set_residency_batch_pages(&mut self, pages: usize) -> Result<(), Fault> {
         self.authority()?;
@@ -321,7 +358,7 @@ fn interests(
 
 impl ResidencyScheduler {
     pub(crate) fn is_idle(&self) -> bool {
-        !self.busy && self.ready.is_none() && self.batch_ready.is_empty()
+        !self.busy && self.ready.is_none() && self.batch_ready.is_empty() && self.retire_charge == 0
     }
     fn poll<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>(
         &mut self,
@@ -348,6 +385,11 @@ impl ResidencyScheduler {
                 return Ok(ResidencyProgress::CapacityBlocked);
             }
             required.insert(pos);
+        }
+        if self.retire_charge != 0
+            && let Some(progress) = self.poll_retire(server, sink, &required, tickets.global)?
+        {
+            return Ok(progress);
         }
         if self.busy {
             match self.worker.receiver.try_recv() {
@@ -475,15 +517,30 @@ impl ResidencyScheduler {
         if charge > self.config.max_io_bytes {
             return Ok(ResidencyProgress::BudgetBlocked);
         }
-        let page_count = self
-            .batch_pages
-            .min((self.config.max_io_bytes / charge) as usize)
-            .min(
-                self.config
-                    .max_resident
-                    .saturating_sub(server.authority.world().store().len())
-                    .max(1),
-            );
+        let world = server.authority.world();
+        let missing = required
+            .iter()
+            .find(|pos| world.store().section(**pos).is_none())
+            .copied();
+        let loading = missing.is_some() && world.store().len() < self.config.max_resident;
+        if self.batch_pages > 1
+            && self.retire_charge == 0
+            && !tickets.global
+            && server.parking.is_none()
+            && server.authority.residency_ready(true)
+        {
+            self.begin_retire(server, &required, charge, loading)?;
+        }
+        let read_budget = self.config.max_io_bytes - self.retire_charge;
+        if read_budget < charge {
+            return Ok(ResidencyProgress::Pending);
+        }
+        let page_count = self.batch_pages.min((read_budget / charge) as usize).min(
+            self.config
+                .max_resident
+                .saturating_sub(server.authority.world().store().len())
+                .max(1),
+        );
         let charge = charge
             .checked_mul(page_count as u64)
             .ok_or_else(|| Fault::resource_limit("batch page reservation overflow"))?;
@@ -499,13 +556,10 @@ impl ResidencyScheduler {
             None
         };
         let world = server.authority.world();
-        let missing = required
-            .iter()
-            .find(|pos| world.store().section(**pos).is_none())
-            .copied();
         // A generated parking job owns page-file publication. Near reads can
         // continue against immutable files, but defer other writes to the catalog.
-        let victim = if tickets.global
+        let victim = if self.batch_pages > 1
+            || tickets.global
             || server.parking.is_some()
             || !server.authority.residency_ready(true)
         {
@@ -535,6 +589,8 @@ impl ResidencyScheduler {
                 }
             } else if let Some(pos) = victim {
                 Request::Save(world.capture_section(pos, self.pages.budget())?)
+            } else if self.retire_charge != 0 {
+                return Ok(ResidencyProgress::Pending);
             } else if missing.is_some() || world.store().len() > self.config.max_resident {
                 return Ok(ResidencyProgress::CapacityBlocked);
             } else {

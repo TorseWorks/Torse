@@ -32,6 +32,8 @@ struct SavedBatch {
 
 pub(crate) struct ParkingJob {
     worker: Option<JoinHandle<Result<SavedBatch, Fault>>>,
+    allocator: u128,
+    positions: Vec<(SectionPos, Option<Revision>)>,
     _memory: Option<MemoryLease>,
 }
 
@@ -48,8 +50,8 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
 {
     /// Submit one ordered batch of generated pages at the current generation
     /// cut. The worker persists their immutable bytes without borrowing the host.
-    /// IDs must extend the current allocator, in page order. A change in the
-    /// allocator while the job runs causes rejection at publication.
+    /// Input IDs extend the generation cut's allocator in page order. The
+    /// durable parked index binds them to authority IDs at publication.
     pub fn begin_generated_parking(
         &mut self,
         pages: SectionPages,
@@ -81,7 +83,9 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
             .map(|pool| pool.reserve(MemoryClass::Codec, limits.max_bytes, EvictionRank::Pinned))
             .transpose()?;
         let meta = torse_sim::streaming::page_meta(host.world());
+        let allocator = host.world().entities().next_entity_id();
         let mut positions = BTreeSet::new();
+        let mut observed = Vec::with_capacity(input.len());
         let mut bytes = 0u64;
         for page in &input {
             let [section] = page.sections.as_slice() else {
@@ -99,6 +103,10 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
                 ));
             }
             let cost = pages.measure(page, limits.max_bytes / 4)?;
+            observed.push((
+                section.pos,
+                host.world().store().retired_revision(section.pos),
+            ));
             let components = page
                 .entities
                 .iter()
@@ -139,6 +147,8 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
             })?;
         self.parking = Some(ParkingJob {
             worker: Some(worker),
+            allocator,
+            positions: observed,
             _memory: memory,
         });
         Ok(())
@@ -160,7 +170,7 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
             return Ok(ParkingProgress::Pending);
         }
         let mut job = self.parking.take().expect("parking job");
-        let saved = job
+        let mut saved = job
             .worker
             .take()
             .expect("parking worker")
@@ -171,6 +181,37 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
                     "generated parking worker panicked",
                 )
             })??;
+        let world = self.authority.world();
+        let mut original = job.allocator;
+        let mut allocator = world.entities().next_entity_id();
+        for (change, &(pos, retired)) in saved.changes.iter_mut().zip(&job.positions) {
+            if world.store().phase(pos).is_some()
+                || world.store().retired_revision(pos) != retired
+                || self.authority.parked_sections().contains_key(&pos)
+            {
+                return Err(Fault::invalid_data("generated parking target changed"));
+            }
+            for (entity, id) in change
+                .page
+                .entities
+                .iter()
+                .zip(&mut change.reference.entities)
+            {
+                if entity.id != EntityId(original) {
+                    return Err(Fault::invalid_data("invalid generated parking identity"));
+                }
+                *id = EntityId(allocator);
+                original = original
+                    .checked_add(1)
+                    .ok_or_else(|| Fault::resource_limit("generation allocator exhausted"))?;
+                allocator = allocator
+                    .checked_add(1)
+                    .ok_or_else(|| Fault::resource_limit("parking allocator exhausted"))?;
+            }
+            if change.page.next_entity_id != original {
+                return Err(Fault::invalid_data("invalid generated parking watermark"));
+            }
+        }
         self.authority.queue_parked_sections(saved.changes)?;
         let commit = self.drive_one(sink)?;
         Ok(ParkingProgress::Finished {

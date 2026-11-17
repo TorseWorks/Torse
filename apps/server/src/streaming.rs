@@ -3,6 +3,7 @@ use super::*;
 use crate::{
     CommitStep, HostCheckpointStore, InvalidationSink, Server, section_pages::SectionPages,
 };
+use std::borrow::Cow;
 use torse_storage::CommitJournal;
 use torse_world::Snapshot;
 
@@ -208,6 +209,23 @@ mod cost_tests {
 }
 
 impl ExecutionHost {
+    fn residency_reference(
+        &self,
+        page: &Snapshot,
+        digest: Digest,
+        load: bool,
+        fresh: bool,
+    ) -> ParkedSection {
+        if load
+            && !fresh
+            && let Some(reference) = self.parked.get(&page.sections[0].pos)
+            && reference.digest == digest
+        {
+            return reference.clone();
+        }
+        reference(page, digest)
+    }
+
     pub(crate) fn queue_parked_sections(
         &mut self,
         changes: Vec<SectionChange>,
@@ -316,12 +334,17 @@ impl ExecutionHost {
             })
             .transpose()?;
         self.check_residency(&change)?;
+        let page = if change.load && !change.fresh {
+            bind_parked_page(&change.page, &change.reference)?
+        } else {
+            Cow::Borrowed(&change.page)
+        };
         let world = if change.fresh {
             self.world()
                 .prepare_generated_section(&change.page, self.limits.runtime)?
         } else {
             self.world()
-                .prepare_section(&change.page, change.load, self.limits.runtime)?
+                .prepare_section(&page, change.load, self.limits.runtime)?
         };
         let meta = world.meta();
         let changes = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
@@ -429,8 +452,9 @@ impl ExecutionHost {
             self.world()
                 .prepare_generated_sections_iter(pages, self.limits.runtime)?
         } else {
+            let bound = bind_parking_batch(&changes)?;
             self.world()
-                .prepare_parked_sections(pages, self.limits.runtime)?
+                .prepare_parked_sections(bound.iter().map(Cow::as_ref), self.limits.runtime)?
         };
         let meta = world.meta();
         let empty = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
@@ -473,6 +497,62 @@ pub(crate) fn reference(page: &Snapshot, digest: Digest) -> ParkedSection {
         entities: page.entities.iter().map(|e| e.id).collect(),
     }
 }
+/// The digest authenticates immutable page bytes. The durable index supplies
+/// the committed identities in the same order as those bytes.
+pub(crate) fn bind_parked_page<'a>(
+    page: &'a Snapshot,
+    reference: &ParkedSection,
+) -> Result<Cow<'a, Snapshot>, Fault> {
+    if page.entities.len() != reference.entities.len()
+        || reference.entities.iter().any(|id| id.0 == 0)
+        || reference.entities.windows(2).any(|p| p[0] >= p[1])
+    {
+        return Err(Fault::invalid_data("invalid parked entity binding"));
+    }
+    if page
+        .entities
+        .iter()
+        .map(|e| e.id)
+        .eq(reference.entities.iter().copied())
+    {
+        return Ok(Cow::Borrowed(page));
+    }
+    let ids: BTreeMap<_, _> = page
+        .entities
+        .iter()
+        .zip(&reference.entities)
+        .map(|(e, id)| (e.id, *id))
+        .collect();
+    if ids.len() != page.entities.len() {
+        return Err(Fault::invalid_data("duplicate parked page entity symbol"));
+    }
+    let mut bound = page.clone();
+    for (entity, &id) in bound.entities.iter_mut().zip(&reference.entities) {
+        entity.id = id;
+        for component in &mut entity.components {
+            for (_, value) in &mut component.fields {
+                super::installs::remap(value, &ids)?;
+            }
+        }
+    }
+    bound.next_entity_id = bound.next_entity_id.max(
+        reference
+            .entities
+            .last()
+            .expect("nonempty remap")
+            .0
+            .checked_add(1)
+            .ok_or_else(|| Fault::resource_limit("parked entity watermark"))?,
+    );
+    Ok(Cow::Owned(bound))
+}
+
+fn bind_parking_batch(changes: &[SectionChange]) -> Result<Vec<Cow<'_, Snapshot>>, Fault> {
+    changes
+        .iter()
+        .map(|change| bind_parked_page(&change.page, &change.reference))
+        .collect()
+}
 fn check_parked_additions(
     parked: &BTreeMap<SectionPos, ParkedSection>,
     changes: &[SectionChange],
@@ -504,7 +584,9 @@ fn check_reference(
     parked: &BTreeMap<SectionPos, ParkedSection>,
 ) -> Result<(), Fault> {
     if change.page.sections.len() != 1
-        || change.reference != reference(&change.page, change.reference.digest)
+        || change.page.entities.len() != change.reference.entities.len()
+        || (change.load == change.fresh
+            && change.reference != reference(&change.page, change.reference.digest))
     {
         return Err(Fault::invalid_data("section reference differs from page"));
     }
@@ -550,6 +632,7 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
             durability: self.journal.durability(),
             blocked: None,
             failure: None,
+            page_file_syncs: 0,
         };
         let mut pending = completed.into_iter();
         let mut retry = Vec::new();
@@ -575,8 +658,14 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
                     }
                 }
             }
+            let reference = self.authority.residency_reference(
+                &completed.page,
+                completed.digest,
+                completed.load,
+                completed.fresh,
+            );
             let change = SectionChange {
-                reference: reference(&completed.page, completed.digest),
+                reference,
                 page: completed.page,
                 load: completed.load,
                 fresh: completed.fresh,
@@ -631,7 +720,9 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
     ) -> Result<CommitStep, Fault> {
         self.authority()?;
         let change = SectionChange {
-            reference: reference(&page, digest),
+            reference: self
+                .authority
+                .residency_reference(&page, digest, load, fresh),
             page,
             load,
             fresh,
@@ -861,9 +952,14 @@ impl ExecutionRecovery<'_> {
                 self.limits.runtime,
             )?;
         } else {
+            let page = if change.load {
+                bind_parked_page(&change.page, &change.reference)?
+            } else {
+                Cow::Borrowed(&change.page)
+            };
             self.recovery.replay_section(
                 &record.changes.world,
-                &change.page,
+                &page,
                 change.load,
                 self.limits.runtime,
             )?;
@@ -921,12 +1017,16 @@ impl ExecutionRecovery<'_> {
                 return Err(Fault::invalid_data("invalid generated batch page"));
             }
         }
-        let pages: Vec<_> = changes.sections.iter().map(|c| c.page.clone()).collect();
         if load {
+            let pages: Vec<_> = changes.sections.iter().map(|c| c.page.clone()).collect();
             self.recovery
                 .replay_generated_sections(&changes.world, &pages, self.limits.runtime)
         } else {
             check_parked_additions(&self.parked, &changes.sections, self.limits)?;
+            let pages: Vec<_> = bind_parking_batch(&changes.sections)?
+                .into_iter()
+                .map(Cow::into_owned)
+                .collect();
             self.recovery
                 .replay_parked_sections(&changes.world, &pages, self.limits.runtime)?;
             for change in &changes.sections {
@@ -950,7 +1050,8 @@ impl ExecutionRecovery<'_> {
             .ok_or_else(|| Fault::invalid_data("parked pages require a section store"))?;
         let mut ids = std::collections::BTreeSet::new();
         for (pos, expected) in &self.parked {
-            let page = pages.get(expected.digest)?;
+            let raw = pages.get(expected.digest)?;
+            let page = bind_parked_page(&raw, expected)?;
             if page.sections[0].pos != *pos
                 || reference(&page, expected.digest) != *expected
                 || expected.entities.iter().any(|id| !ids.insert(*id))

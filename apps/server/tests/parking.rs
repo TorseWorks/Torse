@@ -20,6 +20,28 @@ const LIMITS: SectionInstallLimits = SectionInstallLimits {
     max_bytes: 8 * 1024 * 1024,
 };
 
+fn reopen(dir: &support::Directory, pages: &SectionPages) -> base::Files {
+    let (world, actions) = base::world().unwrap();
+    base::Files::open_file(
+        dir.acquire(),
+        world.coordinator().compatibility(),
+        base::Codec::new(base::codec_limits()).unwrap(),
+        fixture::file_policy(),
+        |binding| {
+            Ok(ExecutionRecovery::new(
+                binding,
+                world.registry(),
+                world.schemas(),
+                actions,
+                Vec::new(),
+                fixture::limits(),
+            )
+            .with_section_pages(pages.clone()))
+        },
+    )
+    .unwrap()
+}
+
 fn finish(server: &mut base::Files) -> Result<(CommitStep, u32, Duration), Fault> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut max_poll = Duration::ZERO;
@@ -180,6 +202,295 @@ fn complete_generated_columns_park_across_ticks_and_recover_without_activation()
         }
     }
     assert!(recovered.authority().unwrap().parked_sections().is_empty());
+}
+
+#[test]
+fn parking_binds_ids_after_unrelated_allocations_without_rewriting_pages() {
+    let dir = support::Directory::new();
+    let (mut server, pages, template) = fixture::create(dir.acquire()).unwrap();
+    for (x, entities) in [(3, false), (6, true)] {
+        let mut input = fixture::column(server.authority().unwrap(), x, 0, &template, false);
+        if !entities {
+            let watermark = server
+                .authority()
+                .unwrap()
+                .world()
+                .entities()
+                .next_entity_id();
+            for page in &mut input {
+                page.entities.clear();
+                page.next_entity_id = watermark;
+            }
+        }
+        server
+            .begin_generated_parking(pages.clone(), input.clone(), LIMITS)
+            .unwrap();
+        let unrelated = fixture::column(server.authority().unwrap(), x + 1, 0, &template, false);
+        server
+            .install_section_batch(&pages, unrelated, &mut NoReplicas)
+            .unwrap();
+        let first = server
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .next_entity_id();
+        let (commit, syncs, _) = finish(&mut server).unwrap();
+        assert!(matches!(commit, CommitStep::Durable(_)));
+        assert_eq!(syncs, 1);
+        let host = server.authority().unwrap();
+        let mut ids = Vec::new();
+        for page in input {
+            let reference = &host.parked_sections()[&page.sections[0].pos];
+            assert_eq!(pages.get(reference.digest).unwrap(), page);
+            ids.extend(reference.entities.iter().copied());
+        }
+        let count = if entities { 3 } else { 0 };
+        assert_eq!(
+            ids,
+            (first..first + count).map(EntityId).collect::<Vec<_>>()
+        );
+        assert_eq!(host.world().entities().next_entity_id(), first + count);
+    }
+    let expected = server.authority().unwrap().parked_sections().clone();
+    drop(server);
+    let mut recovered = reopen(&dir, &pages);
+    assert_eq!(recovered.authority().unwrap().parked_sections(), &expected);
+    for (&pos, reference) in expected
+        .iter()
+        .filter(|(_, page)| !page.entities.is_empty())
+    {
+        recovered
+            .reload_section(&pages, pos, &mut NoReplicas)
+            .unwrap();
+        for id in &reference.entities {
+            assert!(
+                recovered
+                    .authority()
+                    .unwrap()
+                    .world()
+                    .entities()
+                    .handle_of(*id)
+                    .is_some()
+            );
+        }
+    }
+    drop(recovered);
+    let recovered = reopen(&dir, &pages);
+    let entities = recovered.authority().unwrap().world().entities();
+    for id in expected.values().flat_map(|reference| &reference.entities) {
+        assert!(entities.handle_of(*id).is_some());
+    }
+}
+
+#[test]
+fn retirement_batches_sync_once_and_recheck_foldback() {
+    use torse_server::residency::{ResidencyConfig, ResidencyProgress};
+
+    let dir = support::Directory::new();
+    let (mut server, pages, template) = fixture::create(dir.acquire()).unwrap();
+    let old = fixture::column(server.authority().unwrap(), 0, 0, &template, false);
+    let keep = old[0].sections[0].pos;
+    server
+        .install_section_batch(&pages, old, &mut NoReplicas)
+        .unwrap();
+    let forward = fixture::column(server.authority().unwrap(), 1, 0, &template, false);
+    let near = forward[0].sections[0].pos;
+    server
+        .begin_generated_parking(pages.clone(), forward, LIMITS)
+        .unwrap();
+    finish(&mut server).unwrap();
+    server
+        .enable_residency(
+            ResidencyConfig {
+                max_resident: 48,
+                max_io_bytes: pages.budget().max_bytes * 4 * 25,
+            },
+            pages.clone(),
+            None,
+            &[near],
+        )
+        .unwrap();
+    server.set_residency_batch_pages(24).unwrap();
+    let start = Instant::now();
+    assert!(matches!(
+        server.poll_residency(&mut NoReplicas).unwrap(),
+        ResidencyProgress::Pending
+    ));
+    let in_flight = server.residency_io_diagnostics().unwrap();
+    assert!(in_flight.read_pending && in_flight.retirement_age.is_some());
+    assert!(in_flight.retirement_reserved_bytes <= pages.budget().max_bytes * 4 * 24);
+    server.set_residency_interest(&[keep, near]).unwrap();
+    let mut retired = 0;
+    let mut page_syncs = 0;
+    while retired < 23
+        || server
+            .authority()
+            .unwrap()
+            .world()
+            .store()
+            .section(near)
+            .is_none()
+    {
+        let before = server.flush_metrics().calls;
+        match server.poll_residency(&mut NoReplicas).unwrap() {
+            ResidencyProgress::Batch(report) => {
+                assert!(report.failure.is_none(), "{report:?}");
+                page_syncs += report.page_file_syncs;
+                retired += report.committed.iter().filter(|pos| pos.x == 0).count();
+                if report.page_file_syncs != 0 {
+                    assert_eq!(server.flush_metrics().calls - before, 1);
+                }
+            }
+            ResidencyProgress::Pending => std::thread::yield_now(),
+            other => panic!("unexpected retirement result: {other:?}"),
+        }
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+    assert_eq!(retired, 23);
+    assert_eq!(page_syncs, 1);
+    assert!(
+        server
+            .residency_io_diagnostics()
+            .unwrap()
+            .retirement_age
+            .is_none()
+    );
+    assert!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .store()
+            .section(keep)
+            .is_some()
+    );
+    let expected = server.authority().unwrap().parked_sections().clone();
+    drop(server);
+    let recovered = reopen(&dir, &pages);
+    let host = recovered.authority().unwrap();
+    assert_eq!(host.parked_sections(), &expected);
+    assert!(host.world().store().section(keep).is_some());
+    assert!(host.world().store().section(near).is_some());
+}
+
+#[test]
+fn generated_parking_rejects_a_target_installed_during_background_io() {
+    let dir = support::Directory::new();
+    let (mut server, pages, template) = fixture::create(dir.acquire()).unwrap();
+    let input = fixture::column(server.authority().unwrap(), 3, 0, &template, false);
+    let target = input[0].sections[0].pos;
+    server
+        .begin_generated_parking(pages.clone(), input.clone(), LIMITS)
+        .unwrap();
+    server
+        .install_section(&pages, input[0].clone(), &mut NoReplicas)
+        .unwrap();
+    let host = server.authority().unwrap();
+    let cursor = host.cursor();
+    let before = host
+        .world()
+        .capture_section(target, base::budget())
+        .unwrap();
+    assert_eq!(
+        finish(&mut server).unwrap_err().code,
+        FaultCode::InvalidData
+    );
+    let host = server.authority().unwrap();
+    assert_eq!(host.cursor(), cursor);
+    assert!(host.parked_sections().is_empty());
+    assert_eq!(
+        host.world()
+            .capture_section(target, base::budget())
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+#[ignore = "real filesystem retirement timing; run in Release"]
+fn compare_serial_and_batched_retirement() {
+    use torse_server::residency::{ResidencyConfig, ResidencyProgress};
+
+    for sample in 0..3 {
+        for batched in [false, true] {
+            let dir = support::Directory::new();
+            let (mut server, pages, template) = fixture::create(dir.acquire()).unwrap();
+            let column = fixture::column(server.authority().unwrap(), 0, 0, &template, false);
+            let positions: Vec<_> = column.iter().map(|page| page.sections[0].pos).collect();
+            server
+                .install_section_batch(&pages, column, &mut NoReplicas)
+                .unwrap();
+            if batched {
+                server
+                    .enable_residency(
+                        ResidencyConfig {
+                            max_resident: 24,
+                            max_io_bytes: pages.budget().max_bytes * 4 * 25,
+                        },
+                        pages.clone(),
+                        None,
+                        &[],
+                    )
+                    .unwrap();
+                server.set_residency_batch_pages(24).unwrap();
+            }
+            let flushes = server.flush_metrics().calls;
+            let start = Instant::now();
+            let mut max_call = Duration::ZERO;
+            let mut written = 0;
+            if batched {
+                let mut retired = 0;
+                while retired < positions.len() {
+                    let called = Instant::now();
+                    let progress = server.poll_residency(&mut NoReplicas).unwrap();
+                    max_call = max_call.max(called.elapsed());
+                    match progress {
+                        ResidencyProgress::Batch(report) => {
+                            assert!(report.failure.is_none(), "{report:?}");
+                            retired += report.committed.len();
+                            written += report.page_file_syncs;
+                        }
+                        ResidencyProgress::Pending => std::thread::yield_now(),
+                        other => panic!("unexpected retirement result: {other:?}"),
+                    }
+                    assert!(start.elapsed() < Duration::from_secs(10));
+                }
+            } else {
+                for pos in positions {
+                    let called = Instant::now();
+                    assert!(matches!(
+                        server.unload_section(&pages, pos, &mut NoReplicas).unwrap(),
+                        CommitStep::Durable(_)
+                    ));
+                    max_call = max_call.max(called.elapsed());
+                    // Each new standalone name requires one sync in SectionPages::put.
+                    assert!(
+                        pages
+                            .path(server.authority().unwrap().parked_sections()[&pos].digest)
+                            .is_file()
+                    );
+                    written += 1;
+                }
+            }
+            assert_eq!(server.authority().unwrap().parked_sections().len(), 24);
+            assert_eq!(written, if batched { 1 } else { 24 });
+            let elapsed = start.elapsed();
+            let log_syncs = server.flush_metrics().calls - flushes;
+            if batched {
+                // Journal admission may shorten the accepted prefix.
+                assert!((1..24).contains(&log_syncs));
+            } else {
+                assert_eq!(log_syncs, 24);
+            }
+            println!(
+                "{sample}, {batched}, {:.4}, {:.4}, {written}, {}",
+                max_call.as_secs_f64() * 1000.,
+                elapsed.as_secs_f64() * 1000.,
+                server.flush_metrics().calls - flushes
+            );
+        }
+    }
 }
 
 #[test]

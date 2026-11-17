@@ -35,6 +35,7 @@ pub struct VisualTerrainDiagnostics {
     pub io_pending: bool,
     pub generation: u64,
     pub sequence: u64,
+    pub reused_read_pages: u64,
 }
 impl VisualTerrainLimits {
     fn validate(self, pages: &SectionPages) -> Result<u64, Fault> {
@@ -99,6 +100,7 @@ struct Item {
 }
 struct Job {
     generation: u64,
+    refresh: u64,
     items: Vec<Item>,
 }
 struct Prepared {
@@ -108,6 +110,7 @@ struct Prepared {
 }
 struct Response {
     generation: u64,
+    refresh: u64,
     pages: Vec<Prepared>,
 }
 struct Worker {
@@ -242,6 +245,8 @@ pub(crate) struct VisualSession {
     worker: Worker,
     busy: bool,
     generation: u64,
+    refresh: u64,
+    reused_read_pages: u64,
     seq: u64,
     reset: bool,
     cache: BTreeMap<SectionPos, Cached>,
@@ -502,6 +507,7 @@ impl VisualSession {
                     if results
                         .send(Response {
                             generation: job.generation,
+                            refresh: job.refresh,
                             pages: prepared,
                         })
                         .is_err()
@@ -529,6 +535,8 @@ impl VisualSession {
             },
             busy: false,
             generation: 1,
+            refresh: 0,
+            reused_read_pages: 0,
             seq: 0,
             reset: true,
             cache: BTreeMap::new(),
@@ -560,6 +568,9 @@ impl VisualSession {
             .generation
             .checked_add(1)
             .ok_or_else(|| Fault::resource_limit("visual generation exhausted"))?;
+        if refresh {
+            self.refresh = self.generation;
+        }
         self.seq = 0;
         self.light_seq = 0;
         self.light_sent.clear();
@@ -590,6 +601,7 @@ impl VisualSession {
             io_pending: self.busy,
             generation: self.generation,
             sequence: self.seq,
+            reused_read_pages: self.reused_read_pages,
         }
     }
     pub(crate) fn poll(
@@ -611,10 +623,12 @@ impl VisualSession {
             match self.worker.receiver.try_recv() {
                 Ok(response) => {
                     self.busy = false;
-                    if response.generation == self.generation {
+                    if response.refresh == self.refresh {
+                        let overlapping = response.generation != self.generation;
                         for page in response.pages {
                             if !self.desired.sections.contains(&page.pos)
                                 || stamp(host, page.pos) != page.stamp
+                                || (overlapping && page.result.is_err())
                             {
                                 continue;
                             }
@@ -637,6 +651,9 @@ impl VisualSession {
                                         && cached.digest == digest
                                     {
                                         cached.verify_source = false;
+                                        self.reused_read_pages = self
+                                            .reused_read_pages
+                                            .saturating_add(u64::from(overlapping));
                                         self.unavailable.remove(&page.pos);
                                         continue;
                                     }
@@ -685,6 +702,9 @@ impl VisualSession {
                                         continue;
                                     }
                                     self.bytes += cost;
+                                    self.reused_read_pages = self
+                                        .reused_read_pages
+                                        .saturating_add(u64::from(overlapping));
                                     self.cache.insert(
                                         page.pos,
                                         Cached {
@@ -749,8 +769,10 @@ impl VisualSession {
             order.sort_by_key(|p| {
                 (
                     u128::from(p.x.abs_diff(self.center.x))
-                        + u128::from(p.y.abs_diff(self.center.y))
                         + u128::from(p.z.abs_diff(self.center.z)),
+                    p.x,
+                    p.z,
+                    p.y.abs_diff(self.center.y),
                     *p,
                 )
             });
@@ -805,6 +827,7 @@ impl VisualSession {
                     .expect("live visual worker")
                     .try_send(Job {
                         generation: self.generation,
+                        refresh: self.refresh,
                         items,
                     })
                     .map_err(|_| {
@@ -843,7 +866,17 @@ impl VisualSession {
         };
         let mut pages = Vec::new();
         let mut bytes = 0u64;
-        for pos in self.dirty.iter().copied().collect::<Vec<_>>() {
+        let mut dirty: Vec<_> = self.dirty.iter().copied().collect();
+        dirty.sort_by_key(|p| {
+            (
+                u128::from(p.x.abs_diff(self.center.x)) + u128::from(p.z.abs_diff(self.center.z)),
+                p.x,
+                p.z,
+                p.y.abs_diff(self.center.y),
+                *p,
+            )
+        });
+        for pos in dirty {
             if !self.desired.sections.contains(&pos) {
                 self.dirty.remove(&pos);
                 continue;
@@ -868,6 +901,7 @@ impl VisualSession {
             self.sent.insert(pos, cached.digest);
             self.dirty.remove(&pos);
         }
+        pages.sort_unstable_by_key(|p| p.terrain.sections[0].pos);
         if reset.is_none() && pages.is_empty() && self.unavailable.is_empty() {
             return Ok(None);
         }

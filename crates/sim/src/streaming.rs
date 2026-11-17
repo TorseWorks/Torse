@@ -116,7 +116,9 @@ pub(crate) fn prepare_batch<'a>(
         if !positions.insert(prepared.position()) {
             return Err(Fault::invalid_data("duplicate generated batch position"));
         }
-        allocator = page.next_entity_id;
+        if !park || !page.entities.is_empty() {
+            allocator = page.next_entity_id;
+        }
         sections.push(prepared);
     }
     if sections.len() != count {
@@ -164,9 +166,13 @@ fn prepare_at(
         let end = first
             .checked_add(page.entities.len() as u128)
             .ok_or_else(|| Fault::resource_limit("generated entity allocator exhausted"))?;
+        // A terrain-only parked page owns no IDs. Its original watermark
+        // remains part of the immutable bytes but cannot move the allocator.
+        let watermark_matches = page.next_entity_id == end
+            || (park && page.entities.is_empty() && page.next_entity_id < end);
         if !load
             || (!park && page.meta.cursor.seq != world.seq())
-            || page.next_entity_id != end
+            || !watermark_matches
             || page
                 .entities
                 .iter()
@@ -252,7 +258,6 @@ fn same_page(a: &Snapshot, b: &Snapshot) -> bool {
         && a.bounds == b.bounds
         && a.states == b.states
         && a.entities == b.entities
-        && a.next_entity_id == b.next_entity_id
         && a.sections.len() == b.sections.len()
         && a.sections
             .iter()
