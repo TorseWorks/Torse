@@ -68,6 +68,7 @@ fn shared_light_column_progress_measurement() {
                 field: LightFieldLimits {
                     sections: 32,
                     cache_bytes: 256 * 1024 * 1024,
+                    solver_cache_bytes: 256 * 1024 * 1024,
                     consumers: 4,
                     interests: 64,
                     job: LightLimits {

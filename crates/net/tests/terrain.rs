@@ -45,6 +45,7 @@ fn light(pos: SectionPos, digest: Digest, generation: u64) -> TerrainLight {
         terrain: digest,
         generation,
         rules: 1,
+        optics: seed(1).binding.compatibility.rules_digest,
         complete: true,
         emitted: vec![3; 4096],
         sky: vec![15; 4096],
@@ -101,6 +102,44 @@ fn light_updates_match_content_and_reject_bad_or_disordered_messages_atomically(
     changed.pages[0].light = None;
     mirror.apply(changed).unwrap();
     assert!(mirror.light(pos).is_none());
+}
+
+#[test]
+fn light_from_an_unexpected_optics_table_is_discarded_on_both_routes() {
+    let (mut mirror, mut first) = setup(1_000_000);
+    let expected = Digest([4; 32]);
+    mirror.set_light_optics(expected).unwrap();
+    let pos = first.pages[0].terrain.sections[0].pos;
+    let mut page = light(pos, first.pages[0].digest, 1);
+    first.pages[0].light = Some(page.clone());
+    let binding = first.binding;
+    mirror.apply(first).unwrap();
+    assert!(mirror.page(pos).is_some());
+    assert!(mirror.light(pos).is_none());
+    assert!(mirror.set_light_optics(page.optics).is_err());
+
+    let mismatched = TerrainLightUpdate {
+        binding,
+        interest_generation: 1,
+        seq: 1,
+        pages: vec![page.clone()],
+    };
+    assert!(mirror.apply_light(mismatched).unwrap().changed.is_empty());
+    assert!(mirror.light(pos).is_none());
+    page.optics = expected;
+    assert_eq!(
+        mirror
+            .apply_light(TerrainLightUpdate {
+                binding,
+                interest_generation: 1,
+                seq: 2,
+                pages: vec![page.clone()],
+            })
+            .unwrap()
+            .changed,
+        vec![pos]
+    );
+    assert_eq!(mirror.light(pos), Some(&page));
 }
 
 #[test]

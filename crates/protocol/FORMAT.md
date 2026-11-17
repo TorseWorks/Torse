@@ -1,8 +1,8 @@
-# 应用协议版本7
+# 应用协议版本8
 
 ## 独立显示地形
 
-版本6追加Terrain标签10，版本7增加匹配光照及Light标签11。Hello拒绝版本1至6，双方须同时升级；codec/wire版本1与存档格式不变。近景仍使用Seed/Batch/Interest。Terrain不包含实体，不授予交互权限。
+版本6追加Terrain标签10，版本7增加匹配光照及Light标签11，版本8增加光学表身份。Hello拒绝版本1至7，双方须同时升级；codec/wire版本1与存档格式不变。近景仍使用Seed/Batch/Interest。Terrain不包含实体，不授予交互权限。
 
 TerrainUpdate字段依次为Binding、generation:u64、seq:u64、through:CommitCursor、reset:Option<TerrainReset>、pages:Vec<TerrainPage<S>>、unavailable:Vec<(SectionPos,TerrainUnavailable)>。TerrainReset为有序唯一sections和retained:Vec<(SectionPos,Digest)>。TerrainPage为at:CommitCursor、digest:Digest、terrain:S、light:Option<TerrainLight>；S含单个分区、使用到的状态字典和空实体列表。Digest为地形投影wire编码的SHA-256内容标记。可用性标签为0 Pending、1 Missing、2 Corrupt、3 Budget。
 
@@ -67,7 +67,7 @@ Ping仅在Hello成功后接纳，没有响应、不占RequestSeq、不写日志�
 
 应用时序须满足`idle_ticks * tick_period >= 3 * heartbeat_interval`。演示配置为1200个Tick、50毫秒一个Tick、10秒心跳，空闲上限为60秒。停发后仍按原空闲规则回收连接。未握手连接也受空闲上限约束，Ping不能延长其占位。
 
-Ping在应用协议版本2加入，当前协议版本7在Hello阶段拒绝旧版本混用。codec/wire版本保持1，既有标签顺序、存档及执行记录布局不变；未知消息标签仍拒绝。
+Ping在应用协议版本2加入，当前协议版本8在Hello阶段拒绝旧版本混用。codec/wire版本保持1，既有标签顺序、存档及执行记录布局不变；未知消息标签仍拒绝。
 
 ## 提交呈现事件
 
@@ -98,6 +98,6 @@ Seed只包含状态。重连、订阅重建和新epoch都从新基线开始，�
 
 ## 共享区段光照（协议7）
 
-版本7在TerrainPage的terrain之后增加light:Option<TerrainLight>，与版本6不兼容；Hello必须精确匹配版本，双方同时升级，存档格式不变。TerrainLight依次为pos:SectionPos、terrain:Digest、generation:u64、rules:u32、complete:bool、emitted:Vec<u8>、sky:Vec<u8>。两个数组按地形线性次序排列，各恰好side³项，值为0..15；generation非零，当前rules为1。terrain引用当前地形页摘要，generation同时区分邻界依赖变化。
+版本7在TerrainPage的terrain之后增加light:Option<TerrainLight>。版本8的TerrainLight依次为pos:SectionPos、terrain:Digest、generation:u64、rules:u32、optics:Digest、complete:bool、emitted:Vec<u8>、sky:Vec<u8>。两个数组按地形线性次序排列，各恰好side³项，值为0..15；generation非零，当前rules为1。terrain引用当前地形页摘要，generation同时区分邻界依赖变化。optics是求解所用光学表的身份，内置表取Binding中的权威规则摘要（包含注册表的光学配置），自定义表由客户端在收流前配置预期身份。身份不符时丢弃内联和独立光照载荷，保留地形并推进有效消息的序号。
 
 Light消息依次为binding:Binding、interest_generation:u64、seq:u64、pages:Vec<TerrainLight>。pages按坐标严格递增；兴趣代数必须等于当前Terrain代数，seq从1连续增加，在Terrain重置后重新开始。接收端原子拒绝非法内容、丢失或乱序消息并要求重建显示基线；结构有效但地形摘要不匹配或发布代数陈旧的结果丢弃，不安装或保留载荷。发送端先发送地形；首批没有已就绪匹配光照时地形不等待。光照待就绪后独立发送，接收端不为光照提前激活地形。远景光照不改变权威镜像，近景覆盖远景时移除远景光照。

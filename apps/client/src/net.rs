@@ -65,6 +65,7 @@ pub struct Connection<T: Transport> {
     mirror: Option<ReplicaMirror>,
     terrain: Option<TerrainMirror>,
     terrain_limits: TerrainLimits,
+    light_optics: Option<torse_types::Digest>,
     subscription_pending: bool,
     request_seq: u64,
     budget: OutputBudget,
@@ -78,11 +79,17 @@ pub struct Connection<T: Transport> {
 impl<T: Transport> Connection<T> {
     /// Wrap a connected transport with the demo frame budget.
     pub fn new(transport: T) -> Self {
+        Self::with_light_optics(transport, None)
+    }
+
+    /// Pin the expected host optics when using a custom table.
+    pub fn with_light_optics(transport: T, light_optics: Option<torse_types::Digest>) -> Self {
         Self {
             prediction: Default::default(),
             transport,
             mirror: None,
             terrain: None,
+            light_optics,
             terrain_limits: TerrainLimits {
                 max_sections: 4096,
                 max_bytes: 64 * 1024 * 1024,
@@ -350,6 +357,9 @@ impl<T: Transport> Connection<T> {
                         self.terrain_limits,
                         self.memory.as_ref().map(MemoryLease::pool).cloned(),
                     )?;
+                    if let Some(identity) = self.light_optics {
+                        terrain.set_light_optics(identity)?;
+                    }
                     let changes = terrain.apply(update)?;
                     terrain.observe_snapshot(near.state(), near.through);
                     self.terrain = Some(terrain);

@@ -22,6 +22,67 @@ fn registry(emission: f32) -> BlockStateRegistry {
     }
     BlockStateRegistry::build(&compile(pack).unwrap()).unwrap()
 }
+
+#[test]
+fn custom_optics_reject_out_of_range_coefficients_in_cold_and_incremental_jobs() {
+    use torse_world_services::lighting::{LightOptics, OpticalState};
+    struct Optics<'a> {
+        registry: &'a BlockStateRegistry,
+        invalid: BlockStateId,
+        value: OpticalState,
+    }
+    impl LightOptics for Optics<'_> {
+        fn identity(&self) -> Digest {
+            Digest([8; 32])
+        }
+        fn state(&self, id: BlockStateId) -> Option<OpticalState> {
+            if id == self.invalid {
+                Some(self.value)
+            } else {
+                LightOptics::state(self.registry, id)
+            }
+        }
+    }
+    let registry = registry(0.0);
+    let invalid = state(&registry, "base:stone");
+    for value in [
+        OpticalState {
+            absorption: 0,
+            emission: 16,
+        },
+        OpticalState {
+            absorption: 16,
+            emission: 0,
+        },
+    ] {
+        let optics = Optics {
+            registry: &registry,
+            invalid,
+            value,
+        };
+        let cold = store(invalid);
+        let mut job =
+            LightJob::prepare(binding(), &cold, &optics, SectionPos::ZERO, limits()).unwrap();
+        let result = job.poll(binding(), &cold, &optics, 1_000_000);
+        assert!(
+            matches!(&result, Err(e) if e.code == torse_types::FaultCode::InvalidData),
+            "invalid cold optics accepted: {result:?}"
+        );
+        let mut warm = store(BlockStateId::EMPTY);
+        let mut job = LightJob::prepare(binding(), &warm, &optics, SectionPos::ZERO, limits())
+            .unwrap()
+            .reusable(limits().bytes)
+            .unwrap();
+        assert!(job.poll(binding(), &warm, &optics, 1_000_000).unwrap());
+        warm.edit(BlockPos::new(0, 0, 0), invalid).unwrap();
+        job.update(binding(), &warm, &optics).unwrap();
+        let result = job.poll(binding(), &warm, &optics, 1_000_000);
+        assert!(
+            matches!(&result, Err(e) if e.code == torse_types::FaultCode::InvalidData),
+            "invalid incremental optics accepted: {result:?}"
+        );
+    }
+}
 fn binding() -> Binding {
     Binding {
         world: WorldId(1),

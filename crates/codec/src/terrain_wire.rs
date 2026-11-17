@@ -75,6 +75,7 @@ impl Wire for torse_types::TerrainLight {
         self.terrain.write(e)?;
         self.generation.write(e)?;
         self.rules.write(e)?;
+        self.optics.write(e)?;
         self.complete.write(e)?;
         self.emitted.write(e)?;
         self.sky.write(e)
@@ -85,6 +86,7 @@ impl Wire for torse_types::TerrainLight {
             terrain: Wire::read(d)?,
             generation: Wire::read(d)?,
             rules: Wire::read(d)?,
+            optics: Wire::read(d)?,
             complete: Wire::read(d)?,
             emitted: Wire::read(d)?,
             sky: Wire::read(d)?,

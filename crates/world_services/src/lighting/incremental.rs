@@ -66,14 +66,14 @@ impl LightJob {
         &mut self,
         binding: Binding,
         source: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
     ) -> Result<(), Fault> {
         if self.failed
             || self.seeded != self.levels.len()
             || !self.queue.is_empty()
             || self.observed.binding != binding
             || source.binding().is_some_and(|b| b != binding)
-            || self.observed.content != registry.authority_digest()
+            || self.observed.optics != optics.identity()
             || self.observed.rules != source.rules_version()
             || self.observed.side != source.side()
             || self.observed.bounds != source.bounds()
@@ -117,7 +117,7 @@ impl LightJob {
     pub(super) fn advance_update(
         &mut self,
         source: &(impl LightSource + ?Sized),
-        registry: &BlockStateRegistry,
+        optics: &(impl LightOptics + ?Sized),
         work: usize,
     ) -> Result<bool, Fault> {
         for _ in 0..work {
@@ -147,13 +147,11 @@ impl LightJob {
                     let (absorption, direct, emission) = match source.query(pos) {
                         TerrainQuery::Ready(id) if id.is_empty() => (1, 0, 0),
                         TerrainQuery::Ready(id) => {
-                            let transport = registry.light_transport(id).ok_or_else(|| {
-                                Fault::invalid_data("unknown updated light state")
-                            })?;
+                            let transport = checked_state(optics, id)?;
                             (
-                                (transport.absorption * 15.0).ceil().clamp(1.0, 15.0) as u8,
-                                (transport.absorption * 15.0).ceil() as u8,
-                                (transport.emission * 15.0).round() as u8,
+                                transport.absorption.max(1),
+                                transport.absorption,
+                                transport.emission,
                             )
                         }
                         _ => (15, 15, 0),
