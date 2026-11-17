@@ -108,17 +108,6 @@ impl<T: Transport> NetworkHub<T> {
         if server.binding() != self.binding {
             return Err(Fault::invalid_data("visual binding mismatch"));
         }
-        if self.lighting.is_some() {
-            let cells = u64::from(server.authority()?.world().store().side()).pow(3);
-            if limits.batch_bytes < 128 + 2 * cells
-                || self.limits.budget.max_bytes < 256 + 2 * cells
-                || u64::from(self.limits.budget.max_items) < 256 + 2 * cells
-            {
-                return Err(Fault::resource_limit(
-                    "display budget cannot fit one light section",
-                ));
-            }
-        }
         let peer = self
             .peers
             .get_mut(&id)
@@ -137,7 +126,7 @@ impl<T: Transport> NetworkHub<T> {
             limits,
         )?;
         if let Some((field, _)) = &mut self.lighting {
-            field.subscribe(id, &visual.desired_positions())?;
+            field.subscribe_near(id, &visual.desired_positions(), center)?;
         }
         peer.visual = Some(visual);
         Ok(())
@@ -163,7 +152,11 @@ impl<T: Transport> NetworkHub<T> {
             .ok_or_else(|| Fault::invalid_data("display terrain not enabled"))?;
         visual.check_request(&scope)?;
         if let Some((field, _)) = &mut self.lighting {
-            field.subscribe(id, &scope.sections.iter().copied().collect::<Vec<_>>())?;
+            field.subscribe_near(
+                id,
+                &scope.sections.iter().copied().collect::<Vec<_>>(),
+                center,
+            )?;
         }
         visual.request(scope, center, false)
     }

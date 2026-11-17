@@ -259,11 +259,33 @@ impl SharedLightField {
         optics: &(impl LightOptics + ?Sized),
         work: usize,
     ) -> Result<Option<SectionPos>, Fault> {
+        self.poll_ready(source, optics, work, |_| Some(0))
+    }
+
+    /// Advance the ready target with the lowest host-supplied priority. Prefer
+    /// a reusable column only among equally urgent targets. None defers input
+    /// verification and cancels in-flight work for that target.
+    pub fn poll_ready(
+        &mut self,
+        source: &(impl LightSource + ?Sized),
+        optics: &(impl LightOptics + ?Sized),
+        work: usize,
+        priority: impl Fn(SectionPos) -> Option<u128>,
+    ) -> Result<Option<SectionPos>, Fault> {
         if work == 0 {
             return Ok(None);
         }
         if source.binding().is_some_and(|b| b != self.binding) {
             return Err(Fault::invalid_data("light field binding"));
+        }
+        if self
+            .work
+            .as_ref()
+            .is_some_and(|w| priority(w.target).is_none())
+        {
+            let active = self.work.take().expect("unready lighting work");
+            self.pending.insert(active.target);
+            self.measure();
         }
         if self.work.is_none() {
             // Unknown targets wait without spinning calculations. A later input
@@ -277,19 +299,21 @@ impl SharedLightField {
                     )
             };
             let target = self
-                .last_column
-                .filter(|key| self.retained.contains_key(key))
-                .and_then(|(x, z)| {
-                    self.pending
-                        .range(
-                            SectionPos::new(x, i64::MIN, i64::MIN)
-                                ..=SectionPos::new(x, i64::MAX, i64::MAX),
+                .pending
+                .iter()
+                .filter(readable)
+                .filter_map(|&p| {
+                    priority(p).map(|rank| {
+                        (
+                            rank,
+                            !(self.last_column == Some(column(p))
+                                && self.retained.contains_key(&column(p))),
+                            p,
                         )
-                        .filter(|p| p.z == z)
-                        .find(readable)
+                    })
                 })
-                .or_else(|| self.pending.iter().find(readable))
-                .copied();
+                .min()
+                .map(|(_, _, p)| p);
             let Some(target) = target else {
                 return Ok(None);
             };

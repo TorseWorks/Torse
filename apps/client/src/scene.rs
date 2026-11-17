@@ -2300,6 +2300,23 @@ mod tests {
         assert!(!query(&scene, BlockPos::new(33, 0, 1)));
     }
     #[test]
+    fn terrain_without_shared_light_completes_local_display_lighting() {
+        let (mut scene, near, terrain) = display_fixture();
+        let pos = SectionPos::new(2, 0, 0);
+        scene.enable_lighting().unwrap();
+        scene.try_apply_display(&near, &terrain, [pos]).unwrap();
+        assert!(!scene.lighting.as_ref().unwrap().has_remote(pos));
+        for _ in 0..2000 {
+            if scene.refresh_lighting(100_000).unwrap() {
+                assert!(scene.lighting.as_ref().unwrap().stamp(pos)[1] > 0);
+                scene.refresh_meshes();
+                assert!(scene.section_geometry(pos).is_some());
+                return;
+            }
+        }
+        panic!("terrain-only display did not finish local lighting");
+    }
+    #[test]
     fn matching_shared_light_changes_the_display_mesh_and_near_override_removes_it() {
         let (mut scene, mut near, mut terrain) = display_fixture();
         let pos = SectionPos::new(2, 0, 0);

@@ -382,7 +382,10 @@ impl VisualSession {
                         unreachable!()
                     };
                     if update.pages.len() == 1 {
-                        return Err(error);
+                        // Lighting is optional: a terrain-capable connection
+                        // may have no room for a light page. Keep local fallback
+                        // and leave the publication unsent for a later retry.
+                        return Ok(None);
                     }
                     update.pages.truncate(update.pages.len() / 2);
                 }

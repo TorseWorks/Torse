@@ -11,6 +11,7 @@ use torse_types::{Binding, BlockPos, Digest, Fault, SectionPos};
 mod source;
 pub use source::{LightInputVersion, LightSource};
 mod optics;
+use optics::checked_state;
 pub use optics::{LightOptics, LightOpticsTable, OpticalState};
 mod terrain;
 pub use terrain::LightTerrain;
@@ -373,9 +374,7 @@ impl LightJob {
                         direct_absorption = 0;
                     }
                     TerrainQuery::Ready(state) => {
-                        let light = optics
-                            .state(state)
-                            .ok_or_else(|| Fault::invalid_data("unregistered lighting state"))?;
+                        let light = checked_state(optics, state)?;
                         self.absorption[index] = light.absorption.max(1);
                         let level = light.emission;
                         direct_absorption = light.absorption;

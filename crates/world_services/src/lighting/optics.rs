@@ -15,6 +15,20 @@ pub trait LightOptics {
     fn state(&self, id: BlockStateId) -> Option<OpticalState>;
 }
 
+/// Validate at the solver boundary as hosts can implement LightOptics directly.
+pub(super) fn checked_state(
+    optics: &(impl LightOptics + ?Sized),
+    id: BlockStateId,
+) -> Result<OpticalState, Fault> {
+    let state = optics
+        .state(id)
+        .ok_or_else(|| Fault::invalid_data("unregistered lighting state"))?;
+    if state.absorption > super::MAX_LIGHT || state.emission > super::MAX_LIGHT {
+        return Err(Fault::invalid_data("invalid lighting coefficients"));
+    }
+    Ok(state)
+}
+
 impl LightOptics for BlockStateRegistry {
     fn identity(&self) -> Digest {
         self.authority_digest()

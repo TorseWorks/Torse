@@ -147,9 +147,7 @@ impl LightJob {
                     let (absorption, direct, emission) = match source.query(pos) {
                         TerrainQuery::Ready(id) if id.is_empty() => (1, 0, 0),
                         TerrainQuery::Ready(id) => {
-                            let transport = optics.state(id).ok_or_else(|| {
-                                Fault::invalid_data("unknown updated light state")
-                            })?;
+                            let transport = checked_state(optics, id)?;
                             (
                                 transport.absorption.max(1),
                                 transport.absorption,
