@@ -3,7 +3,7 @@ use torse_types::{Fault, SectionPos};
 
 use super::MAX_VISUAL_SECTIONS;
 
-const MAX_EXPLICIT_APPROVAL_SECTIONS: usize = 16_384;
+const MAX_EXPLICIT_APPROVAL_SECTIONS: usize = MAX_VISUAL_SECTIONS;
 
 /// Host-approved display coordinates. A rectangular approval takes constant
 /// space regardless of the number of covered sections.

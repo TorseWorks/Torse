@@ -292,6 +292,7 @@ fn optional_light_budgets_do_not_block_sparse_terrain_or_interest_moves() {
                 io_bytes: 32 * 1024 * 1024,
                 batch_bytes: 64 * 1024,
                 pages_per_poll: 8,
+                control_bytes: 64 * 1024,
             },
         )
         .unwrap();
@@ -302,6 +303,7 @@ fn optional_light_budgets_do_not_block_sparse_terrain_or_interest_moves() {
             TerrainLimits {
                 max_sections: 81,
                 max_bytes: 512 * 1024,
+                metadata_bytes: 81024,
             },
             None,
         )
@@ -513,6 +515,7 @@ fn shared_display_light_reaches_fast_peer_while_other_peer_keeps_output_pending(
         io_bytes: 32 * 1024 * 1024,
         batch_bytes: 64 * 1024,
         pages_per_poll: 1,
+        control_bytes: 64 * 1024,
     };
     for id in [slow, fast] {
         hub.enable_visual_interest(
@@ -533,6 +536,7 @@ fn shared_display_light_reaches_fast_peer_while_other_peer_keeps_output_pending(
         TerrainLimits {
             max_sections: 1,
             max_bytes: 128 * 1024,
+            metadata_bytes: 1024,
         },
         None,
     )
@@ -572,6 +576,7 @@ fn shared_display_light_reaches_fast_peer_while_other_peer_keeps_output_pending(
         TerrainLimits {
             max_sections: 1,
             max_bytes: 128 * 1024,
+            metadata_bytes: 1024,
         },
         None,
     )
@@ -637,6 +642,7 @@ fn ready_shared_light_is_attached_to_the_first_terrain_page() {
             io_bytes: 32 * 1024 * 1024,
             batch_bytes: 64 * 1024,
             pages_per_poll: 1,
+            control_bytes: 64 * 1024,
         },
     )
     .unwrap();
@@ -699,6 +705,7 @@ fn light_cache_denial_keeps_the_connection_and_terrain_delivery_alive() {
             io_bytes: 32 * 1024 * 1024,
             batch_bytes: 64 * 1024,
             pages_per_poll: 1,
+            control_bytes: 64 * 1024,
         },
     )
     .unwrap();
@@ -776,6 +783,7 @@ fn inline_light_that_exceeds_the_wire_item_budget_is_deferred_without_disconnect
             io_bytes: 32 * 1024 * 1024,
             batch_bytes: 64 * 1024,
             pages_per_poll: 1,
+            control_bytes: 64 * 1024,
         },
     )
     .unwrap();
@@ -786,6 +794,7 @@ fn inline_light_that_exceeds_the_wire_item_budget_is_deferred_without_disconnect
         TerrainLimits {
             max_sections: 1,
             max_bytes: 128 * 1024,
+            metadata_bytes: 1024,
         },
         None,
     )
@@ -859,6 +868,7 @@ fn shared_light_fixed_route_measurement() {
         io_bytes: 32 * 1024 * 1024,
         batch_bytes: 64 * 1024,
         pages_per_poll: 1,
+        control_bytes: 64 * 1024,
     };
     let mut mirror = TerrainMirror::new(
         server.binding(),
@@ -867,6 +877,7 @@ fn shared_light_fixed_route_measurement() {
         TerrainLimits {
             max_sections: 1,
             max_bytes: 128 * 1024,
+            metadata_bytes: 1024,
         },
         None,
     )

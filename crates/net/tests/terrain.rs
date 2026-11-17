@@ -5,6 +5,7 @@ use fixture::seed;
 use torse_net::terrain::*;
 use torse_sim::replica::*;
 use torse_types::*;
+use torse_world::WorldBounds;
 
 fn setup(bytes: u64) -> (TerrainMirror, TerrainUpdate<ReplicaSnapshot>) {
     let seed = seed(1);
@@ -15,6 +16,7 @@ fn setup(bytes: u64) -> (TerrainMirror, TerrainUpdate<ReplicaSnapshot>) {
         TerrainLimits {
             max_sections: 4,
             max_bytes: bytes,
+            metadata_bytes: 4_u64 * 1024,
         },
         None,
     )
@@ -38,6 +40,75 @@ fn setup(bytes: u64) -> (TerrainMirror, TerrainUpdate<ReplicaSnapshot>) {
         unavailable: vec![],
     };
     (mirror, update)
+}
+#[test]
+fn full_height_metadata_budget_is_independent_and_rejection_preserves_sequence() {
+    let (base, mut update) = setup(1_000_000);
+    let mut page = update.pages[0].clone();
+    drop(base);
+    let scope: Vec<_> = (-32..=32)
+        .flat_map(|x| (-4..20).flat_map(move |y| (-32..=32).map(move |z| SectionPos::new(x, y, z))))
+        .collect();
+    let mut limits = TerrainLimits {
+        max_sections: 131_072,
+        max_bytes: 4096,
+        metadata_bytes: 512,
+    };
+    let mut mirror = TerrainMirror::new(
+        update.binding,
+        16,
+        update.pages[0].terrain.bounds,
+        limits,
+        None,
+    )
+    .unwrap();
+    update.pages.clear();
+    update.reset = Some(TerrainReset {
+        sections: scope.clone(),
+        retained: Vec::new(),
+    });
+    assert!(mirror.apply(update.clone()).is_err());
+    assert!(mirror.desired().is_empty());
+    assert_eq!(mirror.accounted_bytes(), 0);
+    limits.metadata_bytes = 128 * 1024 * 1024;
+    let mut mirror = TerrainMirror::new(
+        update.binding,
+        16,
+        WorldBounds::new(-64, 320).unwrap(),
+        limits,
+        None,
+    )
+    .unwrap();
+    mirror.apply(update.clone()).unwrap();
+    assert_eq!(mirror.desired().len(), 101_400);
+    assert_eq!(mirror.cached_bytes(), 0);
+    assert_eq!(mirror.metadata_bytes(), 101_400 * 512);
+    page.terrain.bounds = WorldBounds::new(-64, 320).unwrap();
+    let mut batch = update.clone();
+    batch.reset = None;
+    batch.seq = 2;
+    batch.pages = vec![page];
+    assert_eq!(
+        mirror.apply(batch.clone()).unwrap_err().code,
+        FaultCode::ResourceLimit
+    );
+    assert_eq!(mirror.desired().len(), 101_400);
+    assert_eq!(mirror.cached_pages(), 0);
+    batch.pages.clear();
+    mirror.apply(batch).unwrap();
+    update.generation = 2;
+    update.reset.as_mut().unwrap().sections.reverse();
+    assert!(mirror.apply(update.clone()).is_err());
+    assert_eq!(mirror.desired().len(), 101_400);
+    update.reset = Some(TerrainReset {
+        sections: vec![SectionPos::ZERO],
+        retained: Vec::new(),
+    });
+    mirror.apply(update.clone()).unwrap();
+    assert_eq!(mirror.desired().len(), 1);
+    update.generation = 1;
+    assert!(mirror.apply(update).is_err());
+    assert_eq!(mirror.desired().len(), 1);
 }
 fn light(pos: SectionPos, digest: Digest, generation: u64) -> TerrainLight {
     TerrainLight {
@@ -252,7 +323,8 @@ fn cache_denial_is_atomic_and_pool_reservation_releases_on_drop() {
         update.pages[0].terrain.bounds,
         TerrainLimits {
             max_sections: 4,
-            max_bytes: 1_000_000,
+            max_bytes: 1_000_000 - 4 * 1024,
+            metadata_bytes: 4_u64 * 1024,
         },
         Some(pool.clone()),
     )

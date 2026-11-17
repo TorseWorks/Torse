@@ -66,6 +66,7 @@ fn shared_light_route_to_offscreen_draw() {
         io_bytes: 32 * 1024 * 1024,
         batch_bytes: 64 * 1024,
         pages_per_poll: 1,
+        control_bytes: 64 * 1024,
     };
     let mut mirror = TerrainMirror::new(
         server.binding(),
@@ -74,6 +75,7 @@ fn shared_light_route_to_offscreen_draw() {
         TerrainLimits {
             max_sections: 1,
             max_bytes: 128 * 1024,
+            metadata_bytes: 1_u64 * 1024,
         },
         None,
     )
