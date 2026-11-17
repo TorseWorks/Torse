@@ -1,0 +1,22 @@
+{
+  "baseline_commit": "bdae92b0df63f9eb1e5a5b61eead85abe70ffd4e",
+  "candidate_source_sha256": {
+    "apps/server/src/lighting.rs": "1d7806a01cf0e059efe0904dee5f06399e5d984cf354d18a80020a5140daf13a",
+    "apps/server/src/network_visual.rs": "dfc4bcd450991a15db0c5943e447fc22d4c5ecccf0de1aa16da00b153480b5c0",
+    "apps/server/src/visual.rs": "186efb52f54edfb5a950e1c24ce94826199288bc71c12d3be5bb3367e9c6a593",
+    "crates/world_services/src/lighting/shared.rs": "2c785f683716157f06644de7de17ace793af483a554155d405d6d124be573c3c",
+    "apps/server/tests/light_column_measurement.rs": "c2a40a1dff5faa96eb1286d25c8f038526c8406430065493255785b8b3641978"
+  },
+  "os": "Windows-11-10.0.26200-SP0",
+  "cpu": "Intel(R) Core(TM) i9-14900HX",
+  "rust": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "profile": "release",
+  "samples": 6,
+  "order": "candidate six samples, then baseline six samples",
+  "file_cache": "OS default, not flushed",
+  "fixture": "resident origin; 24 file-backed dense mixed stone/empty sections at x=-40..-17, y=z=0; world height 0..32; side 16",
+  "work_per_poll": 1000000,
+  "pages_per_poll": 4,
+  "network_and_client_rendering_measured": false,
+  "output_sha256": "7e9c4e0aa4fb1d941d58170b12be595c300d1fe300e775181965dddef0b143dd"
+}

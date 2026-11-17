@@ -90,6 +90,62 @@ fn emitter(registry: &BlockStateRegistry) -> BlockStateId {
 }
 
 #[test]
+fn ready_priority_overrides_coordinate_order() {
+    let (terrain, registry, mut field) = setup();
+    let first = SectionPos::ZERO;
+    let near = SectionPos::new(1, 0, 0);
+    field.subscribe(1, &[first, near]).unwrap();
+    for _ in 0..1000 {
+        if let Some(published) = field
+            .poll_ready(&terrain, &registry, 20_000, |p| {
+                Some(if p == near { 0 } else { 1 })
+            })
+            .unwrap()
+        {
+            assert_eq!(published, near);
+            assert!(field.publication(1, first, &terrain, &registry).is_none());
+            return;
+        }
+    }
+    panic!("priority target did not publish");
+}
+
+#[test]
+fn deferred_in_flight_column_does_not_block_ready_work_or_publish_stale_light() {
+    let (mut terrain, registry, mut field) = setup();
+    let first = SectionPos::ZERO;
+    let second = SectionPos::new(1, 0, 0);
+    field.subscribe(1, &[first, second]).unwrap();
+    field
+        .poll_ready(&terrain, &registry, 1, |_| Some(0))
+        .unwrap();
+    assert_eq!(field.diagnostics().started, 1);
+    assert_eq!(field.diagnostics().published, 0);
+    for _ in 0..1000 {
+        field
+            .poll_ready(&terrain, &registry, 20_000, |p| (p == second).then_some(0))
+            .unwrap();
+        if field.publication(1, second, &terrain, &registry).is_some() {
+            break;
+        }
+    }
+    assert!(field.publication(1, first, &terrain, &registry).is_none());
+    assert!(field.publication(1, second, &terrain, &registry).is_some());
+    terrain
+        .insert(
+            first,
+            Section::new(4, emitter(&registry)).unwrap(),
+            &registry,
+        )
+        .unwrap();
+    field.inputs_changed(&terrain, &registry);
+    settle(&mut field, &terrain, &registry);
+    let publication = field.publication(1, first, &terrain, &registry).unwrap();
+    assert!(publication.emitted.levels().iter().all(|&v| v == 15));
+    assert!(publication.validate(&terrain, &registry));
+}
+
+#[test]
 fn two_consumers_share_one_calculation_and_content_survives_source_switches() {
     let (mut terrain, registry, mut field) = setup();
     let target = SectionPos::ZERO;

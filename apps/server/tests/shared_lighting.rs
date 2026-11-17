@@ -50,6 +50,317 @@ fn settle(field: &mut HostLightField, host: &torse_server::execution::ExecutionH
     }
 }
 #[test]
+fn nearby_ready_column_publishes_before_distant_saved_inputs_are_verified() {
+    let dir = Directory::new();
+    let mut server = fixture::create(&dir);
+    let pages = fixture::pages(&dir);
+    let near = SectionPos::ZERO;
+    let mut targets = vec![near];
+    // Negative coordinates deliberately precede the near target in map order.
+    for x in -40..-16 {
+        let pos = SectionPos::new(x, 0, 0);
+        let page = fixture::generated(server.authority().unwrap().world(), pos);
+        server
+            .install_section(&pages, page, &mut NoReplicas)
+            .unwrap();
+        server.unload_section(&pages, pos, &mut NoReplicas).unwrap();
+        targets.push(pos);
+    }
+    targets.sort_unstable();
+    let mut config = limits();
+    config.input_sections = 512;
+    config.field.sections = 32;
+    config.field.interests = 64;
+    let mut light = HostLightField::new(server.authority().unwrap(), pages, config).unwrap();
+    assert_eq!(
+        light.subscribe_near(1, &targets, near).unwrap(),
+        targets.len()
+    );
+    for _ in 0..10 {
+        light.poll(server.authority().unwrap(), 1_000_000).unwrap();
+        if light
+            .publication(1, near, server.authority().unwrap())
+            .is_some()
+        {
+            assert_ne!(
+                light.input_status(targets[0]),
+                Some(LightInputStatus::Ready)
+            );
+            assert!(light.diagnostics().pending > 0);
+            return;
+        }
+    }
+    panic!("ready near column waited for unrelated saved terrain");
+}
+
+#[test]
+fn parked_input_pipeline_is_bounded_and_refresh_rejects_old_reads() {
+    let dir = Directory::new();
+    let mut server = fixture::create(&dir);
+    let pages = fixture::pages(&dir);
+    let targets = [
+        SectionPos::new(4, 0, 0),
+        SectionPos::new(5, 0, 0),
+        SectionPos::new(6, 0, 0),
+    ];
+    for pos in targets {
+        let page = fixture::generated(server.authority().unwrap().world(), pos);
+        server
+            .install_section(&pages, page, &mut NoReplicas)
+            .unwrap();
+        server.unload_section(&pages, pos, &mut NoReplicas).unwrap();
+    }
+    let mut config = limits();
+    config.pages_per_poll = 3;
+    let mut light = HostLightField::new(server.authority().unwrap(), pages, config).unwrap();
+    light.subscribe_near(1, &targets, targets[0]).unwrap();
+    light.poll(server.authority().unwrap(), 1_000_000).unwrap();
+    assert_eq!(light.resource_diagnostics().io_in_flight, 3);
+    assert_eq!(light.diagnostics().published, 0);
+    light.refresh().unwrap();
+    for pos in targets {
+        assert!(
+            light
+                .publication(1, pos, server.authority().unwrap())
+                .is_none()
+        );
+    }
+    settle(&mut light, server.authority().unwrap());
+    assert_eq!(light.resource_diagnostics().io_in_flight, 0);
+    assert_eq!(light.diagnostics().published, 3);
+}
+
+#[test]
+fn sparse_radius_32_light_admission_preserves_other_peers_and_replaces_old_links() {
+    let dir = Directory::new();
+    let server = fixture::create(&dir);
+    let mut config = limits();
+    // A single target's 3x3 horizontal halo spans two vertical sections.
+    config.input_sections = 18;
+    let mut light =
+        HostLightField::new(server.authority().unwrap(), fixture::pages(&dir), config).unwrap();
+    let origin = SectionPos::ZERO;
+    let far = SectionPos::new(32, 0, 32);
+    let sparse: Vec<_> = (-32..=32)
+        .step_by(8)
+        .flat_map(|x| (-32..=32).step_by(8).map(move |z| SectionPos::new(x, 0, z)))
+        .collect();
+    assert_eq!(light.subscribe_near(1, &sparse, origin).unwrap(), 1);
+    settle(&mut light, server.authority().unwrap());
+    assert!(
+        light
+            .publication(1, origin, server.authority().unwrap())
+            .is_some()
+    );
+    assert_eq!(light.subscribe_near(2, &sparse, far).unwrap(), 1);
+    assert_eq!(light.resource_diagnostics().admitted_links, 2);
+    // The second peer reuses the first peer's covered origin, rather than
+    // displacing it to satisfy its own otherwise unaffordable far target.
+    assert!(Arc::ptr_eq(
+        light
+            .publication(1, origin, server.authority().unwrap())
+            .unwrap(),
+        light
+            .publication(2, origin, server.authority().unwrap())
+            .unwrap(),
+    ));
+    assert_eq!(light.subscribe_near(2, &[far], far).unwrap(), 0);
+    assert!(
+        light
+            .publication(2, origin, server.authority().unwrap())
+            .is_none()
+    );
+    assert!(
+        light
+            .publication(1, origin, server.authority().unwrap())
+            .is_some()
+    );
+    light.unsubscribe(1);
+    assert_eq!(light.subscribe_near(2, &[far], far).unwrap(), 1);
+    assert_eq!(light.resource_diagnostics().input_sections, 18);
+    assert!(light.resource_diagnostics().admission_denials > 0);
+}
+
+#[test]
+fn consumer_and_link_caps_only_deny_optional_light_links() {
+    for consumer_cap in [true, false] {
+        let dir = Directory::new();
+        let server = fixture::create(&dir);
+        let mut config = limits();
+        if consumer_cap {
+            config.field.consumers = 1;
+        } else {
+            config.field.interests = 1;
+        }
+        let mut light =
+            HostLightField::new(server.authority().unwrap(), fixture::pages(&dir), config).unwrap();
+        assert_eq!(
+            light
+                .subscribe_near(1, &[SectionPos::ZERO], SectionPos::ZERO)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            light
+                .subscribe_near(2, &[SectionPos::ZERO], SectionPos::ZERO)
+                .unwrap(),
+            0
+        );
+        settle(&mut light, server.authority().unwrap());
+        assert!(
+            light
+                .publication(1, SectionPos::ZERO, server.authority().unwrap())
+                .is_some()
+        );
+        assert!(
+            light
+                .publication(2, SectionPos::ZERO, server.authority().unwrap())
+                .is_none()
+        );
+        light.unsubscribe(1);
+        assert_eq!(
+            light
+                .subscribe_near(2, &[SectionPos::ZERO], SectionPos::ZERO)
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn optional_light_budgets_do_not_block_sparse_terrain_or_interest_moves() {
+    use torse_net::{
+        MemoryTransport,
+        terrain::{TerrainLimits, TerrainMirror},
+    };
+    use torse_server::{
+        bootstrap as base,
+        network::*,
+        visual::{VisualTerrainApproval, VisualTerrainLimits},
+    };
+    use torse_sim::replica::ReplicaScope;
+    for cause in ["input envelope", "input bytes", "targets", "wire items"] {
+        let dir = Directory::new();
+        let mut server = fixture::create(&dir);
+        let pages = fixture::pages(&dir);
+        let near = SectionPos::ZERO;
+        let far = SectionPos::new(32, 0, 32);
+        let page = fixture::generated(server.authority().unwrap().world(), far);
+        server
+            .install_section(&pages, page, &mut NoReplicas)
+            .unwrap();
+        server.unload_section(&pages, far, &mut NoReplicas).unwrap();
+        let scope = ReplicaScope {
+            sections: (-32..=32)
+                .step_by(8)
+                .flat_map(|x| (-32..=32).step_by(8).map(move |z| SectionPos::new(x, 0, z)))
+                .collect(),
+        };
+        let mut network = base::network_limits();
+        let mut config = limits();
+        config.pages_per_poll = 64;
+        match cause {
+            "input envelope" => config.input_sections = 1,
+            "input bytes" => config.input_bytes = 1,
+            "targets" => config.field.sections = 1,
+            "wire items" => network.budget.max_items = 1000,
+            _ => unreachable!(),
+        }
+        let mut hub = NetworkHub::<MemoryTransport>::new(server.binding(), network).unwrap();
+        hub.enable_shared_lighting(&server, pages.clone(), config, 1_000_000)
+            .unwrap();
+        let (id, mut client, _, _) = interest::attach(
+            &mut hub,
+            &mut server,
+            ReplicaScope {
+                sections: [near].into(),
+            },
+        );
+        hub.enable_visual_interest(
+            &server,
+            id,
+            pages,
+            VisualTerrainApproval::rectangular(SectionPos::new(-32, 0, -32), far).unwrap(),
+            scope,
+            near,
+            VisualTerrainLimits {
+                max_sections: 81,
+                cache_bytes: 512 * 1024,
+                io_bytes: 32 * 1024 * 1024,
+                batch_bytes: 64 * 1024,
+                pages_per_poll: 8,
+            },
+        )
+        .unwrap();
+        let mut mirror = TerrainMirror::new(
+            server.binding(),
+            16,
+            server.authority().unwrap().world().store().bounds(),
+            TerrainLimits {
+                max_sections: 81,
+                max_bytes: 512 * 1024,
+            },
+            None,
+        )
+        .unwrap();
+        let start = Instant::now();
+        loop {
+            hub.poll(&mut server).unwrap();
+            for message in interest::drain(&mut client).0 {
+                match message {
+                    ServerMessage::Terrain(update) => {
+                        mirror.apply(update).unwrap();
+                    }
+                    ServerMessage::Light(update) => {
+                        mirror.apply_light(update).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            if mirror.page(near).is_some() && mirror.page(far).is_some() {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "{cause}");
+            std::thread::yield_now();
+        }
+        assert!(
+            mirror.light(far).is_none(),
+            "{cause}: fallback target must have terrain only"
+        );
+        assert!(hub.contains(id), "{cause}");
+        assert!(hub.shared_light_resources().unwrap().input_sections <= config.input_sections);
+        hub.set_visual_interest(
+            id,
+            ReplicaScope {
+                sections: [far].into(),
+            },
+            far,
+        )
+        .unwrap();
+        loop {
+            hub.poll(&mut server).unwrap();
+            for message in interest::drain(&mut client).0 {
+                match message {
+                    ServerMessage::Terrain(update) => {
+                        mirror.apply(update).unwrap();
+                    }
+                    ServerMessage::Light(update) => {
+                        mirror.apply_light(update).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            if mirror.page(near).is_none() && mirror.page(far).is_some() {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "move: {cause}");
+            std::thread::yield_now();
+        }
+        assert!(hub.contains(id), "{cause}");
+    }
+}
+
+#[test]
 fn file_backed_host_shares_results_and_reuses_identical_unload_reload_inputs() {
     let dir = Directory::new();
     let mut server = fixture::create(&dir);
