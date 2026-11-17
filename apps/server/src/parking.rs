@@ -1,14 +1,18 @@
 //! Background preparation of a single durable generated parking batch.
 use std::{collections::BTreeSet, thread::JoinHandle};
 
-use torse_sim::durable::SectionChange;
+use torse_sim::durable::{ParkingReservation, SectionChange};
 use torse_storage::CommitJournal;
 use torse_types::*;
 use torse_world::Snapshot;
 
 use crate::{
     CommitStep, HostCheckpointStore, InvalidationSink, Server,
-    execution::{ExecutionHost, ExecutionModel, streaming::reference},
+    coordinator::{DurablePublication, PublishedStep},
+    execution::{
+        ExecutionHost, ExecutionModel,
+        streaming::{bind_parked_page, reference},
+    },
     installs::SectionInstallLimits,
     section_pages::SectionPages,
 };
@@ -17,6 +21,10 @@ use crate::{
 pub enum ParkingProgress {
     Idle,
     Pending,
+    Stale {
+        position: SectionPos,
+    },
+    Canceled,
     Finished {
         commit: CommitStep,
         /// File-data synchronizations for the bundle. Directory metadata may
@@ -33,6 +41,12 @@ struct SavedBatch {
 pub(crate) struct ParkingJob {
     worker: Option<JoinHandle<Result<SavedBatch, Fault>>>,
     allocator: u128,
+    input: Option<Vec<Snapshot>>,
+    saved: Option<SavedBatch>,
+    pages: SectionPages,
+    canceled: bool,
+    #[cfg(test)]
+    before_write: Option<std::sync::mpsc::Receiver<()>>,
     positions: Vec<(SectionPos, Option<Revision>)>,
     _memory: Option<MemoryLease>,
 }
@@ -49,9 +63,8 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
     Server<ExecutionHost, J, S>
 {
     /// Submit one ordered batch of generated pages at the current generation
-    /// cut. The worker persists their immutable bytes without borrowing the host.
-    /// Input IDs extend the generation cut's allocator in page order. The
-    /// durable parked index binds them to authority IDs at publication.
+    /// cut. The first poll admits attached IDs durably before starting the writer.
+    /// Input IDs extend the generation cut's allocator in page order.
     pub fn begin_generated_parking(
         &mut self,
         pages: SectionPages,
@@ -120,42 +133,32 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
                 return Err(Fault::resource_limit("generated parking input bytes"));
             }
         }
-        let worker = std::thread::Builder::new()
-            .name("torse-generated-parking".into())
-            .spawn(move || {
-                let (digests, synced) = pages.put_bundle(&input)?;
-                let changes = input
-                    .into_iter()
-                    .zip(digests)
-                    .map(|(page, digest)| SectionChange {
-                        reference: reference(&page, digest),
-                        page,
-                        load: false,
-                        fresh: true,
-                    })
-                    .collect();
-                Ok(SavedBatch {
-                    changes,
-                    page_file_syncs: u32::from(synced),
-                })
-            })
-            .map_err(|error| {
-                Fault::new(
-                    FaultCode::StorageUnavailable,
-                    format!("start generated parking: {error}"),
-                )
-            })?;
         self.parking = Some(ParkingJob {
-            worker: Some(worker),
+            worker: None,
             allocator,
+            input: Some(input),
+            saved: None,
+            pages,
+            canceled: false,
+            #[cfg(test)]
+            before_write: None,
             positions: observed,
             _memory: memory,
         });
         Ok(())
     }
 
-    /// Poll the background job. A ready batch publishes at a tick boundary
-    /// and waits for one journal barrier before returning durable success.
+    /// Cancel pending publication. Reserved IDs are never returned to the allocator.
+    pub fn cancel_generated_parking(&mut self) -> Result<(), Fault> {
+        self.authority()?;
+        if let Some(job) = self.parking.as_mut() {
+            job.canceled = true;
+            self.authority.clear_parking_reservation();
+        }
+        Ok(())
+    }
+
+    /// A busy journal leaves the queued input or completed bundle in the job.
     pub fn poll_generated_parking(
         &mut self,
         sink: &mut impl InvalidationSink,
@@ -164,59 +167,256 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         let Some(job) = self.parking.as_ref() else {
             return Ok(ParkingProgress::Idle);
         };
-        if !job.worker.as_ref().expect("parking worker").is_finished()
-            || !host.residency_ready(false)
+        if job
+            .worker
+            .as_ref()
+            .is_some_and(|writer| !writer.is_finished())
+            || (!job.canceled && !host.residency_ready(false))
         {
             return Ok(ParkingProgress::Pending);
         }
         let mut job = self.parking.take().expect("parking job");
-        let mut saved = job
-            .worker
-            .take()
-            .expect("parking worker")
-            .join()
-            .map_err(|_| {
+        let result = self.advance_generated_parking(&mut job, sink);
+        if matches!(result, Ok(ParkingProgress::Pending)) {
+            self.parking = Some(job);
+        } else {
+            self.authority.clear_parking_reservation();
+        }
+        result
+    }
+
+    fn advance_generated_parking(
+        &mut self,
+        job: &mut ParkingJob,
+        sink: &mut impl InvalidationSink,
+    ) -> Result<ParkingProgress, Fault> {
+        if job.canceled {
+            return Ok(ParkingProgress::Canceled);
+        }
+        let world = self.authority.world();
+        for &(pos, retired) in &job.positions {
+            if world.store().phase(pos).is_some()
+                || world.store().retired_revision(pos) != retired
+                || self.authority.parked_sections().contains_key(&pos)
+            {
+                return Ok(ParkingProgress::Stale { position: pos });
+            }
+        }
+        if let Some(input) = job.input.as_ref() {
+            let first = world.entities().next_entity_id();
+            let mut original = job.allocator;
+            for page in input {
+                for entity in &page.entities {
+                    if entity.id != EntityId(original) {
+                        return Err(Fault::invalid_data("invalid generated parking identity"));
+                    }
+                    original = original
+                        .checked_add(1)
+                        .ok_or_else(|| Fault::resource_limit("generation allocator exhausted"))?;
+                }
+                if page.next_entity_id != original {
+                    return Err(Fault::invalid_data("invalid generated parking watermark"));
+                }
+            }
+            let count = original - job.allocator;
+            if count > 0 {
+                let end = first
+                    .checked_add(count)
+                    .ok_or_else(|| Fault::resource_limit("parking allocator exhausted"))?;
+                self.authority
+                    .queue_parking_reservation(ParkingReservation { first, end })?;
+                match self.drive_one(sink)? {
+                    CommitStep::Blocked(StageError::Busy) => return Ok(ParkingProgress::Pending),
+                    CommitStep::Blocked(error) => return Err(parking_stage_fault(error)),
+                    CommitStep::Durable(_) => {}
+                    CommitStep::Idle => {
+                        return Err(Fault::invalid_data("parking reservation disappeared"));
+                    }
+                }
+            }
+            let mut input = job.input.take().expect("queued generated parking");
+            let mut next = first;
+            for page in &mut input {
+                if !page.entities.is_empty() && first != job.allocator {
+                    let mut binding = reference(page, Digest::default());
+                    for id in &mut binding.entities {
+                        *id = EntityId(next);
+                        next += 1;
+                    }
+                    let bound = bind_parked_page(page, &binding)?;
+                    if let std::borrow::Cow::Owned(bound) = bound {
+                        *page = bound;
+                    }
+                }
+            }
+            job.worker = Some(start_writer(
+                job.pages.clone(),
+                input,
+                #[cfg(test)]
+                job.before_write.take(),
+            )?);
+            return Ok(ParkingProgress::Pending);
+        }
+        if let Some(worker) = job.worker.take() {
+            let saved = worker.join().map_err(|_| {
                 Fault::new(
                     FaultCode::StorageUnavailable,
                     "generated parking worker panicked",
                 )
             })??;
-        let world = self.authority.world();
-        let mut original = job.allocator;
-        let mut allocator = world.entities().next_entity_id();
-        for (change, &(pos, retired)) in saved.changes.iter_mut().zip(&job.positions) {
-            if world.store().phase(pos).is_some()
-                || world.store().retired_revision(pos) != retired
-                || self.authority.parked_sections().contains_key(&pos)
-            {
-                return Err(Fault::invalid_data("generated parking target changed"));
-            }
-            for (entity, id) in change
-                .page
-                .entities
-                .iter()
-                .zip(&mut change.reference.entities)
-            {
-                if entity.id != EntityId(original) {
-                    return Err(Fault::invalid_data("invalid generated parking identity"));
+            for change in &saved.changes {
+                if job.pages.digest(&change.page)? != change.reference.digest {
+                    return Err(Fault::invalid_data("generated parking digest mismatch"));
                 }
-                *id = EntityId(allocator);
-                original = original
-                    .checked_add(1)
-                    .ok_or_else(|| Fault::resource_limit("generation allocator exhausted"))?;
-                allocator = allocator
-                    .checked_add(1)
-                    .ok_or_else(|| Fault::resource_limit("parking allocator exhausted"))?;
             }
-            if change.page.next_entity_id != original {
-                return Err(Fault::invalid_data("invalid generated parking watermark"));
+            job.saved = Some(saved);
+        }
+        let saved = job.saved.take().expect("written parking bundle");
+        self.authority.queue_parked_sections(saved.changes)?;
+        match self.publish_one(sink, None)? {
+            PublishedStep::Blocked(StageError::Busy, prepared) => {
+                job.saved = Some(SavedBatch {
+                    changes: ExecutionHost::take_blocked_parking(prepared),
+                    page_file_syncs: saved.page_file_syncs,
+                });
+                Ok(ParkingProgress::Pending)
+            }
+            PublishedStep::Blocked(error, _) => Err(parking_stage_fault(error)),
+            PublishedStep::Published(publication) => {
+                let durability = self.flush_to(publication.at)?;
+                Ok(ParkingProgress::Finished {
+                    commit: CommitStep::Durable(DurablePublication {
+                        publication,
+                        durability,
+                    }),
+                    page_file_syncs: saved.page_file_syncs,
+                })
+            }
+            PublishedStep::Idle => Err(Fault::invalid_data(
+                "generated parking publication disappeared",
+            )),
+        }
+    }
+}
+
+fn parking_stage_fault(error: StageError) -> Fault {
+    match error {
+        StageError::TooLarge => Fault::resource_limit("generated parking journal record"),
+        StageError::InvalidRecord(fault) | StageError::Stopped(fault) => fault,
+        StageError::Busy => unreachable!("busy jobs remain queued"),
+    }
+}
+
+fn start_writer(
+    pages: SectionPages,
+    input: Vec<Snapshot>,
+    #[cfg(test)] before_write: Option<std::sync::mpsc::Receiver<()>>,
+) -> Result<JoinHandle<Result<SavedBatch, Fault>>, Fault> {
+    std::thread::Builder::new()
+        .name("torse-generated-parking".into())
+        .spawn(move || {
+            #[cfg(test)]
+            if let Some(gate) = before_write {
+                gate.recv()
+                    .map_err(|_| Fault::invalid_data("parking test gate disconnected"))?;
+            }
+            let (digests, synced) = pages.put_bundle(&input)?;
+            let changes = input
+                .into_iter()
+                .zip(digests)
+                .map(|(page, digest)| SectionChange {
+                    reference: reference(&page, digest),
+                    page,
+                    load: false,
+                    fresh: true,
+                })
+                .collect();
+            Ok(SavedBatch {
+                changes,
+                page_file_syncs: u32::from(synced),
+            })
+        })
+        .map_err(|error| {
+            Fault::new(
+                FaultCode::StorageUnavailable,
+                format!("start generated parking: {error}"),
+            )
+        })
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../examples/dense_install_baseline/workload.rs"]
+mod fixture;
+
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NoReplicas;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn paused_writer_preserves_terrain_only_and_reserved_pages() {
+        let dir = support::Directory::new();
+        let (mut server, pages, template) = fixture::create(dir.acquire()).unwrap();
+        for (x, has_entities) in [(2, false), (4, true)] {
+            let host = server.authority().unwrap();
+            let first = host.world().entities().next_entity_id();
+            let mut column = fixture::column(host, x, 0, &template, false);
+            if !has_entities {
+                for page in &mut column {
+                    page.entities.clear();
+                    page.next_entity_id = first;
+                }
+            }
+            server
+                .begin_generated_parking(
+                    pages.clone(),
+                    column.clone(),
+                    SectionInstallLimits {
+                        max_pages: 24,
+                        max_bytes: 8 * 1024 * 1024,
+                    },
+                )
+                .unwrap();
+            let (release, blocked) = std::sync::mpsc::channel();
+            server.parking.as_mut().unwrap().before_write = Some(blocked);
+            assert!(matches!(
+                server.poll_generated_parking(&mut NoReplicas).unwrap(),
+                ParkingProgress::Pending
+            ));
+            let end = first + if has_entities { 3 } else { 0 };
+            let host = server.authority().unwrap();
+            assert_eq!(host.world().entities().next_entity_id(), end);
+            let near = fixture::column(host, x + 1, 0, &template, false);
+            server
+                .install_section_batch(&pages, near, &mut NoReplicas)
+                .unwrap();
+            for page in &column {
+                assert!(!pages.path(pages.digest(page).unwrap()).exists());
+            }
+            release.send(()).unwrap();
+            let timeout = Instant::now() + Duration::from_secs(10);
+            loop {
+                match server.poll_generated_parking(&mut NoReplicas).unwrap() {
+                    ParkingProgress::Pending => std::thread::yield_now(),
+                    ParkingProgress::Finished {
+                        page_file_syncs: 1, ..
+                    } => break,
+                    other => panic!("unexpected parking progress: {other:?}"),
+                }
+                assert!(Instant::now() < timeout);
+            }
+            let host = server.authority().unwrap();
+            assert_eq!(host.world().entities().next_entity_id(), end + 3);
+            for page in column {
+                let reference = &host.parked_sections()[&page.sections[0].pos];
+                assert_eq!(pages.get(reference.digest).unwrap(), page);
             }
         }
-        self.authority.queue_parked_sections(saved.changes)?;
-        let commit = self.drive_one(sink)?;
-        Ok(ParkingProgress::Finished {
-            commit,
-            page_file_syncs: saved.page_file_syncs,
-        })
     }
 }

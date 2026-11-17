@@ -2,6 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+extern crate self as torse_server;
+
 pub mod archive;
 pub mod authentication;
 mod authority;

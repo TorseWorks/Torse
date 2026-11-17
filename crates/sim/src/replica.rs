@@ -254,6 +254,19 @@ impl ReplicaSource {
         self.world.publish_parked_sections(prepared)
     }
 
+    pub fn publish_parking_reservation(
+        &mut self,
+        barrier: PreparedChange,
+        range: crate::durable::ParkingReservation,
+    ) -> Result<Publication, CommitFault> {
+        let mut publication = self.world.publish_parking_reservation(barrier, range)?;
+        publication.invalidated_replicas = std::mem::take(&mut self.pending_invalidations)
+            .into_iter()
+            .map(SubscriptionId)
+            .collect();
+        Ok(publication)
+    }
+
     pub fn new(
         world: WorldAuthority,
         binding: Binding,

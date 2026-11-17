@@ -160,6 +160,7 @@ pub fn state(host: &ExecutionHost) -> Result<Vec<u8>, Fault> {
         meta,
         state: torse_sim::durable::ExecutionSnapshot {
             parked: Default::default(),
+            parking_reservation: None,
             world: host
                 .world()
                 .capture_snapshot(meta)

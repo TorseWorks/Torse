@@ -240,6 +240,30 @@ impl WorldAuthority {
         crate::streaming::prepare_batch(self, pages, budget, true)
     }
 
+    pub fn prepare_reserved_parking<'a>(
+        &self,
+        pages: impl ExactSizeIterator<Item = &'a Snapshot>,
+        range: crate::durable::ParkingReservation,
+        budget: torse_types::OutputBudget,
+    ) -> Result<crate::streaming::PreparedSections, torse_types::Fault> {
+        crate::streaming::prepare_parking(self, pages, budget, range)
+    }
+
+    pub fn publish_parking_reservation(
+        &mut self,
+        barrier: PreparedChange,
+        range: crate::durable::ParkingReservation,
+    ) -> Result<Publication, CommitFault> {
+        if !range.valid() || range.first != self.entities.next_entity_id() {
+            return Err(CommitFault::Invariant("stale parking reservation"));
+        }
+        let publication = self.publish(barrier)?;
+        self.entities
+            .restore_next_entity_id(range.end)
+            .map_err(|_| CommitFault::Invariant("invalid parking reservation"))?;
+        Ok(publication)
+    }
+
     /// Publish only the barrier and allocator watermark, leaving the pages
     /// outside the authoritative section and active entity stores.
     pub fn publish_parked_sections(
@@ -646,6 +670,31 @@ pub struct Recovery<'a> {
 }
 
 impl<'a> Recovery<'a> {
+    pub fn replay_parking_reservation(
+        &mut self,
+        world: &ChangeSet,
+        range: crate::durable::ParkingReservation,
+    ) -> Result<(), torse_types::Fault> {
+        let invalid = || torse_types::Fault::invalid_data("invalid parking reservation replay");
+        if !range.valid()
+            || self
+                .restored
+                .as_ref()
+                .ok_or_else(invalid)?
+                .entities
+                .next_entity_id()
+                != range.first
+        {
+            return Err(invalid());
+        }
+        self.replay(world).map_err(crate::streaming::fault)?;
+        self.restored
+            .as_mut()
+            .ok_or_else(invalid)?
+            .entities
+            .restore_next_entity_id(range.end)
+            .map_err(crate::streaming::fault)
+    }
     /// Apply an isolated residency record without executing gameplay or generation.
     pub fn replay_section(
         &mut self,
@@ -675,7 +724,14 @@ impl<'a> Recovery<'a> {
         generated: bool,
         budget: torse_types::OutputBudget,
     ) -> Result<(), torse_types::Fault> {
-        self.replay_sections_impl(changes, std::slice::from_ref(page), load, generated, budget)
+        self.replay_sections_impl(
+            changes,
+            std::slice::from_ref(page),
+            load,
+            generated,
+            budget,
+            None,
+        )
     }
     pub fn replay_generated_sections(
         &mut self,
@@ -683,7 +739,7 @@ impl<'a> Recovery<'a> {
         pages: &[Snapshot],
         budget: torse_types::OutputBudget,
     ) -> Result<(), torse_types::Fault> {
-        self.replay_sections_impl(changes, pages, true, true, budget)
+        self.replay_sections_impl(changes, pages, true, true, budget, None)
     }
     pub fn replay_parked_sections(
         &mut self,
@@ -691,7 +747,16 @@ impl<'a> Recovery<'a> {
         pages: &[Snapshot],
         budget: torse_types::OutputBudget,
     ) -> Result<(), torse_types::Fault> {
-        self.replay_sections_impl(changes, pages, false, true, budget)
+        self.replay_sections_impl(changes, pages, false, true, budget, None)
+    }
+    pub fn replay_reserved_parking(
+        &mut self,
+        changes: &ChangeSet,
+        pages: &[Snapshot],
+        range: crate::durable::ParkingReservation,
+        budget: torse_types::OutputBudget,
+    ) -> Result<(), torse_types::Fault> {
+        self.replay_sections_impl(changes, pages, false, true, budget, Some(range))
     }
     fn replay_sections_impl(
         &mut self,
@@ -700,6 +765,7 @@ impl<'a> Recovery<'a> {
         load: bool,
         generated: bool,
         budget: torse_types::OutputBudget,
+        reservation: Option<crate::durable::ParkingReservation>,
     ) -> Result<(), torse_types::Fault> {
         let invalid = || torse_types::Fault::invalid_data("illegal section recovery transition");
         if changes.meta.cursor.world != self.world
@@ -727,7 +793,10 @@ impl<'a> Recovery<'a> {
             coordinator,
         };
         if generated && !load {
-            let prepared = world.prepare_parked_sections(pages.iter(), budget)?;
+            let prepared = match reservation {
+                Some(range) => world.prepare_reserved_parking(pages.iter(), range, budget),
+                None => world.prepare_parked_sections(pages.iter(), budget),
+            }?;
             if prepared.meta() != changes.meta {
                 return Err(invalid());
             }

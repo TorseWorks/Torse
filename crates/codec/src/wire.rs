@@ -16,7 +16,8 @@ pub const EXECUTION_COMMIT_VERSION: u16 = 4;
 const PARKED_EXECUTION_COMMIT_VERSION: u16 = 6;
 const BOUND_PARKING_COMMIT_VERSION: u16 = 7;
 pub const PACKED_EXECUTION_COMMIT_VERSION: u16 = 5;
-pub const EXECUTION_SNAPSHOT_VERSION: u16 = 2;
+const RESERVED_PARKING_COMMIT_VERSION: u16 = 8;
+pub const EXECUTION_SNAPSHOT_VERSION: u16 = 3;
 pub trait Wire: Sized {
     fn write(&self, out: &mut Encoder<'_>) -> EncodeResult<()>;
     fn read(input: &mut Decoder<'_>) -> EncodeResult<Self>;
@@ -809,8 +810,10 @@ fields!(RuntimeState {
 fields!(ExecutionSnapshot {
     world,
     runtime,
-    parked
+    parked,
+    parking_reservation
 });
+fields!(ParkingReservation { first, end });
 fields!(ParkedSection { digest, entities });
 fields!(SectionChange {
     page,
@@ -835,12 +838,22 @@ impl Wire for RuntimeUpdate {
                 1u8.write(e)?;
                 progress.write(e)
             }
+            Self::ReserveParking(range) => {
+                2u8.write(e)?;
+                range.write(e)
+            }
+            Self::PublishParking(range) => {
+                3u8.write(e)?;
+                range.write(e)
+            }
         }
     }
     fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
         match u8::read(d)? {
             0 => Ok(Self::Full(Wire::read(d)?)),
             1 => Ok(Self::Progress(Wire::read(d)?)),
+            2 => Ok(Self::ReserveParking(Wire::read(d)?)),
+            3 => Ok(Self::PublishParking(Wire::read(d)?)),
             _ => Err(invalid("unknown runtime update")),
         }
     }
@@ -981,8 +994,16 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
         };
         let mut e = Encoder::new(out, b, self.limits);
         e.count_items(1)?;
-        e.write_u16(EXECUTION_SNAPSHOT_VERSION)?;
-        v.write(&mut e)?;
+        if v.state.parking_reservation.is_some() {
+            e.write_u16(EXECUTION_SNAPSHOT_VERSION)?;
+            v.write(&mut e)?;
+        } else {
+            e.write_u16(2)?;
+            v.meta.write(&mut e)?;
+            v.state.world.write(&mut e)?;
+            v.state.runtime.write(&mut e)?;
+            v.state.parked.write(&mut e)?;
+        }
         e.finish();
         Ok(())
     }
@@ -994,12 +1015,17 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
         d.charge_items(1)?;
         d.charge_bytes(size_of::<ModelSnapshot<M>>() as u64)?;
         let v = match d.read_u16()? {
-            1 => WorldSnapshot {
+            version @ (1 | 2) => WorldSnapshot {
                 meta: Wire::read(&mut d)?,
                 state: ExecutionSnapshot {
                     world: Wire::read(&mut d)?,
                     runtime: Wire::read(&mut d)?,
-                    parked: BTreeMap::new(),
+                    parked: if version == 1 {
+                        BTreeMap::new()
+                    } else {
+                        Wire::read(&mut d)?
+                    },
+                    parking_reservation: None,
                 },
             },
             EXECUTION_SNAPSHOT_VERSION => ModelSnapshot::<M>::read(&mut d)?,
@@ -1049,13 +1075,20 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
                     .map(|entity| entity.id)
                     .ne(change.reference.entities.iter().copied())
         });
-        encoder.write_u16(if parking || bound_load {
-            BOUND_PARKING_COMMIT_VERSION
-        } else if packed {
-            PACKED_EXECUTION_COMMIT_VERSION
-        } else {
-            EXECUTION_COMMIT_VERSION
-        })?;
+        encoder.write_u16(
+            if matches!(
+                v.changes.runtime,
+                RuntimeUpdate::ReserveParking(_) | RuntimeUpdate::PublishParking(_)
+            ) {
+                RESERVED_PARKING_COMMIT_VERSION
+            } else if parking || bound_load {
+                BOUND_PARKING_COMMIT_VERSION
+            } else if packed {
+                PACKED_EXECUTION_COMMIT_VERSION
+            } else {
+                EXECUTION_COMMIT_VERSION
+            },
+        )?;
         v.write(&mut encoder)?;
         encoder.finish();
         Ok(())
@@ -1104,6 +1137,7 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
             },
             EXECUTION_COMMIT_VERSION
             | PARKED_EXECUTION_COMMIT_VERSION
+            | RESERVED_PARKING_COMMIT_VERSION
             | BOUND_PARKING_COMMIT_VERSION => ModelCommit::<M>::read(&mut d)?,
             PACKED_EXECUTION_COMMIT_VERSION => {
                 d.packed_snapshot_cells = true;
@@ -1111,7 +1145,20 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
             }
             _ => return Err(Fault::incompatible("execution commit version")),
         };
-        let parking = version == PARKED_EXECUTION_COMMIT_VERSION
+        let reserved = matches!(
+            v.changes.runtime,
+            RuntimeUpdate::ReserveParking(_) | RuntimeUpdate::PublishParking(_)
+        );
+        if reserved != (version == RESERVED_PARKING_COMMIT_VERSION)
+            || (reserved
+                && (v.changes.section.is_some()
+                    || matches!(v.changes.runtime, RuntimeUpdate::PublishParking(_))
+                        == v.changes.sections.is_empty()))
+        {
+            return Err(invalid("execution reserved parking operation"));
+        }
+        let parking = matches!(v.changes.runtime, RuntimeUpdate::PublishParking(_))
+            || version == PARKED_EXECUTION_COMMIT_VERSION
             || (version == BOUND_PARKING_COMMIT_VERSION && !v.changes.sections.is_empty());
         if (parking && (v.changes.sections.is_empty() || v.changes.section.is_some()))
             || v.changes

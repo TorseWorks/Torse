@@ -172,6 +172,7 @@ struct Queued {
 pub struct ExecutionHost {
     players: BTreeMap<u128, player_control::PlayerSession>,
     parked: BTreeMap<SectionPos, ParkedSection>,
+    parking_reservation: Option<ParkingReservation>,
     visual_transitions:
         std::collections::VecDeque<(SectionPos, crate::visual::Stamp, crate::visual::Stamp)>,
     section_pending: Option<ExecutionPrepared>,
@@ -495,6 +496,7 @@ impl ExecutionHost {
             players: BTreeMap::new(),
             source: ReplicaSource::new(world, binding, limits.replicas)?,
             parked: BTreeMap::new(),
+            parking_reservation: None,
             visual_transitions: std::collections::VecDeque::new(),
             section_pending: None,
             section_install_limit: 24,
@@ -1480,11 +1482,21 @@ impl HostAuthority for ExecutionHost {
             }
         } else if let Some(section) = prepared.world.section {
             self.source.publish_section(*section)
+        } else if let RuntimeUpdate::ReserveParking(range) = prepared.record.changes.runtime {
+            self.source.publish_parking_reservation(
+                prepared.world.normal.expect("parking reservation barrier"),
+                range,
+            )
         } else {
             self.source
                 .publish(prepared.world.normal.expect("normal preparation"))
         }
         .map_err(commit_fault)?;
+        match prepared.record.changes.runtime {
+            RuntimeUpdate::ReserveParking(range) => self.parking_reservation = Some(range),
+            RuntimeUpdate::PublishParking(_) => self.parking_reservation = None,
+            _ => {}
+        }
         if parking {
             for change in &prepared.record.changes.sections {
                 self.parked
@@ -1584,6 +1596,7 @@ impl HostAuthority for ExecutionHost {
                 world,
                 runtime: self.runtime.clone(),
                 parked: self.parked.clone(),
+                parking_reservation: self.parking_reservation,
             },
         })
     }
@@ -1603,6 +1616,7 @@ impl HostAuthority for ExecutionHost {
 
 pub struct ExecutionRecovery<'a> {
     parked: BTreeMap<SectionPos, ParkedSection>,
+    parking_reservation: Option<ParkingReservation>,
     section_pages: Option<crate::section_pages::SectionPages>,
     binding: Binding,
     recovery: Recovery<'a>,
@@ -1624,6 +1638,7 @@ impl<'a> ExecutionRecovery<'a> {
     ) -> Self {
         Self {
             parked: BTreeMap::new(),
+            parking_reservation: None,
             section_pages: None,
             binding,
             recovery: Recovery::new(binding.world, registry, schemas),
@@ -1677,6 +1692,29 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
                 "execution snapshot boundary or compatibility",
             ));
         }
+        if let Some(range) = snapshot.state.parking_reservation {
+            let overlaps = |id: EntityId| (range.first..range.end).contains(&id.0);
+            if !range.valid()
+                || range.end > snapshot.state.world.next_entity_id
+                || snapshot
+                    .state
+                    .world
+                    .entities
+                    .iter()
+                    .any(|entity| overlaps(entity.id))
+                || snapshot
+                    .state
+                    .parked
+                    .values()
+                    .flat_map(|page| &page.entities)
+                    .copied()
+                    .any(overlaps)
+            {
+                return Err(Fault::invalid_data(
+                    "invalid checkpoint parking reservation",
+                ));
+            }
+        }
         self.validate(&snapshot.state.runtime, snapshot.meta.resume_at)?;
         receipt_bounds(&snapshot.state.runtime, snapshot.meta.cursor)?;
         self.recovery
@@ -1685,14 +1723,21 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
         self.point = Some(snapshot.meta.resume_at);
         self.runtime = Some(snapshot.state.runtime);
         self.parked = snapshot.state.parked;
+        self.parking_reservation = snapshot.state.parking_reservation;
         Ok(())
     }
     fn replay(&mut self, record: CommitRecord<ExecutionChanges>) -> Result<(), Fault> {
+        if let RuntimeUpdate::ReserveParking(range) = record.changes.runtime {
+            return self.replay_parking_reservation(record, range);
+        }
         if !record.changes.sections.is_empty() {
             return self.replay_section_batch(record);
         }
         if record.changes.section.is_some() {
             return self.replay_section(record);
+        }
+        if matches!(record.changes.runtime, RuntimeUpdate::PublishParking(_)) {
+            return Err(Fault::invalid_data("parking publication has no pages"));
         }
         let previous = self
             .point

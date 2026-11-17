@@ -60,7 +60,7 @@ fn finish(server: &mut base::Files) -> Result<(CommitStep, u32, Duration), Fault
             } => {
                 return Ok((commit, page_file_syncs, max_poll));
             }
-            ParkingProgress::Idle => panic!("parking job disappeared"),
+            other => panic!("parking job did not finish: {other:?}"),
         }
     }
 }
@@ -93,6 +93,10 @@ fn complete_generated_columns_park_across_ticks_and_recover_without_activation()
                 .next_entity_id(),
             old_id
         );
+        assert!(matches!(
+            server.poll_generated_parking(&mut NoReplicas).unwrap(),
+            ParkingProgress::Pending
+        ));
         if index == 0 {
             server.drive_tick(&mut NoReplicas, 1024).unwrap();
         }
@@ -205,7 +209,7 @@ fn complete_generated_columns_park_across_ticks_and_recover_without_activation()
 }
 
 #[test]
-fn parking_binds_ids_after_unrelated_allocations_without_rewriting_pages() {
+fn parking_reserves_ids_before_unrelated_allocations_without_rewriting_pages() {
     let dir = support::Directory::new();
     let (mut server, pages, template) = fixture::create(dir.acquire()).unwrap();
     for (x, entities) in [(3, false), (6, true)] {
@@ -225,11 +229,34 @@ fn parking_binds_ids_after_unrelated_allocations_without_rewriting_pages() {
         server
             .begin_generated_parking(pages.clone(), input.clone(), LIMITS)
             .unwrap();
+        let first = server
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .next_entity_id();
+        let count = if entities { 3 } else { 0 };
+        assert!(matches!(
+            server.poll_generated_parking(&mut NoReplicas).unwrap(),
+            ParkingProgress::Pending
+        ));
+        assert_eq!(
+            server
+                .authority()
+                .unwrap()
+                .world()
+                .entities()
+                .next_entity_id(),
+            first + count
+        );
+        if entities {
+            server.checkpoint().unwrap();
+        }
         let unrelated = fixture::column(server.authority().unwrap(), x + 1, 0, &template, false);
         server
             .install_section_batch(&pages, unrelated, &mut NoReplicas)
             .unwrap();
-        let first = server
+        let watermark = server
             .authority()
             .unwrap()
             .world()
@@ -245,12 +272,11 @@ fn parking_binds_ids_after_unrelated_allocations_without_rewriting_pages() {
             assert_eq!(pages.get(reference.digest).unwrap(), page);
             ids.extend(reference.entities.iter().copied());
         }
-        let count = if entities { 3 } else { 0 };
         assert_eq!(
             ids,
             (first..first + count).map(EntityId).collect::<Vec<_>>()
         );
-        assert_eq!(host.world().entities().next_entity_id(), first + count);
+        assert_eq!(host.world().entities().next_entity_id(), watermark);
     }
     let expected = server.authority().unwrap().parked_sections().clone();
     drop(server);
@@ -375,6 +401,101 @@ fn retirement_batches_sync_once_and_recheck_foldback() {
 }
 
 #[test]
+fn parking_unpublished_crash_child() {
+    let Some(path) = std::env::var_os("TORSE_TEST_UNPUBLISHED_PARKING") else {
+        return;
+    };
+    let directory = torse_server::WorldDirectory::acquire(path, base::WORLD, 8192).unwrap();
+    let (mut server, pages, template) = fixture::create(directory).unwrap();
+    let input = fixture::column(server.authority().unwrap(), 3, 0, &template, false);
+    let paths: Vec<_> = input
+        .iter()
+        .map(|p| pages.path(pages.digest(p).unwrap()))
+        .collect();
+    server
+        .begin_generated_parking(pages, input, LIMITS)
+        .unwrap();
+    assert!(matches!(
+        server.poll_generated_parking(&mut NoReplicas).unwrap(),
+        ParkingProgress::Pending
+    ));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !paths.iter().all(|path| path.is_file()) {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    std::process::exit(76);
+}
+
+#[test]
+fn written_unpublished_bundle_recovers_only_its_reservation() {
+    let dir = support::Directory::new();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "parking_unpublished_crash_child"])
+        .env("TORSE_TEST_UNPUBLISHED_PARKING", &dir.0)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(76));
+    let pages = SectionPages::new(
+        dir.0.join("sections"),
+        base::budget(),
+        base::codec_limits(),
+        4096,
+    )
+    .unwrap();
+    let server = reopen(&dir, &pages);
+    let host = server.authority().unwrap();
+    assert_eq!(host.world().entities().next_entity_id(), 4);
+    assert!(host.parked_sections().is_empty());
+    assert!(host.world().entities().iter().next().is_none());
+}
+
+#[test]
+fn canceled_parking_does_not_return_reserved_ids() {
+    let dir = support::Directory::new();
+    let (mut server, pages, template) = fixture::create(dir.acquire()).unwrap();
+    let input = fixture::column(server.authority().unwrap(), 3, 0, &template, false);
+    server
+        .begin_generated_parking(pages.clone(), input, LIMITS)
+        .unwrap();
+    assert!(matches!(
+        server.poll_generated_parking(&mut NoReplicas).unwrap(),
+        ParkingProgress::Pending
+    ));
+    server.cancel_generated_parking().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match server.poll_generated_parking(&mut NoReplicas).unwrap() {
+            ParkingProgress::Pending => std::thread::yield_now(),
+            ParkingProgress::Canceled => break,
+            other => panic!("unexpected parking progress: {other:?}"),
+        }
+        assert!(Instant::now() < deadline);
+    }
+    assert!(server.authority().unwrap().parked_sections().is_empty());
+    assert_eq!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .next_entity_id(),
+        4
+    );
+    drop(server);
+    let recovered = reopen(&dir, &pages);
+    assert_eq!(
+        recovered
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .next_entity_id(),
+        4
+    );
+}
+
+#[test]
 fn generated_parking_rejects_a_target_installed_during_background_io() {
     let dir = support::Directory::new();
     let (mut server, pages, template) = fixture::create(dir.acquire()).unwrap();
@@ -383,8 +504,13 @@ fn generated_parking_rejects_a_target_installed_during_background_io() {
     server
         .begin_generated_parking(pages.clone(), input.clone(), LIMITS)
         .unwrap();
+    assert!(matches!(
+        server.poll_generated_parking(&mut NoReplicas).unwrap(),
+        ParkingProgress::Pending
+    ));
+    let installation = fixture::column(server.authority().unwrap(), 3, 0, &template, false);
     server
-        .install_section(&pages, input[0].clone(), &mut NoReplicas)
+        .install_section(&pages, installation[0].clone(), &mut NoReplicas)
         .unwrap();
     let host = server.authority().unwrap();
     let cursor = host.cursor();
@@ -392,10 +518,15 @@ fn generated_parking_rejects_a_target_installed_during_background_io() {
         .world()
         .capture_section(target, base::budget())
         .unwrap();
-    assert_eq!(
-        finish(&mut server).unwrap_err().code,
-        FaultCode::InvalidData
-    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match server.poll_generated_parking(&mut NoReplicas).unwrap() {
+            ParkingProgress::Pending => std::thread::yield_now(),
+            ParkingProgress::Stale { position } if position == target => break,
+            other => panic!("unexpected parking progress: {other:?}"),
+        }
+        assert!(Instant::now() < deadline);
+    }
     let host = server.authority().unwrap();
     assert_eq!(host.cursor(), cursor);
     assert!(host.parked_sections().is_empty());
@@ -525,6 +656,14 @@ fn invalid_allocator_budget_and_file_capacity_do_not_publish_a_prefix() {
         finish(&mut server).unwrap_err().code,
         FaultCode::ResourceLimit
     );
+    let before_failure = server
+        .authority()
+        .unwrap()
+        .world()
+        .entities()
+        .next_entity_id();
+    assert_eq!(before_failure, 4);
+    let input = fixture::column(server.authority().unwrap(), 3, 0, &template, false);
     let mut invalid = input.clone();
     invalid.last_mut().unwrap().next_entity_id += 1;
     server
@@ -535,8 +674,8 @@ fn invalid_allocator_budget_and_file_capacity_do_not_publish_a_prefix() {
         FaultCode::InvalidData
     );
     let host = server.authority().unwrap();
-    assert_eq!(host.cursor(), before);
-    assert_eq!(host.world().entities().next_entity_id(), 1);
+    assert!(host.cursor().seq > before.seq);
+    assert_eq!(host.world().entities().next_entity_id(), before_failure);
     assert!(host.world().store().is_empty());
     assert!(host.parked_sections().is_empty());
     server
@@ -636,7 +775,7 @@ fn compare_direct_parking_with_install_then_unload_and_a_large_index() {
             };
             let elapsed = start.elapsed();
             let journal_flushes = server.flush_metrics().calls - before;
-            assert_eq!(journal_flushes, if direct { 1 } else { 25 });
+            assert_eq!(journal_flushes, if direct { 2 } else { 25 });
             assert_eq!(page_file_syncs, if direct { 1 } else { 24 });
             assert_eq!(server.authority().unwrap().world().store().len(), 24);
             if x <= 6 || x > 96 {

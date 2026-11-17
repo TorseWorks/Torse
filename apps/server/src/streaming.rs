@@ -209,6 +209,50 @@ mod cost_tests {
 }
 
 impl ExecutionHost {
+    pub(crate) fn clear_parking_reservation(&mut self) {
+        self.parking_reservation = None;
+    }
+
+    pub(crate) fn queue_parking_reservation(
+        &mut self,
+        range: ParkingReservation,
+    ) -> Result<(), Fault> {
+        if !self.residency_ready(false)
+            || !range.valid()
+            || range.first != self.world().entities().next_entity_id()
+        {
+            return Err(Fault::invalid_data("invalid parking reservation cut"));
+        }
+        let barrier = self.world().prepare_barrier().map_err(commit_fault)?;
+        let meta = barrier.meta();
+        let empty = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
+            .map_err(|error| Fault::invalid_data(error.to_string()))?;
+        let mut prepared = ExecutionPrepared {
+            world: PreparedWorld {
+                normal: Some(barrier),
+                section: None,
+                sections: None,
+            },
+            record: CommitRecord {
+                meta,
+                changes: ExecutionChanges {
+                    world: empty,
+                    runtime: RuntimeUpdate::ReserveParking(range),
+                    outcome: None,
+                    cancelled: None,
+                    section: None,
+                    sections: Vec::new(),
+                },
+            },
+            memory: None,
+            runtime: self.runtime.clone(),
+            remove_pending: Vec::new(),
+        };
+        self.account_residency(&mut prepared)?;
+        self.section_pending = Some(prepared);
+        Ok(())
+    }
+
     fn residency_reference(
         &self,
         page: &Snapshot,
@@ -232,6 +276,9 @@ impl ExecutionHost {
     ) -> Result<(), Fault> {
         self.section_pending = Some(self.prepare_section_batch(changes)?);
         Ok(())
+    }
+    pub(crate) fn take_blocked_parking(prepared: ExecutionPrepared) -> Vec<SectionChange> {
+        prepared.record.changes.sections
     }
     pub fn parked_sections(&self) -> &BTreeMap<SectionPos, ParkedSection> {
         &self.parked
@@ -434,6 +481,13 @@ impl ExecutionHost {
         }
         if !load {
             check_parked_additions(&self.parked, &changes, self.limits)?;
+            if self.parking_reservation.is_some()
+                && changes.iter().any(|change| {
+                    change.reference != reference(&change.page, change.reference.digest)
+                })
+            {
+                return Err(Fault::invalid_data("reserved parking page identities"));
+            }
         }
         let _codec = self
             .memory_pool()
@@ -452,9 +506,19 @@ impl ExecutionHost {
             self.world()
                 .prepare_generated_sections_iter(pages, self.limits.runtime)?
         } else {
-            let bound = bind_parking_batch(&changes)?;
-            self.world()
-                .prepare_parked_sections(bound.iter().map(Cow::as_ref), self.limits.runtime)?
+            match self.parking_reservation {
+                Some(range) => {
+                    self.world()
+                        .prepare_reserved_parking(pages, range, self.limits.runtime)?
+                }
+                None => {
+                    let bound = bind_parking_batch(&changes)?;
+                    self.world().prepare_parked_sections(
+                        bound.iter().map(Cow::as_ref),
+                        self.limits.runtime,
+                    )?
+                }
+            }
         };
         let meta = world.meta();
         let empty = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
@@ -472,7 +536,10 @@ impl ExecutionHost {
                 meta,
                 changes: ExecutionChanges {
                     world: empty,
-                    runtime: RuntimeUpdate::Full(self.runtime.clone()),
+                    runtime: match self.parking_reservation.filter(|_| !load) {
+                        Some(range) => RuntimeUpdate::PublishParking(range),
+                        None => RuntimeUpdate::Full(self.runtime.clone()),
+                    },
                     outcome: None,
                     cancelled: None,
                     section: None,
@@ -882,6 +949,38 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
 }
 
 impl ExecutionRecovery<'_> {
+    pub(super) fn replay_parking_reservation(
+        &mut self,
+        record: CommitRecord<ExecutionChanges>,
+        range: ParkingReservation,
+    ) -> Result<(), Fault> {
+        let changes = &record.changes;
+        let world = &changes.world;
+        if record.meta != world.meta
+            || record.meta.compatibility != self.binding.compatibility
+            || Some(record.meta.resume_at) != self.point
+            || record.meta.resume_at.next_phase != 0
+            || record.meta.resume_at.next_step != 0
+            || self
+                .runtime
+                .as_ref()
+                .is_none_or(|state| state.work.is_some())
+            || changes.section.is_some()
+            || !changes.sections.is_empty()
+            || changes.outcome.is_some()
+            || changes.cancelled.is_some()
+            || !world.edits.is_empty()
+            || !world.entity_moves.is_empty()
+            || !world.component_edits.is_empty()
+            || world.entity_lifecycle.is_some()
+        {
+            return Err(Fault::invalid_data("invalid parking reservation record"));
+        }
+        self.recovery.replay_parking_reservation(world, range)?;
+        self.parking_reservation = Some(range);
+        Ok(())
+    }
+
     pub fn with_section_pages(mut self, pages: SectionPages) -> Self {
         self.section_pages = Some(pages);
         self
@@ -892,7 +991,9 @@ impl ExecutionRecovery<'_> {
         record: CommitRecord<ExecutionChanges>,
     ) -> Result<(), Fault> {
         let change = record.changes.section.as_ref().expect("section replay");
-        if change.fresh && !change.load {
+        if !matches!(record.changes.runtime, RuntimeUpdate::Full(_))
+            || (change.fresh && !change.load)
+        {
             return Err(Fault::invalid_data(
                 "direct parking requires a generated batch",
             ));
@@ -996,7 +1097,11 @@ impl ExecutionRecovery<'_> {
             || before.work.is_some()
             || changes.outcome.is_some()
             || changes.cancelled.is_some()
-            || !matches!(&changes.runtime, RuntimeUpdate::Full(state) if state == before)
+            || !match &changes.runtime {
+                RuntimeUpdate::Full(state) => state == before,
+                RuntimeUpdate::PublishParking(range) => self.parking_reservation == Some(*range),
+                _ => false,
+            }
         {
             return Err(Fault::invalid_data(
                 "invalid generated batch execution semantics",
@@ -1017,7 +1122,33 @@ impl ExecutionRecovery<'_> {
                 return Err(Fault::invalid_data("invalid generated batch page"));
             }
         }
-        if load {
+        if let RuntimeUpdate::PublishParking(range) = changes.runtime {
+            if load
+                || changes.sections.iter().any(|change| {
+                    change.reference != reference(&change.page, change.reference.digest)
+                })
+            {
+                return Err(Fault::invalid_data("reserved parking page identities"));
+            }
+            check_parked_additions(&self.parked, &changes.sections, self.limits)?;
+            let pages: Vec<_> = changes
+                .sections
+                .iter()
+                .map(|change| change.page.clone())
+                .collect();
+            self.recovery.replay_reserved_parking(
+                &changes.world,
+                &pages,
+                range,
+                self.limits.runtime,
+            )?;
+            self.parking_reservation = None;
+            for change in &changes.sections {
+                self.parked
+                    .insert(change.page.sections[0].pos, change.reference.clone());
+            }
+            Ok(())
+        } else if load {
             let pages: Vec<_> = changes.sections.iter().map(|c| c.page.clone()).collect();
             self.recovery
                 .replay_generated_sections(&changes.world, &pages, self.limits.runtime)

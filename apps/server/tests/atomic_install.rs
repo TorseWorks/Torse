@@ -11,7 +11,7 @@ use std::{
 use support::Directory;
 use torse_server::{bootstrap as base, execution::*, section_pages::SectionPages, *};
 use torse_sim::WorldAuthority;
-use torse_storage::{Checkpoints, FileCheckpointBackend, Journal, JournalBackend};
+use torse_storage::{Checkpoints, CommitJournal, FileCheckpointBackend, Journal, JournalBackend};
 use torse_types::*;
 use torse_world::*;
 
@@ -20,6 +20,7 @@ struct Counts {
     appends: AtomicUsize,
     syncs: AtomicUsize,
     fail: AtomicUsize,
+    busy: AtomicUsize,
 }
 struct ObservedFile {
     file: std::fs::File,
@@ -51,9 +52,39 @@ impl JournalBackend for ObservedFile {
         Ok(())
     }
 }
+type FileJournal = Journal<ExecutionModel, base::Codec, ObservedFile>;
+struct GatedJournal {
+    inner: FileJournal,
+    counts: Arc<Counts>,
+}
+impl CommitJournal<ExecutionModel> for GatedJournal {
+    type Staged = <FileJournal as CommitJournal<ExecutionModel>>::Staged;
+    fn try_stage(
+        &mut self,
+        record: &ModelCommit<ExecutionModel>,
+    ) -> Result<Self::Staged, StageError> {
+        if self.counts.busy.load(Ordering::SeqCst) != 0
+            && !record.changes.sections.is_empty()
+            && !record.changes.sections[0].load
+        {
+            self.counts.busy.fetch_add(1, Ordering::SeqCst);
+            return Err(StageError::Busy);
+        }
+        self.inner.try_stage(record)
+    }
+    fn accept(&mut self, staged: Self::Staged) -> Result<(), Fault> {
+        self.inner.accept(staged)
+    }
+    fn flush_through(&mut self, target: CommitCursor) -> Result<Durability, Fault> {
+        self.inner.flush_through(target)
+    }
+    fn durability(&self) -> Durability {
+        self.inner.durability()
+    }
+}
 type Files = Server<
     ExecutionHost,
-    Journal<ExecutionModel, base::Codec, ObservedFile>,
+    GatedJournal,
     Checkpoints<ExecutionModel, base::Codec, FileCheckpointBackend>,
 >;
 fn setup(
@@ -108,6 +139,10 @@ fn setup(
     let mut limits = base::execution_limits();
     limits.runtime = runtime;
     let host = ExecutionHost::new(binding, world, actions, Vec::new(), limits).unwrap();
+    let journal = GatedJournal {
+        inner: journal,
+        counts: counts.clone(),
+    };
     let server = Server::initialize(directory, host, journal, checkpoints, config.server).unwrap();
     std::fs::create_dir(dir.0.join("sections")).unwrap();
     let pages = SectionPages::new(
@@ -318,6 +353,57 @@ fn partial_append_and_failed_sync_recover_zero_or_whole_batch_above_confirmed_fl
 }
 
 #[test]
+fn busy_parking_publication_retains_the_written_bundle() {
+    use std::time::Duration;
+    use torse_server::{execution::installs::SectionInstallLimits, parking::ParkingProgress};
+    let dir = Directory::new();
+    let (mut server, pages, counts) = setup(&dir, base::execution_limits().runtime, 8_388_608);
+    let input = column(server.authority().unwrap(), 3, true);
+    server
+        .begin_generated_parking(
+            pages.clone(),
+            input.clone(),
+            SectionInstallLimits {
+                max_pages: 24,
+                max_bytes: 8_388_608,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        server.poll_generated_parking(&mut NoReplicas).unwrap(),
+        ParkingProgress::Pending
+    ));
+    let reservation = server.authority().unwrap().cursor();
+    counts.busy.store(1, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while counts.busy.load(Ordering::SeqCst) == 1 {
+        assert!(matches!(
+            server.poll_generated_parking(&mut NoReplicas).unwrap(),
+            ParkingProgress::Pending
+        ));
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(server.authority().unwrap().cursor(), reservation);
+    assert!(server.authority().unwrap().parked_sections().is_empty());
+    let file = pages.path(pages.digest(&input[0]).unwrap());
+    let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+    counts.busy.store(0, Ordering::SeqCst);
+    assert!(matches!(
+        server.poll_generated_parking(&mut NoReplicas).unwrap(),
+        ParkingProgress::Finished {
+            page_file_syncs: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        std::fs::metadata(file).unwrap().modified().unwrap(),
+        modified
+    );
+    assert_eq!(server.authority().unwrap().parked_sections().len(), 24);
+}
+
+#[test]
 fn parked_batch_recovery_handles_partial_append_and_lost_sync_acknowledgement() {
     use std::time::Duration;
     use torse_server::{execution::installs::SectionInstallLimits, parking::ParkingProgress};
@@ -329,9 +415,7 @@ fn parked_batch_recovery_handles_partial_append_and_lost_sync_acknowledgement() 
         server
             .install_section_batch(&pages, vec![anchor], &mut NoReplicas)
             .unwrap();
-        let floor = server.durability().through;
         let input = column(server.authority().unwrap(), 3, true);
-        counts.fail.store(mode, Ordering::SeqCst);
         server
             .begin_generated_parking(
                 pages.clone(),
@@ -342,6 +426,12 @@ fn parked_batch_recovery_handles_partial_append_and_lost_sync_acknowledgement() 
                 },
             )
             .unwrap();
+        assert!(matches!(
+            server.poll_generated_parking(&mut NoReplicas).unwrap(),
+            ParkingProgress::Pending
+        ));
+        let floor = server.durability().through;
+        counts.fail.store(mode, Ordering::SeqCst);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match server.poll_generated_parking(&mut NoReplicas) {
@@ -365,10 +455,7 @@ fn parked_batch_recovery_handles_partial_append_and_lost_sync_acknowledgement() 
         assert_eq!(host.world().store().len(), 1);
         assert_eq!(host.world().entities().iter().count(), 0);
         assert_eq!(host.parked_sections().len(), if mode == 1 { 0 } else { 24 });
-        assert_eq!(
-            host.world().entities().next_entity_id(),
-            if mode == 1 { 1 } else { 25 }
-        );
+        assert_eq!(host.world().entities().next_entity_id(), 25);
     }
 }
 

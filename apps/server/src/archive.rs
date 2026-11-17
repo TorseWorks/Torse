@@ -261,6 +261,7 @@ impl ExecutionRecovery<'_> {
                 world: archive.world.snapshot.clone(),
                 runtime: archive.runtime.clone(),
                 parked: Default::default(),
+                parking_reservation: None,
             },
         })
     }

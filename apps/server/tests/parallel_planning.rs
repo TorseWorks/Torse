@@ -185,6 +185,7 @@ fn bytes(host: &ExecutionHost) -> Vec<u8> {
         meta,
         state: ExecutionSnapshot {
             parked: Default::default(),
+            parking_reservation: None,
             world: host.world().capture_snapshot(meta).unwrap(),
             runtime: host.runtime().clone(),
         },
