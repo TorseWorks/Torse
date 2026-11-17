@@ -247,11 +247,34 @@ impl SharedLightField {
         registry: &BlockStateRegistry,
         work: usize,
     ) -> Result<Option<SectionPos>, Fault> {
+        self.poll_ready(source, registry, work, |_| Some(0))
+    }
+
+    /// Advance a ready target, preferring the lowest host-supplied priority.
+    /// `None` defers a target whose source envelope is still being verified.
+    /// In-flight work that becomes unready is cancelled, allowing unrelated
+    /// ready columns to progress without publishing against transient inputs.
+    pub fn poll_ready(
+        &mut self,
+        source: &(impl LightSource + ?Sized),
+        registry: &BlockStateRegistry,
+        work: usize,
+        priority: impl Fn(SectionPos) -> Option<u128>,
+    ) -> Result<Option<SectionPos>, Fault> {
         if work == 0 {
             return Ok(None);
         }
         if source.binding().is_some_and(|b| b != self.binding) {
             return Err(Fault::invalid_data("light field binding"));
+        }
+        if self
+            .work
+            .as_ref()
+            .is_some_and(|w| priority(w.target).is_none())
+        {
+            let active = self.work.take().expect("unready lighting work");
+            self.pending.insert(active.target);
+            self.measure();
         }
         if self.work.is_none() {
             // Unknown targets wait without spinning calculations. A later input
@@ -259,7 +282,7 @@ impl SharedLightField {
             let target = self
                 .pending
                 .iter()
-                .find(|&&p| {
+                .filter(|&&p| {
                     !self.blocked.contains(&p)
                         && matches!(
                             source.version(p),
@@ -267,7 +290,9 @@ impl SharedLightField {
                                 | LightInputVersion::Resident { readable: true, .. }
                         )
                 })
-                .copied();
+                .filter_map(|&p| priority(p).map(|rank| (rank, p)))
+                .min()
+                .map(|(_, p)| p);
             let Some(target) = target else {
                 return Ok(None);
             };

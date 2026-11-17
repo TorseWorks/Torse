@@ -39,6 +39,11 @@ pub struct HostLightDiagnostics {
     pub input_bytes: usize,
     pub input_peak: usize,
     pub io_pending: bool,
+    pub io_in_flight: usize,
+    pub input_sections: usize,
+    pub admitted_links: usize,
+    /// Targets omitted by best-effort admission, accumulated across requests.
+    pub admission_denials: u64,
     pub reserved_bytes: u64,
 }
 struct Input {
@@ -76,10 +81,14 @@ pub struct HostLightField {
     field: SharedLightField,
     limits: HostLightLimits,
     interests: BTreeMap<u128, BTreeSet<SectionPos>>,
+    centers: BTreeMap<u128, SectionPos>,
     needed: BTreeSet<SectionPos>,
+    input_order: Vec<SectionPos>,
     inputs: BTreeMap<SectionPos, Input>,
     loader: Loader,
-    busy: bool,
+    in_flight: usize,
+    io_capacity: usize,
+    admission_denials: u64,
     io_generation: u64,
     page_budget: OutputBudget,
     _memory: Option<MemoryLease>,
@@ -120,10 +129,20 @@ impl HostLightField {
             limits.input_bytes,
         )?;
         let field = SharedLightField::new(host.binding(), limits.field)?;
+        // Resident capture throughput need not reserve dozens of decoded file
+        // pages. Pipeline a small bounded number through the disk worker.
+        let io_capacity = limits.pages_per_poll.min(4);
         let reserve = (limits.input_bytes as u64)
             .checked_add(limits.field.cache_bytes as u64)
             .and_then(|n| n.checked_add(field.diagnostics().work_reservation))
-            .and_then(|n| n.checked_add(pages.budget().max_bytes.checked_mul(4)?))
+            .and_then(|n| {
+                n.checked_add(
+                    pages
+                        .budget()
+                        .max_bytes
+                        .checked_mul(4 * (io_capacity as u64 + 1))?,
+                )
+            })
             .and_then(|n| n.checked_add(limits.input_sections as u64 * 512))
             .and_then(|n| n.checked_add(limits.field.interests as u64 * 128))
             .ok_or_else(|| Fault::resource_limit("shared lighting reservation"))?;
@@ -132,8 +151,8 @@ impl HostLightField {
             .map(|p| p.reserve(MemoryClass::Mesh, reserve, EvictionRank::Pinned))
             .transpose()?;
         let page_budget = pages.budget();
-        let (sender, jobs) = mpsc::sync_channel::<(u64, SectionPos, Digest)>(1);
-        let (results, receiver) = mpsc::sync_channel(1);
+        let (sender, jobs) = mpsc::sync_channel::<(u64, SectionPos, Digest)>(io_capacity);
+        let (results, receiver) = mpsc::sync_channel(io_capacity);
         let handle = thread::Builder::new()
             .name("torse-light-pages".into())
             .spawn(move || {
@@ -158,14 +177,18 @@ impl HostLightField {
             field,
             limits,
             interests: BTreeMap::new(),
+            centers: BTreeMap::new(),
             needed: BTreeSet::new(),
+            input_order: Vec::new(),
             inputs: BTreeMap::new(),
             loader: Loader {
                 sender: Some(sender),
                 receiver,
                 handle: Some(handle),
             },
-            busy: false,
+            in_flight: 0,
+            io_capacity,
+            admission_denials: 0,
             io_generation: 0,
             page_budget,
             _memory: memory,
@@ -189,12 +212,86 @@ impl HostLightField {
         self.field.subscribe(consumer, sections)?;
         self.interests
             .insert(consumer, sections.iter().copied().collect());
+        self.centers.insert(consumer, SectionPos::ZERO);
         self.set_needed(needed);
         Ok(())
+    }
+    /// Admit the nearest targets that fit this optional service's budgets.
+    /// Omitted targets must retain the recipient's local lighting fallback.
+    /// Other consumers keep their admitted inputs; overlapping targets share
+    /// the same computation. A new request replaces all of this consumer's old
+    /// links, including when no new target fits. Retry on interest change.
+    pub fn subscribe_near(
+        &mut self,
+        consumer: u128,
+        sections: &[SectionPos],
+        center: SectionPos,
+    ) -> Result<usize, Fault> {
+        // Validate before changing subscriptions, even if every target is denied.
+        for &target in sections {
+            self.validate_target(target)?;
+        }
+        let mut targets: BTreeSet<_> = self
+            .interests
+            .iter()
+            .filter(|(id, _)| **id != consumer)
+            .flat_map(|(_, s)| s.iter().copied())
+            .collect();
+        let mut needed = self.dependencies(&targets)?;
+        let links: usize = self
+            .interests
+            .iter()
+            .filter(|(id, _)| **id != consumer)
+            .map(|(_, s)| s.len())
+            .sum();
+        let available = self.interests.contains_key(&consumer)
+            || self.interests.len() < self.limits.field.consumers;
+        let mut ordered = sections.to_vec();
+        ordered.sort_unstable();
+        ordered.dedup();
+        let requested = ordered.len();
+        ordered.sort_unstable_by_key(|&p| (distance(p, center), p.x, p.z, p.y));
+        let mut admitted = BTreeSet::new();
+        if available {
+            for target in ordered {
+                if links + admitted.len() == self.limits.field.interests
+                    || (!targets.contains(&target) && targets.len() == self.limits.field.sections)
+                {
+                    continue;
+                }
+                let envelope = match self.dependencies(&[target].into()) {
+                    Ok(envelope) => envelope,
+                    Err(e) if e.code == FaultCode::ResourceLimit => continue,
+                    Err(e) => return Err(e),
+                };
+                let added = envelope.iter().filter(|p| !needed.contains(p)).count();
+                if needed.len() + added > self.limits.input_sections {
+                    continue;
+                }
+                needed.extend(envelope);
+                targets.insert(target);
+                admitted.insert(target);
+            }
+        }
+        let count = admitted.len();
+        if admitted.is_empty() {
+            self.unsubscribe(consumer);
+        } else {
+            self.field
+                .subscribe(consumer, &admitted.iter().copied().collect::<Vec<_>>())?;
+            self.interests.insert(consumer, admitted);
+            self.centers.insert(consumer, center);
+            self.set_needed(needed);
+        }
+        self.admission_denials = self
+            .admission_denials
+            .saturating_add((requested - count) as u64);
+        Ok(count)
     }
     pub fn unsubscribe(&mut self, consumer: u128) {
         self.field.unsubscribe(consumer);
         self.interests.remove(&consumer);
+        self.centers.remove(&consumer);
         let targets = self
             .interests
             .values()
@@ -216,6 +313,25 @@ impl HostLightField {
             self.terrain.remove(pos);
         }
         self.needed = needed;
+        self.input_order = self.needed.iter().copied().collect();
+        let centers = &self.centers;
+        self.input_order.sort_unstable_by_key(|&p| {
+            (
+                centers.values().map(|&c| distance(p, c)).min().unwrap_or(0),
+                p.x,
+                p.z,
+                std::cmp::Reverse(p.y),
+            )
+        });
+    }
+    fn validate_target(&self, target: SectionPos) -> Result<(), Fault> {
+        let side = i128::from(self.terrain.side());
+        let bounds = self.terrain.bounds();
+        let base = i128::from(target.y) * side;
+        if base >= i128::from(bounds.max_y) || base + side <= i128::from(bounds.min_y) {
+            return Err(Fault::invalid_data("light target outside world bounds"));
+        }
+        Ok(())
     }
     fn dependencies(&self, targets: &BTreeSet<SectionPos>) -> Result<BTreeSet<SectionPos>, Fault> {
         let side = i128::from(self.terrain.side());
@@ -223,10 +339,11 @@ impl HostLightField {
         let ymin = i128::from(bounds.min_y).div_euclid(side);
         let ymax = (i128::from(bounds.max_y) - 1).div_euclid(side);
         let mut needed = BTreeSet::new();
+        let mut columns = BTreeSet::new();
         for &target in targets {
-            let base = i128::from(target.y) * side;
-            if base >= i128::from(bounds.max_y) || base + side <= i128::from(bounds.min_y) {
-                return Err(Fault::invalid_data("light target outside world bounds"));
+            self.validate_target(target)?;
+            if !columns.insert((target.x, target.z)) {
+                continue;
             }
             let first = |v: i64| (i128::from(v) * side - 15).div_euclid(side);
             let last = |v: i64| (i128::from(v) * side + side + 14).div_euclid(side);
@@ -282,7 +399,11 @@ impl HostLightField {
             field: self.field.diagnostics(),
             input_bytes: self.input_bytes(),
             input_peak: self.input_peak,
-            io_pending: self.busy,
+            io_pending: self.in_flight != 0,
+            io_in_flight: self.in_flight,
+            input_sections: self.needed.len(),
+            admitted_links: self.interests.values().map(BTreeSet::len).sum(),
+            admission_denials: self.admission_denials,
             reserved_bytes: self.reserved_bytes,
         }
     }
@@ -315,10 +436,10 @@ impl HostLightField {
         if host.binding() != self.terrain.binding() {
             return Err(Fault::invalid_data("shared lighting world changed"));
         }
-        if self.busy {
+        for _ in 0..self.in_flight {
             match self.loader.receiver.try_recv() {
                 Ok(result) => {
-                    self.busy = false;
+                    self.in_flight -= 1;
                     if result.generation == self.io_generation
                         && self.needed.contains(&result.pos)
                         && source(host, result.pos) == Source::Parked(result.digest)
@@ -364,7 +485,7 @@ impl HostLightField {
                         );
                     }
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     return Err(Fault::invalid_data("lighting page worker stopped"));
                 }
@@ -372,7 +493,7 @@ impl HostLightField {
         }
         // Suspend all changed sources before advancing any light job. Captures
         // below are bounded separately from the read-only metadata scan.
-        for &pos in &self.needed {
+        for &pos in &self.input_order {
             if self
                 .inputs
                 .get(&pos)
@@ -382,7 +503,7 @@ impl HostLightField {
             }
         }
         let mut captured = 0;
-        for &pos in &self.needed {
+        for &pos in &self.input_order {
             let current = source(host, pos);
             if self.inputs.get(&pos).is_some_and(|i| i.source == current) {
                 continue;
@@ -432,14 +553,14 @@ impl HostLightField {
                     );
                 }
                 Source::Parked(digest) => {
-                    if !self.busy {
+                    if self.in_flight < self.io_capacity {
                         self.loader
                             .sender
                             .as_ref()
                             .expect("open page worker")
                             .try_send((self.io_generation, pos, digest))
                             .map_err(invalid)?;
-                        self.busy = true;
+                        self.in_flight += 1;
                         self.inputs.insert(
                             pos,
                             Input {
@@ -455,21 +576,37 @@ impl HostLightField {
         self.field
             .inputs_changed(&self.terrain, host.world().registry());
         self.input_peak = self.input_peak.max(self.input_bytes());
-        // A transient source handover must not replace reusable light with a
-        // calculation against unknown terrain while verification is pending.
-        if self.inputs.len() != self.needed.len()
-            || self.inputs.iter().any(|(&p, input)| {
-                input.status == LightInputStatus::Pending || source(host, p) != input.source
-            })
-        {
-            return Ok(None);
+        // Verify readiness per column: a distant read or a denied source must
+        // not stall unrelated ready columns. Unknown, absent terrain is distinct
+        // from terrain whose verification is still pending or has failed.
+        let mut ready = BTreeMap::new();
+        for (&consumer, targets) in &self.interests {
+            for &target in targets {
+                let column = (target.x, target.z);
+                if let std::collections::btree_map::Entry::Vacant(entry) = ready.entry(column) {
+                    let envelope = self.dependencies(&[target].into())?;
+                    let verified = envelope.iter().all(|p| {
+                        self.inputs.get(p).is_some_and(|i| {
+                            matches!(
+                                i.status,
+                                LightInputStatus::Ready | LightInputStatus::Missing
+                            ) && source(host, *p) == i.source
+                        })
+                    });
+                    entry.insert(verified.then_some(u128::MAX));
+                }
+                if let Some(rank) = ready.get_mut(&column).expect("column readiness") {
+                    *rank = (*rank).min(distance(target, self.centers[&consumer]));
+                }
+            }
         }
         // Ordinary invalidation cancels stale work; it is not a server failure.
         let stale = self.field.diagnostics().stale;
         match self
             .field
-            .poll(&self.terrain, host.world().registry(), work)
-        {
+            .poll_ready(&self.terrain, host.world().registry(), work, |p| {
+                ready.get(&(p.x, p.z)).copied().flatten()
+            }) {
             Err(e)
                 if e.code == FaultCode::InvalidData && self.field.diagnostics().stale > stale =>
             {
@@ -478,6 +615,9 @@ impl HostLightField {
             other => other,
         }
     }
+}
+fn distance(pos: SectionPos, center: SectionPos) -> u128 {
+    u128::from(pos.x.abs_diff(center.x).max(pos.z.abs_diff(center.z)))
 }
 fn invalid(e: impl std::fmt::Display) -> Fault {
     Fault::invalid_data(e.to_string())
