@@ -1,0 +1,71 @@
+{
+  "base_commit": "b7f63ce7c822595ffcd317510c9f1d5aaf185ff1",
+  "source_sha256_lf": {
+    "apps/server/src/visual.rs": "dbf24d5f8e5a59d35eef48735b05b3018d8b4add770f9001d7e01e3b24ae8da0",
+    "apps/server/src/visual/approval.rs": "cda1a26476cfb98a74b8ce1bb5ea068797f19470482dcd7ce2bd51ac43e22f94",
+    "apps/server/src/visual/frame.rs": "48e2f22d9f547758c80cb3d124973ff3086b4905d8fadcf9a420785cba1fa7cb",
+    "apps/server/src/network_visual.rs": "7df925dba63a1254d63230b959772cb365bd4e825f9644f417f55d67e4078938",
+    "crates/net/src/terrain.rs": "2afe456a472244ff01307a6adc7953b4758f226d8982a7a6ad7cf165a6de0374",
+    "crates/types/src/terrain.rs": "18605367ccadb925aaa208368ba77cd53fc55ce379dabdf43de57d6a103e329f",
+    "crates/types/src/lib.rs": "217879f910f380d3370f27b56bf925deb883b082135ea57e31960638ed30a917",
+    "apps/server/tests/visual_windows.rs": "def355186c711173ea97a53a19d9a4a9327a595fda678c7fcdfc36c61159e17c"
+  },
+  "os": "Windows-11-10.0.26200-SP0",
+  "cpu": "Intel(R) Core(TM) i9-14900HX",
+  "rust": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "profile": "release",
+  "prepared_parked_pages": 102958,
+  "authoritative_resident_sections": 2,
+  "scope": "65x65x24, side 16, height [-64,320)",
+  "route": [
+    [
+      0,
+      32
+    ],
+    [
+      1,
+      32
+    ],
+    [
+      0,
+      32
+    ],
+    [
+      0,
+      16
+    ],
+    [
+      0,
+      32
+    ]
+  ],
+  "transport": "MemoryTransport, codec round trips, one process",
+  "host_limits": {
+    "max_sections": 131072,
+    "cache_bytes": 536870912,
+    "io_bytes": 33554432,
+    "batch_bytes": 524288,
+    "control_bytes": 8388608,
+    "pages_per_poll": 64
+  },
+  "mirror_limits": {
+    "max_sections": 131072,
+    "max_bytes": 536870912,
+    "metadata_bytes": 134217728
+  },
+  "network": {
+    "max_items": 2000000,
+    "max_bytes": 8388608
+  },
+  "preparation_timed_separately": true,
+  "gpu_or_tick_cadence_measured": false,
+  "process_memory": {
+    "exit_code": 0,
+    "samples": 2469,
+    "interval_ms": 50,
+    "peak_working_set_bytes": 222470144,
+    "peak_pagefile_bytes": 221032448,
+    "method": "Windows GetProcessMemoryInfo; maximum observed process peak counters, includes fixture preparation"
+  },
+  "unfinished_samples": []
+}

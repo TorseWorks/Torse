@@ -9,6 +9,22 @@ use torse_world::{SnapshotCells, WorldBounds};
 pub struct TerrainLimits {
     pub max_sections: usize,
     pub max_bytes: u64,
+    /// Desired coordinates, floors and reset working storage; separate from pages.
+    pub metadata_bytes: u64,
+}
+impl TerrainLimits {
+    pub fn reservation_bytes(self) -> Result<u64, Fault> {
+        if self.max_sections == 0
+            || self.max_sections > MAX_TERRAIN_INTEREST_SECTIONS
+            || self.max_bytes < 4096
+            || self.metadata_bytes < 512
+        {
+            return Err(Fault::resource_limit("display terrain limits"));
+        }
+        self.max_bytes
+            .checked_add(self.metadata_bytes)
+            .ok_or_else(|| Fault::resource_limit("display terrain reservation"))
+    }
 }
 #[derive(Debug)]
 pub struct TerrainChanges {
@@ -72,9 +88,7 @@ impl TerrainMirror {
         limits: TerrainLimits,
         memory: Option<MemoryPool>,
     ) -> Result<Self, Fault> {
-        if limits.max_sections == 0 || limits.max_sections > 16384 || limits.max_bytes < 4096 {
-            return Err(Fault::resource_limit("display terrain limits"));
-        }
+        let reserve = limits.reservation_bytes()?;
         ReplicaMirror::from_seed(WorldReplicaSeed {
             binding,
             subscription: SubscriptionId(1),
@@ -88,7 +102,7 @@ impl TerrainMirror {
             },
         })?;
         let lease = memory
-            .map(|p| p.reserve(MemoryClass::Replica, limits.max_bytes, EvictionRank::Pinned))
+            .map(|p| p.reserve(MemoryClass::Replica, reserve, EvictionRank::Pinned))
             .transpose()?;
         Ok(Self {
             binding,
@@ -121,7 +135,16 @@ impl TerrainMirror {
         Ok(())
     }
     pub fn accounted_bytes(&self) -> u64 {
+        self.bytes + self.metadata_bytes()
+    }
+    pub fn metadata_bytes(&self) -> u64 {
+        self.desired.len() as u64 * 512
+    }
+    pub fn cached_bytes(&self) -> u64 {
         self.bytes
+    }
+    pub fn cached_pages(&self) -> usize {
+        self.pages.len()
     }
     pub fn page(&self, pos: SectionPos) -> Option<&ReplicaSnapshot> {
         self.pages
@@ -240,8 +263,10 @@ impl TerrainMirror {
         {
             return Err(invalid());
         }
-        let (desired, retained) = if let Some(reset) = &update.reset {
+        let (next_desired, retained) = if let Some(reset) = &update.reset {
             if reset.sections.len() > self.limits.max_sections
+                || reset.sections.len() as u64 * 512 > self.limits.metadata_bytes
+                || reset.retained.len() > reset.sections.len()
                 || !sorted(reset.sections.iter().copied())
                 || !sorted(reset.retained.iter().map(|(p, _)| *p))
             {
@@ -254,10 +279,11 @@ impl TerrainMirror {
             }) {
                 return Err(invalid());
             }
-            (desired, retained)
+            (Some(desired), retained)
         } else {
-            (self.desired.clone(), BTreeMap::new())
+            (None, BTreeMap::new())
         };
+        let desired = next_desired.as_ref().unwrap_or(&self.desired);
         if update.pages.len() > self.limits.max_sections
             || update.unavailable.len() > self.limits.max_sections
             || update.pages.iter().any(|p| p.terrain.sections.len() != 1)
@@ -341,32 +367,46 @@ impl TerrainMirror {
                 && !incoming.contains_key(pos)
                 && (update.reset.is_none() || retained.contains_key(pos))
         };
-        let bytes = self
-            .pages
+        let removed: Vec<_> = if update.reset.is_some() {
+            self.pages
+                .keys()
+                .filter(|p| !keep(p) && !incoming.contains_key(p))
+                .copied()
+                .collect()
+        } else {
+            unavailable
+                .iter()
+                .filter(|p| self.pages.contains_key(p))
+                .copied()
+                .collect()
+        };
+        let freed = removed
             .iter()
-            .filter(|(pos, _)| keep(pos))
-            .fold(0u64, |n, (_, p)| {
+            .chain(incoming.keys())
+            .filter_map(|p| self.pages.get(p))
+            .fold(0u64, |n, p| {
                 n.saturating_add(terrain_bytes(&p.terrain))
                     .saturating_add(light_bytes(p.light.as_ref()))
-            })
-            .saturating_add(incoming.values().fold(0u64, |n, p| {
-                n.saturating_add(terrain_bytes(&p.terrain))
-                    .saturating_add(light_bytes(p.light.as_ref()))
-            }))
-            .saturating_add(desired.len() as u64 * 128);
+            });
+        let added = incoming.values().fold(0u64, |n, p| {
+            n.saturating_add(terrain_bytes(&p.terrain))
+                .saturating_add(light_bytes(p.light.as_ref()))
+        });
+        let bytes = self
+            .bytes
+            .checked_sub(freed)
+            .and_then(|n| n.checked_add(added))
+            .ok_or_else(|| Fault::resource_limit("display terrain cache accounting"))?;
         if bytes > self.limits.max_bytes {
             return Err(Fault::resource_limit("display terrain cache budget"));
         }
         let mut changes = TerrainChanges {
             changed: incoming.keys().copied().collect(),
-            removed: self
-                .pages
-                .keys()
-                .filter(|p| !keep(p) && !incoming.contains_key(p))
-                .copied()
-                .collect(),
+            removed,
         };
-        self.pages.retain(|pos, _| keep(pos));
+        for pos in &changes.removed {
+            self.pages.remove(pos);
+        }
         for pos in retained.keys() {
             let page = self.pages.get_mut(pos).expect("checked retained page");
             if self
@@ -379,8 +419,10 @@ impl TerrainMirror {
             page.at = update.through;
         }
         self.pages.extend(incoming);
-        self.desired = desired;
-        self.floors.retain(|p, _| self.desired.contains(p));
+        if let Some(desired) = next_desired {
+            self.floors.retain(|p, _| desired.contains(p));
+            self.desired = desired;
+        }
         self.bytes = bytes;
         self.generation = update.generation;
         if update.reset.is_some() {

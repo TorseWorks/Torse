@@ -124,6 +124,7 @@ impl<T: Transport> NetworkHub<T> {
             desired,
             center,
             limits,
+            self.limits,
         )?;
         if let Some((field, _)) = &mut self.lighting {
             field.subscribe_near(id, &visual.desired_positions(), center)?;
@@ -158,7 +159,7 @@ impl<T: Transport> NetworkHub<T> {
                 center,
             )?;
         }
-        visual.request(scope, center, false)
+        visual.request_admitted(scope, center, false)
     }
     /// Explicitly retry missing/corrupt/budget-denied sources at the current view.
     pub fn refresh_visual_interest(&mut self, id: u128) -> Result<(), Fault> {
@@ -199,7 +200,8 @@ impl<T: Transport> NetworkHub<T> {
                 let inline = update.pages.iter().any(|page| page.light.is_some());
                 let mut message = ServerMessage::Terrain(update);
                 if inline
-                    && let Err(error) = wire::measure_inner(&message, limits.budget, limits.codec)
+                    && let Err(error) =
+                        crate::visual::check_frame(&message, limits.budget, limits.codec)
                 {
                     if error.code != FaultCode::ResourceLimit {
                         return Err(error);

@@ -2245,6 +2245,7 @@ mod tests {
             TerrainLimits {
                 max_sections: 8,
                 max_bytes: 1024 * 1024,
+                metadata_bytes: 8_u64 * 1024,
             },
             None,
         )

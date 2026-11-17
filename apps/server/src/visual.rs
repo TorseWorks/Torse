@@ -13,9 +13,11 @@ use torse_types::*;
 use torse_world::{Snapshot, SnapshotCells, SnapshotSection, StateEntry};
 
 mod approval;
+mod frame;
 pub use approval::VisualTerrainApproval;
+pub(crate) use frame::check_frame;
 
-const MAX_VISUAL_SECTIONS: usize = 16_384;
+const MAX_VISUAL_SECTIONS: usize = MAX_TERRAIN_INTEREST_SECTIONS;
 
 #[derive(Clone, Copy, Debug)]
 pub struct VisualTerrainLimits {
@@ -24,6 +26,8 @@ pub struct VisualTerrainLimits {
     pub cache_bytes: u64,
     pub io_bytes: u64,
     pub batch_bytes: u64,
+    /// Encoded and decoded control-frame budget, independent of page batches.
+    pub control_bytes: u64,
     pub pages_per_poll: usize,
 }
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +40,8 @@ pub struct VisualTerrainDiagnostics {
     pub generation: u64,
     pub sequence: u64,
     pub reused_read_pages: u64,
+    pub metadata_scanned: usize,
+    pub pending_candidates: usize,
 }
 impl VisualTerrainLimits {
     fn validate(self, pages: &SectionPages) -> Result<u64, Fault> {
@@ -45,6 +51,7 @@ impl VisualTerrainLimits {
             || self.pages_per_poll > 64
             || self.cache_bytes < 4096
             || self.batch_bytes < 4096
+            || self.control_bytes < 1024
             || self.io_bytes < pages.budget().max_bytes.saturating_mul(4)
         {
             return Err(Fault::resource_limit("visual terrain limits"));
@@ -52,6 +59,7 @@ impl VisualTerrainLimits {
         self.cache_bytes
             .checked_add(self.io_bytes)
             .and_then(|n| n.checked_add(self.batch_bytes.checked_mul(3)?))
+            .and_then(|n| n.checked_add(self.control_bytes.checked_mul(4)?))
             .and_then(|n| n.checked_add(self.max_sections as u64 * 1024))
             .ok_or_else(|| Fault::resource_limit("visual terrain reservation overflow"))
     }
@@ -88,6 +96,17 @@ fn distance(pos: SectionPos, center: SectionPos) -> u128 {
     u128::from(pos.x.abs_diff(center.x))
         + u128::from(pos.y.abs_diff(center.y))
         + u128::from(pos.z.abs_diff(center.z))
+}
+type ColumnPriority = (u128, i64, i64, u64, SectionPos);
+
+fn column_priority(pos: SectionPos, center: SectionPos) -> ColumnPriority {
+    (
+        u128::from(pos.x.abs_diff(center.x)) + u128::from(pos.z.abs_diff(center.z)),
+        pos.x,
+        pos.z,
+        pos.y.abs_diff(center.y),
+        pos,
+    )
 }
 enum Read {
     Saved(Digest),
@@ -252,13 +271,19 @@ pub(crate) struct VisualSession {
     cache: BTreeMap<SectionPos, Cached>,
     bytes: u64,
     clock: u64,
-    dirty: BTreeSet<SectionPos>,
+    dirty: BTreeSet<ColumnPriority>,
     unavailable: BTreeMap<SectionPos, TerrainUnavailable>,
     observed: BTreeMap<SectionPos, Stamp>,
     sent: BTreeMap<SectionPos, Digest>,
     light_sent: BTreeMap<SectionPos, u64>,
     light_seq: u64,
     reserved_bytes: u64,
+    wire_budget: OutputBudget,
+    codec: torse_codec::CodecLimits,
+    order: Vec<SectionPos>,
+    scan_cursor: usize,
+    last_scan: usize,
+    candidates: BTreeSet<ColumnPriority>,
     _memory: Option<MemoryLease>,
 }
 impl VisualSession {
@@ -268,10 +293,65 @@ impl VisualSession {
     pub(crate) fn check_request(&self, desired: &ReplicaScope) -> Result<(), Fault> {
         self.approved
             .check_desired(desired, self.limits.max_sections)?;
+        if desired == &self.desired {
+            return Ok(());
+        }
         self.generation
             .checked_add(1)
             .ok_or_else(|| Fault::resource_limit("visual generation exhausted"))?;
-        Ok(())
+        Self::check_control(
+            self.binding,
+            desired,
+            self.limits.control_bytes,
+            self.wire_budget,
+            self.codec,
+        )
+    }
+    fn check_control(
+        binding: Binding,
+        desired: &ReplicaScope,
+        control_bytes: u64,
+        mut budget: OutputBudget,
+        codec: torse_codec::CodecLimits,
+    ) -> Result<(), Fault> {
+        budget.max_bytes = budget.max_bytes.min(control_bytes);
+        // Every desired page may eventually have a retained-content proof.
+        // Digest values do not change codec cost. This upper bound guarantees
+        // that a later reset fits even after the cache has filled completely.
+        let reset = TerrainReset {
+            sections: desired.sections.iter().copied().collect(),
+            retained: desired
+                .sections
+                .iter()
+                .map(|&p| (p, Digest([0; 32])))
+                .collect(),
+        };
+        let message = crate::network::ServerMessage::Terrain(TerrainUpdate {
+            binding,
+            generation: 1,
+            seq: 1,
+            through: CommitCursor::initial(binding.world),
+            reset: Some(reset),
+            pages: Vec::new(),
+            unavailable: Vec::new(),
+        });
+        check_frame(&message, budget, codec)
+    }
+    fn prioritize(&mut self) {
+        self.order = self.desired.sections.iter().copied().collect();
+        self.order
+            .sort_unstable_by_key(|&p| column_priority(p, self.center));
+        self.candidates = self
+            .order
+            .iter()
+            .map(|&p| column_priority(p, self.center))
+            .collect();
+        self.dirty = self
+            .dirty
+            .iter()
+            .map(|&(.., pos)| column_priority(pos, self.center))
+            .collect();
+        self.scan_cursor = 0;
     }
     fn light_page(
         &self,
@@ -380,7 +460,7 @@ impl VisualSession {
             pages,
         });
         loop {
-            match wire::measure_inner(&message, budget, codec) {
+            match check_frame(&message, budget, codec) {
                 Ok(_) => break,
                 Err(error) if error.code == FaultCode::ResourceLimit => {
                     let crate::network::ServerMessage::Light(update) = &mut message else {
@@ -420,6 +500,7 @@ impl VisualSession {
         desired: ReplicaScope,
         center: SectionPos,
         limits: VisualTerrainLimits,
+        network: crate::network::NetworkLimits,
     ) -> Result<Self, Fault> {
         let charge = limits.validate(&pages)?;
         approved.check_desired(&desired, limits.max_sections)?;
@@ -430,6 +511,13 @@ impl VisualSession {
             .memory_pool()
             .map(|p| p.reserve(MemoryClass::Replica, charge, EvictionRank::Pinned))
             .transpose()?;
+        Self::check_control(
+            host.binding(),
+            &desired,
+            limits.control_bytes,
+            network.budget,
+            network.codec,
+        )?;
         let binding = host.binding();
         let side = host.world().store().side();
         let bounds = host.world().store().bounds();
@@ -522,7 +610,7 @@ impl VisualSession {
                     format!("visual worker startup: {e}"),
                 )
             })?;
-        Ok(Self {
+        let mut session = Self {
             binding,
             approved,
             desired,
@@ -549,8 +637,16 @@ impl VisualSession {
             light_sent: BTreeMap::new(),
             light_seq: 0,
             reserved_bytes: charge,
+            wire_budget: network.budget,
+            codec: network.codec,
+            order: Vec::new(),
+            scan_cursor: 0,
+            last_scan: 0,
+            candidates: BTreeSet::new(),
             _memory: memory,
-        })
+        };
+        session.prioritize();
+        Ok(session)
     }
     pub(crate) fn request(
         &mut self,
@@ -558,10 +654,23 @@ impl VisualSession {
         center: SectionPos,
         refresh: bool,
     ) -> Result<(), Fault> {
-        self.approved
-            .check_desired(&desired, self.limits.max_sections)?;
+        self.check_request(&desired)?;
+        self.request_admitted(desired, center, refresh)
+    }
+    /// The caller must have completed check_request before changing other
+    /// subsystems. Avoid serializing the full reset twice in that transaction.
+    pub(crate) fn request_admitted(
+        &mut self,
+        desired: ReplicaScope,
+        center: SectionPos,
+        refresh: bool,
+    ) -> Result<(), Fault> {
+        let moved = self.center != center;
         self.center = center;
         if !refresh && desired == self.desired {
+            if moved {
+                self.prioritize();
+            }
             return Ok(());
         }
         self.generation = self
@@ -580,13 +689,14 @@ impl VisualSession {
         self.unavailable.clear();
         self.observed.clear();
         self.sent.retain(|p, _| self.desired.sections.contains(p));
+        self.prioritize();
         Ok(())
     }
     fn remove(&mut self, pos: SectionPos) {
         if let Some(old) = self.cache.remove(&pos) {
             self.bytes = self.bytes.saturating_sub(terrain_bytes(&old.page));
         }
-        self.dirty.remove(&pos);
+        self.dirty.remove(&column_priority(pos, self.center));
         self.sent.remove(&pos);
         self.light_sent.remove(&pos);
     }
@@ -602,6 +712,8 @@ impl VisualSession {
             generation: self.generation,
             sequence: self.seq,
             reused_read_pages: self.reused_read_pages,
+            metadata_scanned: self.last_scan,
+            pending_candidates: self.candidates.len(),
         }
     }
     pub(crate) fn poll(
@@ -665,7 +777,11 @@ impl VisualSession {
                                         let victim = self
                                             .cache
                                             .iter()
-                                            .filter(|(pos, _)| !self.dirty.contains(pos))
+                                            .filter(|(pos, _)| {
+                                                !self
+                                                    .dirty
+                                                    .contains(&column_priority(**pos, self.center))
+                                            })
                                             .filter(|(pos, _)| {
                                                 !self.desired.sections.contains(pos)
                                                     || (distance(**pos, self.center), **pos)
@@ -715,7 +831,7 @@ impl VisualSession {
                                             verify_source: false,
                                         },
                                     );
-                                    self.dirty.insert(page.pos);
+                                    self.dirty.insert(column_priority(page.pos, self.center));
                                     self.unavailable.remove(&page.pos);
                                 }
                                 Err(reason) => {
@@ -735,8 +851,13 @@ impl VisualSession {
                 }
             }
         }
-        let desired: Vec<_> = self.desired.sections.iter().copied().collect();
-        for pos in desired.iter().copied() {
+        // Metadata inspection has a separate bounded slice. The priority order
+        // is rebuilt only when interest/center changes, never for every batch.
+        let scan = self.order.len().min(self.limits.pages_per_poll * 64);
+        self.last_scan = scan;
+        for _ in 0..scan {
+            let pos = self.order[self.scan_cursor];
+            self.scan_cursor = (self.scan_cursor + 1) % self.order.len();
             let current = stamp(host, pos);
             if let Some(cached) = self.cache.get_mut(&pos)
                 && cached.stamp != current
@@ -747,7 +868,7 @@ impl VisualSession {
                     // floor. Verify the new source without first removing the page.
                     cached.stamp = current;
                     cached.verify_source = true;
-                    self.dirty.insert(pos);
+                    self.dirty.insert(column_priority(pos, self.center));
                     self.unavailable.remove(&pos);
                 } else {
                     self.remove(pos);
@@ -757,31 +878,28 @@ impl VisualSession {
             if let Some(page) = self.cache.get_mut(&pos) {
                 page.touched = self.clock;
                 if self.sent.get(&pos) != Some(&page.digest) {
-                    self.dirty.insert(pos);
+                    self.dirty.insert(column_priority(pos, self.center));
                 }
             } else if current == Stamp::Missing && self.observed.get(&pos) != Some(&current) {
                 self.observed.insert(pos, current);
                 self.unavailable.insert(pos, TerrainUnavailable::Missing);
             }
+            if self.observed.get(&pos) != Some(&current)
+                || self.cache.get(&pos).is_some_and(|p| p.verify_source)
+            {
+                self.candidates.insert(column_priority(pos, self.center));
+            }
         }
         if !self.busy {
-            let mut order = desired;
-            order.sort_by_key(|p| {
-                (
-                    u128::from(p.x.abs_diff(self.center.x))
-                        + u128::from(p.z.abs_diff(self.center.z)),
-                    p.x,
-                    p.z,
-                    p.y.abs_diff(self.center.y),
-                    *p,
-                )
-            });
             let mut items = Vec::new();
             let mut resident_bytes = 0u64;
-            for pos in order {
-                if items.len() >= self.limits.pages_per_poll {
+            let mut inspected = 0;
+            while let Some(candidate @ (.., pos)) = self.candidates.pop_first() {
+                if items.len() >= self.limits.pages_per_poll || inspected >= scan {
+                    self.candidates.insert(candidate);
                     break;
                 }
+                inspected += 1;
                 let current = stamp(host, pos);
                 if self
                     .cache
@@ -803,6 +921,7 @@ impl VisualSession {
                         }
                         Err(reason) => {
                             if reason == TerrainUnavailable::Budget && !items.is_empty() {
+                                self.candidates.insert(candidate);
                                 break;
                             }
                             self.remove(pos);
@@ -812,7 +931,13 @@ impl VisualSession {
                         }
                     },
                     Stamp::Parked(hash) => Read::Saved(hash),
-                    Stamp::Missing => continue,
+                    Stamp::Missing => {
+                        if self.observed.get(&pos) != Some(&current) {
+                            self.observed.insert(pos, current);
+                            self.unavailable.insert(pos, TerrainUnavailable::Missing);
+                        }
+                        continue;
+                    }
                 };
                 items.push(Item {
                     pos,
@@ -843,7 +968,7 @@ impl VisualSession {
             return Ok(None);
         }
         let through = host.cursor();
-        let reset = if self.reset {
+        if self.reset {
             let retained: Vec<_> = self
                 .cache
                 .iter()
@@ -855,36 +980,48 @@ impl VisualSession {
                 .map(|(p, c)| (*p, c.digest))
                 .collect();
             for (pos, _) in &retained {
-                self.dirty.remove(pos);
+                self.dirty.remove(&column_priority(*pos, self.center));
             }
-            Some(TerrainReset {
+            let reset = TerrainReset {
                 sections: self.desired.sections.iter().copied().collect(),
                 retained,
-            })
-        } else {
-            None
-        };
+            };
+            self.reset = false;
+            self.seq = 1;
+            return Ok(Some(TerrainUpdate {
+                binding: self.binding,
+                generation: self.generation,
+                seq: self.seq,
+                through,
+                reset: Some(reset),
+                pages: Vec::new(),
+                unavailable: Vec::new(),
+            }));
+        }
+        let reset = None;
         let mut pages = Vec::new();
         let mut bytes = 0u64;
-        let mut dirty: Vec<_> = self.dirty.iter().copied().collect();
-        dirty.sort_by_key(|p| {
-            (
-                u128::from(p.x.abs_diff(self.center.x)) + u128::from(p.z.abs_diff(self.center.z)),
-                p.x,
-                p.z,
-                p.y.abs_diff(self.center.y),
-                *p,
-            )
-        });
-        for pos in dirty {
+        for key @ (.., pos) in self
+            .dirty
+            .iter()
+            .copied()
+            .take(self.limits.pages_per_poll * 2)
+            .collect::<Vec<_>>()
+        {
             if !self.desired.sections.contains(&pos) {
-                self.dirty.remove(&pos);
+                self.dirty.remove(&key);
                 continue;
             }
             let Some(cached) = self.cache.get(&pos) else {
-                self.dirty.remove(&pos);
+                self.dirty.remove(&key);
                 continue;
             };
+            // A bounded metadata scan may not have reached this dirty page yet.
+            // Recheck immediately before delivery so no stale terrain escapes.
+            if cached.stamp != stamp(host, pos) {
+                self.candidates.insert(key);
+                continue;
+            }
             let cost = terrain_bytes(&cached.page);
             if pages.len() >= self.limits.pages_per_poll
                 || bytes.saturating_add(cost) > self.limits.batch_bytes
@@ -898,30 +1035,74 @@ impl VisualSession {
                 digest: cached.digest,
                 terrain: cached.page.clone(),
             });
-            self.sent.insert(pos, cached.digest);
-            self.dirty.remove(&pos);
         }
         pages.sort_unstable_by_key(|p| p.terrain.sections[0].pos);
         if reset.is_none() && pages.is_empty() && self.unavailable.is_empty() {
             return Ok(None);
         }
-        self.reset = false;
-        self.seq = self
+        let seq = self
             .seq
             .checked_add(1)
             .ok_or_else(|| Fault::resource_limit("visual sequence exhausted"))?;
-        let unavailable = std::mem::take(&mut self.unavailable)
+        let keys: Vec<_> = self
+            .unavailable
+            .keys()
+            .copied()
+            .take(self.limits.pages_per_poll)
+            .collect();
+        let unavailable = keys
             .into_iter()
+            .map(|p| (p, self.unavailable[&p]))
             .filter(|(p, _)| self.desired.sections.contains(p))
             .collect();
-        Ok(Some(TerrainUpdate {
+        let mut message = crate::network::ServerMessage::Terrain(TerrainUpdate {
             binding: self.binding,
             generation: self.generation,
-            seq: self.seq,
+            seq,
             through,
             reset,
             pages,
             unavailable,
-        }))
+        });
+        loop {
+            match check_frame(&message, self.wire_budget, self.codec) {
+                Ok(()) => break,
+                Err(error) if error.code == FaultCode::ResourceLimit => {
+                    let crate::network::ServerMessage::Terrain(update) = &mut message else {
+                        unreachable!()
+                    };
+                    if update.pages.len() > 1 {
+                        update.pages.truncate(update.pages.len().div_ceil(2));
+                    } else if update.unavailable.len() > 1 {
+                        update
+                            .unavailable
+                            .truncate(update.unavailable.len().div_ceil(2));
+                    } else if let Some(page) = update.pages.pop() {
+                        let pos = page.terrain.sections[0].pos;
+                        self.remove(pos);
+                        self.observed.insert(pos, stamp(host, pos));
+                        update.unavailable.retain(|(p, _)| *p != pos);
+                        update.unavailable.push((pos, TerrainUnavailable::Budget));
+                        update.unavailable.sort_unstable_by_key(|(p, _)| *p);
+                    } else {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let crate::network::ServerMessage::Terrain(update) = message else {
+            unreachable!()
+        };
+        for page in &update.pages {
+            let pos = page.terrain.sections[0].pos;
+            self.sent.insert(pos, page.digest);
+            self.dirty.remove(&column_priority(pos, self.center));
+        }
+        for (pos, _) in &update.unavailable {
+            self.unavailable.remove(pos);
+        }
+        self.seq = seq;
+        Ok(Some(update))
     }
 }

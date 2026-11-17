@@ -1,6 +1,9 @@
 //! Ephemeral read-only terrain streams, independent of simulation subscriptions.
 use crate::{Binding, CommitCursor, Digest, SectionPos};
 
+/// Safety ceiling; each host and receiver must choose smaller explicit budgets.
+pub const MAX_TERRAIN_INTEREST_SECTIONS: usize = 131_072;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerrainReset {
     pub sections: Vec<SectionPos>,
