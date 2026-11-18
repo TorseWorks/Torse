@@ -92,6 +92,7 @@ pub struct SharedLightField {
     work: Option<Work>,
     generation: u64,
     diagnostics: LightFieldDiagnostics,
+    validation_cursor: Option<SectionPos>,
 }
 impl SharedLightField {
     pub fn new(binding: Binding, limits: LightFieldLimits) -> Result<Self, Fault> {
@@ -128,6 +129,7 @@ impl SharedLightField {
             last_column: None,
             work: None,
             generation: 0,
+            validation_cursor: None,
             diagnostics: LightFieldDiagnostics {
                 work_reservation,
                 ..Default::default()
@@ -207,6 +209,8 @@ impl SharedLightField {
                 self.pending.insert(pos);
             }
         }
+        self.diagnostics.cache_bytes = self.entries.values().map(|p| p.allocated_bytes()).sum();
+        self.diagnostics.solver_cache_bytes = self.retained.values().map(Retained::bytes).sum();
         self.measure();
     }
     /// Call after an input transaction. Negative dependencies are included, so
@@ -217,14 +221,43 @@ impl SharedLightField {
         source: &(impl LightSource + ?Sized),
         optics: &(impl LightOptics + ?Sized),
     ) {
-        for (&pos, entry) in &self.entries {
+        self.inputs_changed_bounded(source, optics, usize::MAX);
+    }
+    /// Validate at most `checks` cached targets, rotating across calls. Each
+    /// target's dependency set is bounded by the configured job limits.
+    pub fn inputs_changed_bounded(
+        &mut self,
+        source: &(impl LightSource + ?Sized),
+        optics: &(impl LightOptics + ?Sized),
+        checks: usize,
+    ) -> usize {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let start = self.validation_cursor.map_or(Unbounded, Excluded);
+        let positions: Vec<_> = self
+            .entries
+            .range((start, Unbounded))
+            .chain(self.entries.iter())
+            .take(checks.min(self.entries.len()))
+            .map(|(&p, _)| p)
+            .collect();
+        for &pos in &positions {
+            let entry = &self.entries[&pos];
             if entry.validate(source, optics) {
                 self.pending.remove(&pos);
             } else {
                 self.pending.insert(pos);
             }
+            self.validation_cursor = Some(pos);
         }
         self.measure();
+        positions.len()
+    }
+    /// Whether a host scheduler should consider this target for computation.
+    pub fn needs_work(&self, target: SectionPos) -> bool {
+        self.pending.contains(&target) && !self.blocked.contains(&target)
+    }
+    pub fn active_target(&self) -> Option<SectionPos> {
+        self.work.as_ref().map(|work| work.target)
     }
     /// Borrow a current publication. Two consumers get the very same Arc.
     /// Revoked consumers cannot retrieve a retained result.
@@ -272,6 +305,28 @@ impl SharedLightField {
         work: usize,
         priority: impl Fn(SectionPos) -> Option<u128>,
     ) -> Result<Option<SectionPos>, Fault> {
+        self.poll_scheduled(source, optics, work, priority, None)
+    }
+    /// Advance a host-selected candidate without scanning the pending set.
+    /// `priority` must verify the selected and active target's dependencies.
+    pub fn poll_selected(
+        &mut self,
+        source: &(impl LightSource + ?Sized),
+        optics: &(impl LightOptics + ?Sized),
+        work: usize,
+        target: Option<SectionPos>,
+        priority: impl Fn(SectionPos) -> Option<u128>,
+    ) -> Result<Option<SectionPos>, Fault> {
+        self.poll_scheduled(source, optics, work, priority, Some(target))
+    }
+    fn poll_scheduled(
+        &mut self,
+        source: &(impl LightSource + ?Sized),
+        optics: &(impl LightOptics + ?Sized),
+        work: usize,
+        priority: impl Fn(SectionPos) -> Option<u128>,
+        selected: Option<Option<SectionPos>>,
+    ) -> Result<Option<SectionPos>, Fault> {
         if work == 0 {
             return Ok(None);
         }
@@ -298,22 +353,26 @@ impl SharedLightField {
                             | LightInputVersion::Resident { readable: true, .. }
                     )
             };
-            let target = self
-                .pending
-                .iter()
-                .filter(readable)
-                .filter_map(|&p| {
-                    priority(p).map(|rank| {
-                        (
-                            rank,
-                            !(self.last_column == Some(column(p))
-                                && self.retained.contains_key(&column(p))),
-                            p,
-                        )
+            let target = if let Some(selected) = selected {
+                selected
+                    .filter(|p| self.pending.contains(p) && readable(&p) && priority(*p).is_some())
+            } else {
+                self.pending
+                    .iter()
+                    .filter(readable)
+                    .filter_map(|&p| {
+                        priority(p).map(|rank| {
+                            (
+                                rank,
+                                !(self.last_column == Some(column(p))
+                                    && self.retained.contains_key(&column(p))),
+                                p,
+                            )
+                        })
                     })
-                })
-                .min()
-                .map(|(_, _, p)| p);
+                    .min()
+                    .map(|(_, _, p)| p)
+            };
             let Some(target) = target else {
                 return Ok(None);
             };
@@ -321,6 +380,7 @@ impl SharedLightField {
                 .retained
                 .remove(&column(target))
                 .and_then(|mut solver| {
+                    self.diagnostics.solver_cache_bytes -= solver.bytes();
                     let ready = solver.emitted.observed.valid(self.binding, source, optics)
                         && solver.sky.observed.valid(self.binding, source, optics);
                     solver.emitted.update(self.binding, source, optics).ok()?;
@@ -451,7 +511,11 @@ impl SharedLightField {
             self.measure();
             return Err(Fault::resource_limit("light publication cache"));
         }
-        self.entries.insert(active.target, Arc::new(output));
+        let bytes = output.allocated_bytes();
+        if let Some(previous) = self.entries.insert(active.target, Arc::new(output)) {
+            self.diagnostics.cache_bytes -= previous.allocated_bytes();
+        }
+        self.diagnostics.cache_bytes += bytes;
         self.pending.remove(&active.target);
         let key = column(active.target);
         self.retain_solver(key, retained);
@@ -467,6 +531,9 @@ impl SharedLightField {
             return;
         }
         let mut cached = self.diagnostics.solver_cache_bytes;
+        if let Some(previous) = self.retained.remove(&key) {
+            cached -= previous.bytes();
+        }
         while cached > self.limits.solver_cache_bytes - bytes {
             let (_, old) = self
                 .retained
@@ -475,12 +542,11 @@ impl SharedLightField {
             cached -= old.bytes();
         }
         self.retained.insert(key, solver);
+        self.diagnostics.solver_cache_bytes = cached + bytes;
     }
     fn measure(&mut self) {
         self.diagnostics.pending = self.pending.len() + usize::from(self.work.is_some());
         self.diagnostics.pending_peak = self.diagnostics.pending_peak.max(self.diagnostics.pending);
-        self.diagnostics.cache_bytes = self.entries.values().map(|p| p.allocated_bytes()).sum();
-        self.diagnostics.solver_cache_bytes = self.retained.values().map(Retained::bytes).sum();
         self.diagnostics.solver_cache_peak = self
             .diagnostics
             .solver_cache_peak

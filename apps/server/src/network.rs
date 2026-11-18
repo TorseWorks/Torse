@@ -24,6 +24,7 @@ mod player;
 mod visual;
 pub use control::{ControlBudget, ControlDispatch, ControlPolicy};
 pub use interest::PlayerFollow;
+pub use visual::{DisplayWorkBudget, DisplayWorkProgress};
 
 pub type ClientMessage = torse_protocol::ClientMessage<torse_sim::durable::Call>;
 pub type ServerMessage = torse_protocol::ServerMessage<
@@ -245,6 +246,7 @@ pub struct PeerPolicy {
 }
 struct Peer<T> {
     visual: Option<crate::visual::VisualSession>,
+    light_interest_pending: bool,
     visual_generation_floor: u64,
     user: Option<ContentKey>,
     player: Option<player::Control>,
@@ -277,6 +279,7 @@ pub struct NetworkHub<T> {
     connection_timeout: Option<Duration>,
     follow: Option<PlayerFollow>,
     control: Option<control::ControlPlane>,
+    display_cursor: Option<u128>,
 }
 impl<T: Transport> NetworkHub<T> {
     /// Sequential registry observation, including closed entries until normal reaping.
@@ -361,6 +364,7 @@ impl<T: Transport> NetworkHub<T> {
             connection_timeout: None,
             follow: None,
             control: None,
+            display_cursor: None,
         })
     }
     pub fn with_memory(
@@ -431,6 +435,7 @@ impl<T: Transport> NetworkHub<T> {
                 follow_scope: None,
                 follow_ready: false,
                 visual: None,
+                light_interest_pending: false,
                 visual_generation_floor: 0,
                 control_link: None,
             },
@@ -972,6 +977,37 @@ impl<T: Transport> NetworkHub<T> {
         server: &mut Server<ExecutionHost, J, S>,
         now: Instant,
     ) -> Result<(), Fault> {
+        self.poll_inner(server, now, true)
+    }
+    /// Service input, control and durable replicas without advancing display
+    /// terrain/light work. Schedule `poll_display` separately. Revocation and
+    /// connection cleanup still run immediately; this is not a real-time bound
+    /// on mandatory replication, residency or transport I/O.
+    pub fn poll_control<
+        J: CommitJournal<ExecutionModel>,
+        S: HostCheckpointStore<ExecutionModel>,
+    >(
+        &mut self,
+        server: &mut Server<ExecutionHost, J, S>,
+    ) -> Result<(), Fault> {
+        self.poll_control_at(server, Instant::now())
+    }
+    pub fn poll_control_at<
+        J: CommitJournal<ExecutionModel>,
+        S: HostCheckpointStore<ExecutionModel>,
+    >(
+        &mut self,
+        server: &mut Server<ExecutionHost, J, S>,
+        now: Instant,
+    ) -> Result<(), Fault> {
+        self.poll_inner(server, now, false)
+    }
+    fn poll_inner<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>(
+        &mut self,
+        server: &mut Server<ExecutionHost, J, S>,
+        now: Instant,
+        display: bool,
+    ) -> Result<(), Fault> {
         if server.binding() != self.binding {
             return Err(Fault::invalid_data("hub binding mismatch"));
         }
@@ -981,7 +1017,8 @@ impl<T: Transport> NetworkHub<T> {
             server.poll_residency(self)?;
         }
         let tick = server.authority()?.resume_point().tick;
-        if let Some((lighting, work)) = &mut self.lighting
+        if display
+            && let Some((lighting, work)) = &mut self.lighting
             && let Err(error) = lighting.poll(server.authority()?, *work)
             && error.code != FaultCode::ResourceLimit
         {
@@ -1149,13 +1186,17 @@ impl<T: Transport> NetworkHub<T> {
                             Self::send(peer, ServerMessage::Batch(batch), self.limits)?;
                         }
                     }
-                    Self::poll_visual(
-                        *peer_id,
-                        peer,
-                        server,
-                        self.limits,
-                        self.lighting.as_ref().map(|(f, _)| f),
-                    )?;
+                    if display {
+                        Self::poll_visual(
+                            *peer_id,
+                            peer,
+                            server,
+                            self.limits,
+                            self.lighting.as_ref().map(|(f, _)| f),
+                            usize::MAX,
+                            usize::MAX,
+                        )?;
+                    }
                 }
                 peer.transport.poll()
             })();

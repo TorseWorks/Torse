@@ -17,6 +17,363 @@ use torse_world_services::lighting::{
 };
 use visual_fixture::{interest, streaming as fixture};
 
+struct ControlCounter(Arc<std::sync::atomic::AtomicUsize>);
+impl torse_server::network::ControlDispatch for ControlCounter {
+    fn on_established(&mut self, _: u128, _: torse_types::Viewer) {}
+    fn on_disconnected(&mut self, _: u128, _: torse_types::Viewer) {}
+    fn on_control(
+        &mut self,
+        _: u128,
+        _: torse_types::Viewer,
+        _: u64,
+        _: &[u8],
+    ) -> Result<(), Fault> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[test]
+fn control_only_polling_and_small_display_slices_progress_with_a_stalled_peer() {
+    use torse_net::MemoryTransport;
+    use torse_server::lighting::HostLightWorkBudget;
+    use torse_server::{bootstrap as base, network::*};
+    let dir = Directory::new();
+    let mut server = fixture::create(&dir);
+    let pages = fixture::pages(&dir);
+    for pos in visual_fixture::scope(4, 3).sections {
+        let page = fixture::generated(server.authority().unwrap().world(), pos);
+        server
+            .install_section(&pages, page, &mut NoReplicas)
+            .unwrap();
+        server.unload_section(&pages, pos, &mut NoReplicas).unwrap();
+    }
+    let mut hub =
+        NetworkHub::<MemoryTransport>::new(server.binding(), base::network_limits()).unwrap();
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    hub.set_control(
+        ControlBudget {
+            messages_per_tick: 100_000,
+            queue_messages: 2,
+            queue_bytes: 32,
+            max_message_bytes: 8,
+            policy: ControlPolicy::Reject,
+        },
+        Box::new(ControlCounter(counter.clone())),
+    )
+    .unwrap();
+    hub.enable_shared_lighting(&server, pages.clone(), limits(), 20_000)
+        .unwrap();
+    let (fast, mut client, _, _) =
+        interest::attach(&mut hub, &mut server, visual_fixture::scope(0, 1));
+    let (slow, _stalled, _, _) =
+        interest::attach(&mut hub, &mut server, visual_fixture::scope(0, 1));
+    for id in [fast, slow] {
+        let mut config = visual_fixture::limits();
+        config.pages_per_poll = 1;
+        hub.enable_visual_interest(
+            &server,
+            id,
+            pages.clone(),
+            visual_fixture::approval(),
+            visual_fixture::scope(4, 3),
+            SectionPos::new(4, 0, 0),
+            config,
+        )
+        .unwrap();
+    }
+    interest::send(
+        &mut client,
+        ClientMessage::ControlOffer {
+            api: torse_protocol::CONTROL_API_VERSION,
+        },
+    );
+    hub.poll_control(&mut server).unwrap();
+    assert!(
+        interest::drain(&mut client)
+            .0
+            .iter()
+            .any(|msg| matches!(msg, ServerMessage::ControlReady { .. }))
+    );
+    for _ in 0..32 {
+        hub.poll_control(&mut server).unwrap();
+    }
+    assert_eq!(hub.shared_light_diagnostics().unwrap().started, 0);
+    assert_eq!(
+        hub.visual_terrain_diagnostics(fast)
+            .unwrap()
+            .metadata_scanned,
+        0
+    );
+    assert!(!hub.visual_terrain_diagnostics(fast).unwrap().io_pending);
+    let empty = hub
+        .poll_display(&server, DisplayWorkBudget::default())
+        .unwrap();
+    assert_eq!(empty.sessions, 0);
+    assert_eq!(empty.lighting.input_checks, 0);
+    let budget = DisplayWorkBudget {
+        sessions: 1,
+        light_admissions: 1,
+        metadata_checks_per_session: 2,
+        light_checks_per_session: 1,
+        lighting: HostLightWorkBudget {
+            input_checks: 3,
+            validation_checks: 1,
+            readiness_checks: 2,
+            solver_work: 20_000,
+        },
+    };
+    let mut mirror = visual_fixture::mirror(&server);
+    let start = Instant::now();
+    let mut seq = 0;
+    let mut first = None;
+    loop {
+        seq += 1;
+        let before = hub.shared_light_diagnostics().unwrap();
+        interest::send(
+            &mut client,
+            ClientMessage::Control {
+                seq,
+                payload: vec![1],
+            },
+        );
+        hub.poll_control(&mut server).unwrap();
+        assert_eq!(hub.shared_light_diagnostics().unwrap(), before);
+        let messages = interest::drain(&mut client).0;
+        assert!(messages.iter().any(
+            |msg| matches!(msg, ServerMessage::ControlAck { seq: actual, .. } if *actual == seq)
+        ));
+        assert!(
+            !messages
+                .iter()
+                .any(|msg| matches!(msg, ServerMessage::Terrain(_) | ServerMessage::Light(_)))
+        );
+        let progress = hub.poll_display(&server, budget).unwrap();
+        assert!(
+            progress.sessions <= 1 && progress.metadata_checks <= 2 && progress.light_checks <= 1
+        );
+        assert!(
+            progress.lighting.input_checks <= 3
+                && progress.lighting.validation_checks <= 1
+                && progress.lighting.readiness_checks <= 2
+        );
+        for msg in interest::drain(&mut client).0 {
+            match msg {
+                ServerMessage::Terrain(update) => {
+                    if let Some(page) = update.pages.first() {
+                        first.get_or_insert(page.terrain.sections[0].pos);
+                    }
+                    mirror.apply(update).unwrap();
+                }
+                ServerMessage::Light(update) => {
+                    mirror.apply_light(update).unwrap();
+                }
+                _ => {}
+            }
+        }
+        if mirror.pages().count() == 3
+            && visual_fixture::scope(4, 3)
+                .sections
+                .iter()
+                .all(|&pos| mirror.light(pos).is_some())
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            hub.shared_light_resources()
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(first, Some(SectionPos::new(4, 0, 0)));
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        seq as usize
+    );
+    assert!(hub.contains(fast) && hub.contains(slow));
+    assert_eq!(hub.shared_light_diagnostics().unwrap().published, 3);
+    assert_eq!(hub.shared_light_diagnostics().unwrap().started, 3);
+}
+
+#[test]
+fn deferred_light_admissions_coalesce_and_do_not_gate_terrain_resets() {
+    use torse_net::MemoryTransport;
+    use torse_server::{bootstrap as base, network::*};
+    let dir = Directory::new();
+    let mut server = fixture::create(&dir);
+    let pages = fixture::pages(&dir);
+    let mut hub =
+        NetworkHub::<MemoryTransport>::new(server.binding(), base::network_limits()).unwrap();
+    hub.enable_shared_lighting(&server, pages.clone(), limits(), 20_000)
+        .unwrap();
+    let (id, mut client, _, _) =
+        interest::attach(&mut hub, &mut server, visual_fixture::scope(0, 1));
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages,
+        visual_fixture::approval(),
+        visual_fixture::scope(4, 1),
+        SectionPos::new(4, 0, 0),
+        visual_fixture::limits(),
+    )
+    .unwrap();
+    let before = hub.shared_light_resources().unwrap();
+    hub.set_visual_interest_deferred(id, visual_fixture::scope(5, 1), SectionPos::new(5, 0, 0))
+        .unwrap();
+    hub.set_visual_interest_deferred(id, visual_fixture::scope(6, 2), SectionPos::new(6, 0, 0))
+        .unwrap();
+    hub.poll_control(&mut server).unwrap();
+    assert_eq!(
+        hub.shared_light_resources().unwrap().admitted_links,
+        before.admitted_links
+    );
+    let terrain_only = DisplayWorkBudget {
+        sessions: 1,
+        metadata_checks_per_session: 1,
+        ..Default::default()
+    };
+    let progress = hub.poll_display(&server, terrain_only).unwrap();
+    assert_eq!(progress.light_admissions, 0);
+    let reset = interest::drain(&mut client)
+        .0
+        .into_iter()
+        .find_map(|msg| {
+            if let ServerMessage::Terrain(update) = msg {
+                Some(update)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(
+        reset.reset.unwrap().sections,
+        visual_fixture::scope(6, 2)
+            .sections
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(hub.shared_light_resources().unwrap().admitted_links, 1);
+    let progress = hub
+        .poll_display(
+            &server,
+            DisplayWorkBudget {
+                sessions: 1,
+                light_admissions: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(progress.light_admissions, 1);
+    assert_eq!(hub.shared_light_resources().unwrap().admitted_links, 2);
+    assert_eq!(
+        hub.shared_light_resources().unwrap().admission_denials,
+        before.admission_denials
+    );
+    assert!(
+        hub.set_visual_interest_deferred(id, visual_fixture::scope(100, 1), SectionPos::ZERO)
+            .is_err()
+    );
+    assert_eq!(
+        hub.poll_display(
+            &server,
+            DisplayWorkBudget {
+                sessions: 1,
+                light_admissions: 1,
+                ..Default::default()
+            }
+        )
+        .unwrap()
+        .light_admissions,
+        0
+    );
+    hub.set_visual_interest_deferred(id, visual_fixture::scope(8, 1), SectionPos::new(8, 0, 0))
+        .unwrap();
+    hub.reset_policy(
+        &mut server,
+        id,
+        PeerPolicy {
+            actor: torse_sim::action::ActorContext::new(base::key("test:replacement")),
+            scope: visual_fixture::scope(0, 1),
+        },
+    )
+    .unwrap();
+    assert_eq!(hub.shared_light_resources().unwrap().admitted_links, 0);
+    assert_eq!(
+        hub.poll_display(
+            &server,
+            DisplayWorkBudget {
+                sessions: 1,
+                light_admissions: 1,
+                ..Default::default()
+            }
+        )
+        .unwrap()
+        .light_admissions,
+        0
+    );
+    assert!(hub.visual_terrain_diagnostics(id).is_none());
+    let messages = interest::drain(&mut client).0;
+    assert!(
+        matches!(messages.first(), Some(ServerMessage::Terrain(update)) if update.reset.as_ref().is_some_and(|reset| reset.sections.is_empty()))
+    );
+}
+
+#[test]
+fn one_input_and_target_check_per_slice_eventually_revalidates_source_changes() {
+    use torse_server::lighting::HostLightWorkBudget;
+    let dir = Directory::new();
+    let mut server = fixture::create(&dir);
+    let pages = fixture::pages(&dir);
+    let target = SectionPos::ZERO;
+    let mut field =
+        HostLightField::new(server.authority().unwrap(), pages.clone(), limits()).unwrap();
+    field.subscribe(1, &[target]).unwrap();
+    let budget = HostLightWorkBudget {
+        input_checks: 1,
+        validation_checks: 1,
+        readiness_checks: 1,
+        solver_work: 20_000,
+    };
+    let start = Instant::now();
+    for parked in [false, true, false] {
+        if parked {
+            server
+                .unload_section(&pages, target, &mut NoReplicas)
+                .unwrap();
+        } else if server
+            .authority()
+            .unwrap()
+            .parked_sections()
+            .contains_key(&target)
+        {
+            server
+                .reload_section(&pages, target, &mut NoReplicas)
+                .unwrap();
+        }
+        loop {
+            let progress = field
+                .poll_with_budget(server.authority().unwrap(), budget)
+                .unwrap();
+            assert!(
+                progress.input_checks <= 1
+                    && progress.validation_checks <= 1
+                    && progress.readiness_checks <= 1
+            );
+            if field
+                .publication(1, target, server.authority().unwrap())
+                .is_some()
+            {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::yield_now();
+        }
+    }
+    assert_eq!(field.diagnostics().started, 1);
+}
+
 fn limits() -> HostLightLimits {
     HostLightLimits {
         input_sections: 64,

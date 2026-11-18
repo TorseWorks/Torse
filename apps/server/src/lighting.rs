@@ -19,6 +19,23 @@ pub struct HostLightLimits {
     pub pages_per_poll: usize,
     pub field: LightFieldLimits,
 }
+/// Optional lighting work per scheduling call. A target check includes its
+/// configured, bounded dependency envelope; solver preparation/capture is a
+/// non-preemptible unit bounded by `LightFieldLimits::job`, not a time deadline.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostLightWorkBudget {
+    pub input_checks: usize,
+    pub validation_checks: usize,
+    pub readiness_checks: usize,
+    pub solver_work: usize,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostLightProgress {
+    pub input_checks: usize,
+    pub validation_checks: usize,
+    pub readiness_checks: usize,
+    pub published: Option<SectionPos>,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Source {
     Resident(Revision, Option<Revision>),
@@ -85,6 +102,10 @@ pub struct HostLightField {
     centers: BTreeMap<u128, SectionPos>,
     needed: BTreeSet<SectionPos>,
     input_order: Vec<SectionPos>,
+    input_cursor: usize,
+    target_order: Vec<(u128, SectionPos)>,
+    target_ranks: BTreeMap<SectionPos, u128>,
+    target_cursor: usize,
     inputs: BTreeMap<SectionPos, Input>,
     loader: Loader,
     in_flight: usize,
@@ -170,6 +191,7 @@ impl HostLightField {
             })
             .and_then(|n| n.checked_add(limits.input_sections as u64 * 512))
             .and_then(|n| n.checked_add(limits.field.interests as u64 * 128))
+            .and_then(|n| n.checked_add(limits.field.sections as u64 * 128))
             .ok_or_else(|| Fault::resource_limit("shared lighting reservation"))?;
         let memory = host
             .memory_pool()
@@ -206,6 +228,10 @@ impl HostLightField {
             centers: BTreeMap::new(),
             needed: BTreeSet::new(),
             input_order: Vec::new(),
+            input_cursor: 0,
+            target_order: Vec::new(),
+            target_ranks: BTreeMap::new(),
+            target_cursor: 0,
             inputs: BTreeMap::new(),
             loader: Loader {
                 sender: Some(sender),
@@ -349,6 +375,21 @@ impl HostLightField {
                 std::cmp::Reverse(p.y),
             )
         });
+        self.input_cursor = 0;
+        let mut targets = BTreeMap::<SectionPos, u128>::new();
+        for (&consumer, positions) in &self.interests {
+            for &pos in positions {
+                let rank = distance(pos, self.centers[&consumer]);
+                targets
+                    .entry(pos)
+                    .and_modify(|old| *old = (*old).min(rank))
+                    .or_insert(rank);
+            }
+        }
+        self.target_order = targets.iter().map(|(&pos, &rank)| (rank, pos)).collect();
+        self.target_ranks = targets;
+        self.target_order.sort_unstable();
+        self.target_cursor = 0;
     }
     fn validate_target(&self, target: SectionPos) -> Result<(), Fault> {
         let side = i128::from(self.terrain.side());
@@ -405,6 +446,8 @@ impl HostLightField {
             .checked_add(1)
             .ok_or_else(|| Fault::resource_limit("light I/O generations"))?;
         self.inputs.clear();
+        self.input_cursor = 0;
+        self.target_cursor = 0;
         let positions: Vec<_> = self.terrain.positions().collect();
         for pos in positions {
             self.terrain.suspend(pos);
@@ -469,12 +512,34 @@ impl HostLightField {
     }
 
     pub fn poll(&mut self, host: &ExecutionHost, work: usize) -> Result<Option<SectionPos>, Fault> {
+        Ok(self
+            .poll_with_budget(
+                host,
+                HostLightWorkBudget {
+                    input_checks: usize::MAX,
+                    validation_checks: usize::MAX,
+                    readiness_checks: usize::MAX,
+                    solver_work: work,
+                },
+            )?
+            .published)
+    }
+    /// Budgeted input and target scans rotate independently. Publication also
+    /// rechecks authority source stamps, so an unvisited changed source cannot
+    /// escape through an older publication while its input scan is deferred.
+    pub fn poll_with_budget(
+        &mut self,
+        host: &ExecutionHost,
+        budget: HostLightWorkBudget,
+    ) -> Result<HostLightProgress, Fault> {
+        let mut progress = HostLightProgress::default();
         if host.binding() != self.terrain.binding() {
             return Err(Fault::invalid_data("shared lighting world changed"));
         }
-        for _ in 0..self.in_flight {
+        for _ in 0..self.in_flight.min(budget.input_checks) {
             match self.loader.receiver.try_recv() {
                 Ok(result) => {
+                    progress.input_checks += 1;
                     self.in_flight -= 1;
                     if result.generation == self.io_generation
                         && self.needed.contains(&result.pos)
@@ -527,25 +592,19 @@ impl HostLightField {
                 }
             }
         }
-        // Suspend all changed sources before advancing any light job. Captures
-        // below are bounded separately from the read-only metadata scan.
-        for &pos in &self.input_order {
-            if self
-                .inputs
-                .get(&pos)
-                .is_none_or(|i| i.source != source(host, pos))
-            {
-                self.terrain.suspend(pos);
-            }
-        }
+        let scan = (budget.input_checks - progress.input_checks).min(self.input_order.len());
+        progress.input_checks += scan;
         let mut captured = 0;
-        for &pos in &self.input_order {
+        for _ in 0..scan {
+            let pos = self.input_order[self.input_cursor];
+            self.input_cursor = (self.input_cursor + 1) % self.input_order.len();
             let current = source(host, pos);
             if self.inputs.get(&pos).is_some_and(|i| i.source == current) {
                 continue;
             }
+            self.terrain.suspend(pos);
             if captured == self.limits.pages_per_poll {
-                break;
+                continue;
             }
             match current {
                 Source::Resident(..) => {
@@ -613,44 +672,86 @@ impl HostLightField {
             Some(table) => table,
             None => host.world().registry(),
         };
-        self.field.inputs_changed(&self.terrain, optics);
+        progress.validation_checks =
+            self.field
+                .inputs_changed_bounded(&self.terrain, optics, budget.validation_checks);
         self.input_peak = self.input_peak.max(self.input_bytes());
-        // Verify readiness per column: a distant read or a denied source must
-        // not stall unrelated ready columns. Unknown, absent terrain is distinct
-        // from terrain whose verification is still pending or has failed.
+        if budget.readiness_checks == 0 || budget.solver_work == 0 {
+            return Ok(progress);
+        }
         let mut ready = BTreeMap::new();
-        for (&consumer, targets) in &self.interests {
-            for &target in targets {
-                let column = (target.x, target.z);
-                if let std::collections::btree_map::Entry::Vacant(entry) = ready.entry(column) {
-                    let envelope = self.dependencies(&[target].into())?;
-                    let verified = envelope.iter().all(|p| {
-                        self.inputs.get(p).is_some_and(|i| {
-                            matches!(
-                                i.status,
-                                LightInputStatus::Ready | LightInputStatus::Missing
-                            ) && source(host, *p) == i.source
-                        })
-                    });
-                    entry.insert(verified.then_some(u128::MAX));
-                }
-                if let Some(rank) = ready.get_mut(&column).expect("column readiness") {
-                    *rank = (*rank).min(distance(target, self.centers[&consumer]));
-                }
+        let mut columns = BTreeMap::new();
+        let mut selected: Option<(u128, SectionPos)> = None;
+        let active = self.field.active_target();
+        if let Some(target) = active {
+            let rank = self.target_ranks.get(&target).copied();
+            ready.insert(
+                target,
+                self.ready_priority(host, target, rank, &mut columns)?,
+            );
+            progress.readiness_checks += 1;
+        }
+        let scan =
+            (budget.readiness_checks - progress.readiness_checks).min(self.target_order.len());
+        for _ in 0..scan {
+            let (rank, target) = self.target_order[self.target_cursor];
+            self.target_cursor = (self.target_cursor + 1) % self.target_order.len();
+            progress.readiness_checks += 1;
+            if Some(target) == active || !self.field.needs_work(target) {
+                continue;
+            }
+            let priority = self.ready_priority(host, target, Some(rank), &mut columns)?;
+            ready.insert(target, priority);
+            if let Some(rank) = priority {
+                selected = Some(selected.map_or((rank, target), |old| old.min((rank, target))));
             }
         }
         // Ordinary invalidation cancels stale work; it is not a server failure.
         let stale = self.field.diagnostics().stale;
-        match self.field.poll_ready(&self.terrain, optics, work, |p| {
-            ready.get(&(p.x, p.z)).copied().flatten()
-        }) {
+        let result = match self.field.poll_selected(
+            &self.terrain,
+            optics,
+            budget.solver_work,
+            selected.map(|(_, p)| p),
+            |p| ready.get(&p).copied().flatten(),
+        ) {
             Err(e)
                 if e.code == FaultCode::InvalidData && self.field.diagnostics().stale > stale =>
             {
                 Ok(None)
             }
             other => other,
-        }
+        }?;
+        progress.published = result;
+        Ok(progress)
+    }
+    fn ready_priority(
+        &self,
+        host: &ExecutionHost,
+        target: SectionPos,
+        rank: Option<u128>,
+        columns: &mut BTreeMap<(i64, i64), bool>,
+    ) -> Result<Option<u128>, Fault> {
+        let Some(rank) = rank else {
+            return Ok(None);
+        };
+        let column = (target.x, target.z);
+        let verified = if let Some(&verified) = columns.get(&column) {
+            verified
+        } else {
+            let envelope = self.dependencies(&[target].into())?;
+            let verified = envelope.iter().all(|p| {
+                self.inputs.get(p).is_some_and(|i| {
+                    matches!(
+                        i.status,
+                        LightInputStatus::Ready | LightInputStatus::Missing
+                    ) && source(host, *p) == i.source
+                })
+            });
+            columns.insert(column, verified);
+            verified
+        };
+        Ok(verified.then_some(rank))
     }
 }
 fn distance(pos: SectionPos, center: SectionPos) -> u128 {

@@ -130,6 +130,109 @@ fn tick(server: &mut base::Files, hub: &mut NetworkHub<MemoryTransport>) {
     hub.poll(server).unwrap();
 }
 
+#[test]
+fn control_only_polling_keeps_durable_player_poses_moving_while_display_is_paused() {
+    let dir = Directory::new();
+    let mut server = create(&dir);
+    let mut hub = NetworkHub::new(server.binding(), base::network_limits()).unwrap();
+    let path = dir.0.join("sections");
+    std::fs::create_dir_all(&path).unwrap();
+    let pages =
+        crate::section_pages::SectionPages::new(path, base::budget(), base::codec_limits(), 64)
+            .unwrap();
+    hub.enable_shared_lighting(
+        &server,
+        pages.clone(),
+        crate::lighting::HostLightLimits {
+            input_sections: 128,
+            input_bytes: 8 * 1024 * 1024,
+            pages_per_poll: 2,
+            field: torse_world_services::lighting::LightFieldLimits {
+                sections: 4,
+                cache_bytes: 8 * 1024 * 1024,
+                solver_cache_bytes: 8 * 1024 * 1024,
+                consumers: 2,
+                interests: 8,
+                job: torse_world_services::lighting::LightLimits {
+                    cells: 200_000,
+                    dependencies: 128,
+                    frontier: 200_000,
+                    bytes: 8 * 1024 * 1024,
+                },
+            },
+        },
+        20_000,
+    )
+    .unwrap();
+    let (id, mut client) = add(&mut hub, &server, Some(EntityId(3)));
+    hello(&mut client, &server);
+    send(
+        &mut client,
+        ClientMessage::Subscribe {
+            sections: base::scope().sections.into_iter().collect(),
+        },
+    );
+    hub.poll_control(&mut server).unwrap();
+    let session = receive(&mut client)
+        .into_iter()
+        .find_map(|msg| match msg {
+            ServerMessage::Welcome { session, .. } => Some(session.0),
+            _ => None,
+        })
+        .unwrap();
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages,
+        crate::visual::VisualTerrainApproval::rectangular(
+            SectionPos::ZERO,
+            SectionPos::new(1, 0, 0),
+        )
+        .unwrap(),
+        base::scope(),
+        SectionPos::ZERO,
+        crate::visual::VisualTerrainLimits {
+            max_sections: 2,
+            cache_bytes: 256 * 1024,
+            io_bytes: 32 * 1024 * 1024,
+            batch_bytes: 64 * 1024,
+            control_bytes: 64 * 1024,
+            pages_per_poll: 1,
+        },
+    )
+    .unwrap();
+    // Settle the idle step scheduled by the handshake, then keep a real input
+    // stream queued ahead of each confirmation-driven next-tick admission.
+    for seq in 1..=8 {
+        movement(&mut client, session, seq, [127, 0], false);
+    }
+    server.drive_tick(&mut hub, 2048).unwrap();
+    hub.poll_control(&mut server).unwrap();
+    receive(&mut client);
+    let before = pose(&server, 3);
+    for seq in 1..=8 {
+        for _ in 0..17 {
+            hub.poll_control(&mut server).unwrap();
+        }
+        server.drive_tick(&mut hub, 2048).unwrap();
+        hub.poll_control(&mut server).unwrap();
+        let messages = receive(&mut client);
+        assert!(messages.iter().any(|msg| matches!(msg, ServerMessage::Player(update) if update.input_seq == seq && update.position_bits == pose(&server, 3).to_bits())));
+        assert!(
+            !messages
+                .iter()
+                .any(|msg| matches!(msg, ServerMessage::Terrain(_) | ServerMessage::Light(_)))
+        );
+    }
+    assert!((pose(&server, 3).x - before.x - 8.0 * 0.215).abs() < 1e-8);
+    assert_eq!(hub.shared_light_diagnostics().unwrap().started, 0);
+    assert_eq!(
+        hub.visual_terrain_diagnostics(id).unwrap().metadata_scanned,
+        0
+    );
+    assert!(!hub.visual_terrain_diagnostics(id).unwrap().io_pending);
+}
+
 fn enable_follow(
     dir: &Directory,
     server: &mut base::Files,
