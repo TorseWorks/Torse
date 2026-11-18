@@ -9,6 +9,101 @@ use torse_sim::replica::ReplicaScope;
 use torse_types::*;
 
 #[test]
+fn successive_resets_cannot_retain_a_page_omitted_from_the_previous_reset() {
+    let dir = Directory::new();
+    let (mut server, pages, expected) = create(&dir);
+    let pos = SectionPos::new(20, 0, 0);
+    let (mut hub, id, mut client, _, _) = connect(&mut server, scope(0, 1));
+    let mut display = torse_net::terrain::TerrainMirror::new(
+        server.binding(),
+        16,
+        server.authority().unwrap().world().store().bounds(),
+        torse_net::terrain::TerrainLimits {
+            max_sections: 128,
+            max_bytes: 1_000_000,
+            metadata_bytes: 128 * 512,
+        },
+        None,
+    )
+    .unwrap();
+    let mut budget = limits();
+    budget.max_sections = 128;
+    budget.pages_per_poll = 1;
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages.clone(),
+        approval(),
+        scope(20, 1),
+        pos,
+        budget,
+    )
+    .unwrap();
+    fill(&mut hub, &mut server, &mut client, &mut display);
+    assert_eq!(display.page(pos), expected.get(&pos));
+
+    server.reload_section(&pages, pos, &mut hub).unwrap();
+    // The first bounded scan cannot reach the distant retained candidate.
+    let mut wide = ReplicaScope {
+        sections: (-8..=0)
+            .flat_map(|x| (0..9).map(move |y| SectionPos::new(x, y, 0)))
+            .collect(),
+    };
+    wide.sections.insert(pos);
+    hub.set_visual_interest(id, wide, SectionPos::ZERO).unwrap();
+    hub.poll(&mut server).unwrap();
+    let first = drain(&mut client)
+        .0
+        .into_iter()
+        .find_map(|msg| match msg {
+            ServerMessage::Terrain(update) => Some(update),
+            _ => None,
+        })
+        .unwrap();
+    assert!(first.reset.as_ref().unwrap().retained.is_empty());
+    display.apply(first).unwrap();
+    assert!(display.page(pos).is_none());
+
+    hub.set_visual_interest(id, scope(20, 1), pos).unwrap();
+    hub.poll(&mut server).unwrap();
+    let second = drain(&mut client)
+        .0
+        .into_iter()
+        .find_map(|msg| match msg {
+            ServerMessage::Terrain(update) => Some(update),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        second.reset.as_ref().unwrap().retained.is_empty(),
+        "a reset must not retain an undelivered page"
+    );
+    display.apply(second).unwrap();
+    assert!(display.page(pos).is_none());
+    fill(&mut hub, &mut server, &mut client, &mut display);
+    assert_eq!(display.page(pos), expected.get(&pos));
+
+    // Once delivered again, the same page can legitimately be retained.
+    hub.set_visual_interest(id, scope(20, 2), pos).unwrap();
+    hub.poll(&mut server).unwrap();
+    let reset = drain(&mut client)
+        .0
+        .into_iter()
+        .find_map(|msg| match msg {
+            ServerMessage::Terrain(update) => Some(update),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(reset.reset.as_ref().unwrap().retained.len(), 1);
+    assert_eq!(reset.reset.as_ref().unwrap().retained[0].0, pos);
+    display.apply(reset).unwrap();
+    assert_eq!(display.page(pos), expected.get(&pos));
+    fill(&mut hub, &mut server, &mut client, &mut display);
+    assert_eq!(display.page(pos), expected.get(&pos));
+    assert!(hub.contains(id));
+}
+
+#[test]
 fn unchanged_terrain_remains_visible_while_parking_and_reloading() {
     let dir = Directory::new();
     let (mut server, pages, _) = create(&dir);
