@@ -988,6 +988,11 @@ impl VisualSession {
             for (pos, _) in &retained {
                 self.dirty.remove(&column_priority(*pos, self.center));
             }
+            // Reset removes every other page from the mirror, even when its
+            // cached source can be proven unchanged on a later bounded scan.
+            // Only an actual page delivery can restore its retention eligibility.
+            self.sent.clear();
+            self.sent.extend(retained.iter().copied());
             let reset = TerrainReset {
                 sections: self.desired.sections.iter().copied().collect(),
                 retained,
