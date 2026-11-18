@@ -1,0 +1,56 @@
+[
+  {
+    "directory": "mixed-01",
+    "samples": 30,
+    "kernel_max_ns": 1778700,
+    "kernel_ge_5ms": 0
+  },
+  {
+    "directory": "mixed-02",
+    "samples": 30,
+    "kernel_max_ns": 7340800,
+    "kernel_ge_5ms": 5
+  },
+  {
+    "directory": "mixed-03",
+    "samples": 30,
+    "kernel_max_ns": 6519500,
+    "kernel_ge_5ms": 2
+  },
+  {
+    "directory": "mixed-04",
+    "samples": 30,
+    "kernel_max_ns": 3937900,
+    "kernel_ge_5ms": 0
+  },
+  {
+    "directory": "mixed-05",
+    "samples": 30,
+    "kernel_max_ns": 8549900,
+    "kernel_ge_5ms": 2
+  },
+  {
+    "directory": "mixed-06",
+    "samples": 30,
+    "kernel_max_ns": 2503700,
+    "kernel_ge_5ms": 0
+  },
+  {
+    "directory": "mixed-07",
+    "samples": 30,
+    "kernel_max_ns": 2637900,
+    "kernel_ge_5ms": 0
+  },
+  {
+    "directory": "mixed-08",
+    "samples": 30,
+    "kernel_max_ns": 3596000,
+    "kernel_ge_5ms": 0
+  },
+  {
+    "directory": "uniform-09",
+    "samples": 30,
+    "kernel_max_ns": 1470300,
+    "kernel_ge_5ms": 0
+  }
+]
