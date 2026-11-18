@@ -245,6 +245,7 @@ pub struct PeerPolicy {
 }
 struct Peer<T> {
     visual: Option<crate::visual::VisualSession>,
+    visual_generation_floor: u64,
     user: Option<ContentKey>,
     player: Option<player::Control>,
     transport: T,
@@ -430,6 +431,7 @@ impl<T: Transport> NetworkHub<T> {
                 follow_scope: None,
                 follow_ready: false,
                 visual: None,
+                visual_generation_floor: 0,
                 control_link: None,
             },
         );
@@ -459,6 +461,11 @@ impl<T: Transport> NetworkHub<T> {
             .get_or_insert(Duration::from_secs(60));
         self._authentication_memory = memory;
         Ok(())
+    }
+    /// Current host-selected actor identity, distinct from the authenticated user.
+    pub fn actor_principal(&self, id: u128) -> Option<&ContentKey> {
+        let peer = self.peers.get(&id)?;
+        (!peer.closed).then_some(peer.policy.actor.principal())
     }
     pub fn user(&self, id: u128) -> Option<&ContentKey> {
         self.peers.get(&id)?.user.as_ref()
@@ -551,6 +558,9 @@ impl<T: Transport> NetworkHub<T> {
     }
 
     /// Explicitly retire old subscriptions and send a complete baseline.
+    /// A principal change also retires its display approval and shared-light
+    /// interest. The host must explicitly approve the replacement display range.
+    /// Pending output still closes the connection; authenticated users cannot change.
     pub fn reset_policy<
         J: CommitJournal<ExecutionModel>,
         S: HostCheckpointStore<ExecutionModel>,
@@ -581,7 +591,11 @@ impl<T: Transport> NetworkHub<T> {
         if peer.closed {
             return Err(Fault::invalid_data("closed peer"));
         }
-        if peer.visual.is_some() && peer.policy.actor.principal() != policy.actor.principal() {
+        let principal_changed = peer.policy.actor.principal() != policy.actor.principal();
+        if peer.visual.is_some()
+            && principal_changed
+            && (incremental || !peer.transport.output_idle())
+        {
             peer.closed = true;
             peer.transport.close();
             self.cleanup(server)?;
@@ -598,6 +612,40 @@ impl<T: Transport> NetworkHub<T> {
             return Err(Fault::invalid_data(
                 "scope replacement cannot change the authenticated user",
             ));
+        }
+        let visual_revocation =
+            if principal_changed {
+                peer.visual
+                    .as_ref()
+                    .map(|visual| {
+                        Ok::<_, Fault>(TerrainUpdate {
+                            binding: self.binding,
+                            generation: visual.diagnostics().generation.checked_add(1).ok_or_else(
+                                || Fault::resource_limit("visual generation exhausted"),
+                            )?,
+                            seq: 1,
+                            through: CommitCursor {
+                                world: self.binding.world,
+                                seq: CommitSeq(server.durability().through.0),
+                            },
+                            reset: Some(TerrainReset {
+                                sections: Vec::new(),
+                                retained: Vec::new(),
+                            }),
+                            pages: Vec::new(),
+                            unavailable: Vec::new(),
+                        })
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+        if let Some(update) = &visual_revocation {
+            crate::visual::check_frame(
+                &ServerMessage::Terrain(update.clone()),
+                self.limits.budget,
+                self.limits.codec,
+            )?;
         }
         let policy_bytes = policy
             .actor
@@ -681,6 +729,9 @@ impl<T: Transport> NetworkHub<T> {
                 for old in std::mem::take(&mut peer.subscriptions) {
                     server.close_replica(SubscriptionId(old))?;
                 }
+                if let Some(update) = &visual_revocation {
+                    Self::send(peer, ServerMessage::Terrain(update.clone()), self.limits)?;
+                }
                 if self.follow.is_some() && peer.player.is_some() {
                     return Ok(());
                 }
@@ -697,6 +748,14 @@ impl<T: Transport> NetworkHub<T> {
                 peer.transport.close();
                 self.cleanup(server)?;
                 return Err(error);
+            }
+        }
+        if principal_changed && let Some(visual) = peer.visual.take() {
+            peer.visual_generation_floor = visual_revocation
+                .as_ref()
+                .map_or(visual.diagnostics().generation, |u| u.generation);
+            if let Some((field, _)) = &mut self.lighting {
+                field.unsubscribe(id);
             }
         }
         peer.policy = policy;

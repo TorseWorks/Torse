@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     section_pages::SectionPages,
-    visual::{VisualSession, VisualTerrainApproval, VisualTerrainLimits},
+    visual::{VisualSession, VisualStart, VisualTerrainApproval, VisualTerrainLimits},
 };
 
 impl<T: Transport> NetworkHub<T> {
@@ -122,7 +122,13 @@ impl<T: Transport> NetworkHub<T> {
             pages,
             approved.into(),
             desired,
-            center,
+            VisualStart {
+                center,
+                generation: peer
+                    .visual_generation_floor
+                    .checked_add(1)
+                    .ok_or_else(|| Fault::resource_limit("visual generation exhausted"))?,
+            },
             limits,
             self.limits,
         )?;
