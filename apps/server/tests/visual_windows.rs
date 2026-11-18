@@ -573,7 +573,7 @@ fn separate_display_control_route_measurement() {
     use torse_server::lighting::{HostLightLimits, HostLightWorkBudget};
     use torse_world_services::lighting::{LightFieldLimits, LightLimits};
     println!(
-        "mode,sample,center,control_calls,control_total_ms,control_max_ms,move_ms,display_ms,first_near_ms,received_pages,host_cache_bytes,light_input_bytes,light_pending,slow_connected"
+        "mode,sample,center,control_calls,control_total_ms,control_max_ms,move_ms,display_ms,display_max_ms,first_near_column_payload_ms,received_pages,available_pages,host_cache_bytes,light_input_bytes,light_input_peak,light_pending,slow_connected"
     );
     for split in [false, true] {
         let dir = Directory::new();
@@ -622,6 +622,10 @@ fn separate_display_control_route_measurement() {
                 }];
                 page
             })
+            .collect();
+        let expected: std::collections::BTreeMap<_, _> = input
+            .iter()
+            .map(|page| (page.sections[0].pos, page.sections[0].cells.clone()))
             .collect();
         server
             .begin_generated_parking(
@@ -719,6 +723,7 @@ fn separate_display_control_route_measurement() {
             let mut control_total = Duration::ZERO;
             let mut control_max = Duration::ZERO;
             let mut display_time = Duration::ZERO;
+            let mut display_max = Duration::ZERO;
             let mut first_near = None;
             let mut received = 0;
             for _ in 0..24 {
@@ -736,6 +741,12 @@ fn separate_display_control_route_measurement() {
                     for msg in drain(&mut client) {
                         match msg {
                             ServerMessage::Terrain(update) => {
+                                for page in &update.pages {
+                                    if let Some(cells) = expected.get(&page.terrain.sections[0].pos)
+                                    {
+                                        assert_eq!(&page.terrain.sections[0].cells, cells);
+                                    }
+                                }
                                 if update.pages.iter().any(|page| {
                                     page.terrain.sections[0].pos.x.abs_diff(center) <= 1
                                 }) {
@@ -769,10 +780,18 @@ fn separate_display_control_route_measurement() {
                         },
                     )
                     .unwrap();
-                    display_time += start.elapsed();
+                    let elapsed = start.elapsed();
+                    display_time += elapsed;
+                    display_max = display_max.max(elapsed);
                     for msg in drain(&mut client) {
                         match msg {
                             ServerMessage::Terrain(update) => {
+                                for page in &update.pages {
+                                    if let Some(cells) = expected.get(&page.terrain.sections[0].pos)
+                                    {
+                                        assert_eq!(&page.terrain.sections[0].cells, cells);
+                                    }
+                                }
                                 if update.pages.iter().any(|page| {
                                     page.terrain.sections[0].pos.x.abs_diff(center) <= 1
                                 }) {
@@ -794,18 +813,21 @@ fn separate_display_control_route_measurement() {
             let visual = hub.visual_terrain_diagnostics(id).unwrap();
             let light = hub.shared_light_resources().unwrap();
             println!(
-                "{},{sample},{center},408,{:.6},{:.6},{:.6},{:.6},{},{received},{},{},{},{}",
+                "{},{sample},{center},408,{:.6},{:.6},{:.6},{:.6},{:.6},{},{received},{},{},{},{},{},{}",
                 if split { "split" } else { "combined" },
                 control_total.as_secs_f64() * 1000.,
                 control_max.as_secs_f64() * 1000.,
                 move_time.as_secs_f64() * 1000.,
                 display_time.as_secs_f64() * 1000.,
+                display_max.as_secs_f64() * 1000.,
                 first_near.map_or("unobserved".into(), |t| format!(
                     "{:.6}",
                     t.as_secs_f64() * 1000.
                 )),
+                mirror.pages().count(),
                 visual.cache_bytes,
                 light.input_bytes,
+                light.input_peak,
                 light.field.pending,
                 hub.contains(slow)
             );

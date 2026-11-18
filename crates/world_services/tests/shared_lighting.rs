@@ -91,6 +91,53 @@ fn emitter(registry: &BlockStateRegistry) -> BlockStateId {
 }
 
 #[test]
+fn bounded_revalidation_rotates_and_selected_updates_match_cold_results() {
+    let (mut terrain, registry, mut field) = setup();
+    let targets = [SectionPos::ZERO, SectionPos::new(1, 0, 0)];
+    field.subscribe(1, &targets).unwrap();
+    settle(&mut field, &terrain, &registry);
+    terrain
+        .insert(
+            SectionPos::ZERO,
+            Section::new(4, emitter(&registry)).unwrap(),
+            &registry,
+        )
+        .unwrap();
+    for target in targets {
+        assert!(field.publication(1, target, &terrain, &registry).is_none());
+    }
+    assert_eq!(field.inputs_changed_bounded(&terrain, &registry, 0), 0);
+    assert_eq!(field.diagnostics().pending, 0);
+    assert_eq!(field.inputs_changed_bounded(&terrain, &registry, 1), 1);
+    assert_eq!(field.diagnostics().pending, 1);
+    assert_eq!(field.inputs_changed_bounded(&terrain, &registry, 1), 1);
+    assert_eq!(field.diagnostics().pending, 2);
+    for target in targets {
+        let mut published = None;
+        for _ in 0..1000 {
+            published = field
+                .poll_selected(&terrain, &registry, 20_000, Some(target), |_| Some(0))
+                .unwrap();
+            if published.is_some() {
+                break;
+            }
+        }
+        assert_eq!(published, Some(target));
+        let result = field.publication(1, target, &terrain, &registry).unwrap();
+        assert_eq!(
+            result.emitted.levels(),
+            cold(&terrain, &registry, target, false)
+        );
+        assert_eq!(result.sky.levels(), cold(&terrain, &registry, target, true));
+    }
+    assert_eq!(field.diagnostics().pending, 0);
+    field.unsubscribe(1);
+    assert_eq!(field.diagnostics().cache_bytes, 0);
+    assert_eq!(field.diagnostics().solver_cache_bytes, 0);
+    assert_eq!(field.inputs_changed_bounded(&terrain, &registry, 1), 0);
+}
+
+#[test]
 fn warm_column_affinity_cannot_preempt_a_nearer_ready_target() {
     let (terrain, registry, mut field) = setup();
     let near = SectionPos::ZERO;

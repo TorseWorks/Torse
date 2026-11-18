@@ -446,6 +446,8 @@ impl HostLightField {
             .checked_add(1)
             .ok_or_else(|| Fault::resource_limit("light I/O generations"))?;
         self.inputs.clear();
+        self.input_cursor = 0;
+        self.target_cursor = 0;
         let positions: Vec<_> = self.terrain.positions().collect();
         for pos in positions {
             self.terrain.suspend(pos);
@@ -591,27 +593,16 @@ impl HostLightField {
             }
         }
         let scan = (budget.input_checks - progress.input_checks).min(self.input_order.len());
-        let mut positions = Vec::with_capacity(scan);
-        for _ in 0..scan {
-            positions.push(self.input_order[self.input_cursor]);
-            self.input_cursor = (self.input_cursor + 1) % self.input_order.len();
-        }
         progress.input_checks += scan;
-        for &pos in &positions {
-            if self
-                .inputs
-                .get(&pos)
-                .is_none_or(|i| i.source != source(host, pos))
-            {
-                self.terrain.suspend(pos);
-            }
-        }
         let mut captured = 0;
-        for &pos in &positions {
+        for _ in 0..scan {
+            let pos = self.input_order[self.input_cursor];
+            self.input_cursor = (self.input_cursor + 1) % self.input_order.len();
             let current = source(host, pos);
             if self.inputs.get(&pos).is_some_and(|i| i.source == current) {
                 continue;
             }
+            self.terrain.suspend(pos);
             if captured == self.limits.pages_per_poll {
                 continue;
             }
