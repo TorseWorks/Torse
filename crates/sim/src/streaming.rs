@@ -89,6 +89,28 @@ pub(crate) fn prepare_batch<'a>(
     budget: OutputBudget,
     park: bool,
 ) -> Result<PreparedSections, Fault> {
+    prepare_batch_at(world, pages, budget, park, None)
+}
+
+pub(crate) fn prepare_parking<'a>(
+    world: &WorldAuthority,
+    pages: impl ExactSizeIterator<Item = &'a Snapshot>,
+    budget: OutputBudget,
+    range: crate::durable::ParkingReservation,
+) -> Result<PreparedSections, Fault> {
+    if !range.valid() || range.end > world.entities().next_entity_id() {
+        return Err(Fault::invalid_data("invalid reserved parking range"));
+    }
+    prepare_batch_at(world, pages, budget, true, Some(range))
+}
+
+fn prepare_batch_at<'a>(
+    world: &WorldAuthority,
+    pages: impl ExactSizeIterator<Item = &'a Snapshot>,
+    budget: OutputBudget,
+    park: bool,
+    range: Option<crate::durable::ParkingReservation>,
+) -> Result<PreparedSections, Fault> {
     let count = pages.len();
     if count == 0 || count > 1024 {
         return Err(Fault::resource_limit(
@@ -96,7 +118,8 @@ pub(crate) fn prepare_batch<'a>(
         ));
     }
     let mut positions = std::collections::BTreeSet::new();
-    let mut allocator = world.entities().next_entity_id();
+    let watermark = world.entities().next_entity_id();
+    let mut allocator = range.map_or(watermark, |range| range.first);
     let mut sections = Vec::with_capacity(count);
     let mut cut = None;
     for (index, page) in pages.enumerate() {
@@ -116,15 +139,17 @@ pub(crate) fn prepare_batch<'a>(
         if !positions.insert(prepared.position()) {
             return Err(Fault::invalid_data("duplicate generated batch position"));
         }
-        allocator = page.next_entity_id;
+        if !park || !page.entities.is_empty() {
+            allocator = page.next_entity_id;
+        }
         sections.push(prepared);
     }
-    if sections.len() != count {
+    if sections.len() != count || range.is_some_and(|range| allocator != range.end) {
         return Err(Fault::invalid_data("page iterator length changed"));
     }
     Ok(PreparedSections {
         sections,
-        next_entity_id: allocator,
+        next_entity_id: range.map_or(allocator, |_| watermark),
         park,
     })
 }
@@ -164,9 +189,13 @@ fn prepare_at(
         let end = first
             .checked_add(page.entities.len() as u128)
             .ok_or_else(|| Fault::resource_limit("generated entity allocator exhausted"))?;
+        // A terrain-only parked page owns no IDs. Its original watermark
+        // remains part of the immutable bytes but cannot move the allocator.
+        let watermark_matches = page.next_entity_id == end
+            || (park && page.entities.is_empty() && page.next_entity_id < end);
         if !load
             || (!park && page.meta.cursor.seq != world.seq())
-            || page.next_entity_id != end
+            || !watermark_matches
             || page
                 .entities
                 .iter()
@@ -252,7 +281,6 @@ fn same_page(a: &Snapshot, b: &Snapshot) -> bool {
         && a.bounds == b.bounds
         && a.states == b.states
         && a.entities == b.entities
-        && a.next_entity_id == b.next_entity_id
         && a.sections.len() == b.sections.len()
         && a.sections
             .iter()

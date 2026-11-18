@@ -39,6 +39,7 @@ pub struct VisualTerrainDiagnostics {
     pub io_pending: bool,
     pub generation: u64,
     pub sequence: u64,
+    pub reused_read_pages: u64,
     pub metadata_scanned: usize,
     pub pending_candidates: usize,
 }
@@ -96,6 +97,17 @@ fn distance(pos: SectionPos, center: SectionPos) -> u128 {
         + u128::from(pos.y.abs_diff(center.y))
         + u128::from(pos.z.abs_diff(center.z))
 }
+type ColumnPriority = (u128, i64, i64, u64, SectionPos);
+
+fn column_priority(pos: SectionPos, center: SectionPos) -> ColumnPriority {
+    (
+        u128::from(pos.x.abs_diff(center.x)) + u128::from(pos.z.abs_diff(center.z)),
+        pos.x,
+        pos.z,
+        pos.y.abs_diff(center.y),
+        pos,
+    )
+}
 enum Read {
     Saved(Digest),
     Resident(ReplicaSnapshot),
@@ -107,6 +119,7 @@ struct Item {
 }
 struct Job {
     generation: u64,
+    refresh: u64,
     items: Vec<Item>,
 }
 struct Prepared {
@@ -116,6 +129,7 @@ struct Prepared {
 }
 struct Response {
     generation: u64,
+    refresh: u64,
     pages: Vec<Prepared>,
 }
 struct Worker {
@@ -255,12 +269,14 @@ pub(crate) struct VisualSession {
     worker: Worker,
     busy: bool,
     generation: u64,
+    refresh: u64,
+    reused_read_pages: u64,
     seq: u64,
     reset: bool,
     cache: BTreeMap<SectionPos, Cached>,
     bytes: u64,
     clock: u64,
-    dirty: BTreeSet<SectionPos>,
+    dirty: BTreeSet<ColumnPriority>,
     unavailable: BTreeMap<SectionPos, TerrainUnavailable>,
     observed: BTreeMap<SectionPos, Stamp>,
     sent: BTreeMap<SectionPos, Digest>,
@@ -272,7 +288,7 @@ pub(crate) struct VisualSession {
     order: Vec<SectionPos>,
     scan_cursor: usize,
     last_scan: usize,
-    candidates: BTreeSet<(u128, SectionPos)>,
+    candidates: BTreeSet<ColumnPriority>,
     _memory: Option<MemoryLease>,
 }
 impl VisualSession {
@@ -329,11 +345,16 @@ impl VisualSession {
     fn prioritize(&mut self) {
         self.order = self.desired.sections.iter().copied().collect();
         self.order
-            .sort_unstable_by_key(|&p| (distance(p, self.center), p));
+            .sort_unstable_by_key(|&p| column_priority(p, self.center));
         self.candidates = self
             .order
             .iter()
-            .map(|&p| (distance(p, self.center), p))
+            .map(|&p| column_priority(p, self.center))
+            .collect();
+        self.dirty = self
+            .dirty
+            .iter()
+            .map(|&(.., pos)| column_priority(pos, self.center))
             .collect();
         self.scan_cursor = 0;
     }
@@ -580,6 +601,7 @@ impl VisualSession {
                     if results
                         .send(Response {
                             generation: job.generation,
+                            refresh: job.refresh,
                             pages: prepared,
                         })
                         .is_err()
@@ -607,6 +629,8 @@ impl VisualSession {
             },
             busy: false,
             generation,
+            refresh: 0,
+            reused_read_pages: 0,
             seq: 0,
             reset: true,
             cache: BTreeMap::new(),
@@ -659,6 +683,9 @@ impl VisualSession {
             .generation
             .checked_add(1)
             .ok_or_else(|| Fault::resource_limit("visual generation exhausted"))?;
+        if refresh {
+            self.refresh = self.generation;
+        }
         self.seq = 0;
         self.light_seq = 0;
         self.light_sent.clear();
@@ -675,7 +702,7 @@ impl VisualSession {
         if let Some(old) = self.cache.remove(&pos) {
             self.bytes = self.bytes.saturating_sub(terrain_bytes(&old.page));
         }
-        self.dirty.remove(&pos);
+        self.dirty.remove(&column_priority(pos, self.center));
         self.sent.remove(&pos);
         self.light_sent.remove(&pos);
     }
@@ -690,6 +717,7 @@ impl VisualSession {
             io_pending: self.busy,
             generation: self.generation,
             sequence: self.seq,
+            reused_read_pages: self.reused_read_pages,
             metadata_scanned: self.last_scan,
             pending_candidates: self.candidates.len(),
         }
@@ -713,10 +741,12 @@ impl VisualSession {
             match self.worker.receiver.try_recv() {
                 Ok(response) => {
                     self.busy = false;
-                    if response.generation == self.generation {
+                    if response.refresh == self.refresh {
+                        let overlapping = response.generation != self.generation;
                         for page in response.pages {
                             if !self.desired.sections.contains(&page.pos)
                                 || stamp(host, page.pos) != page.stamp
+                                || (overlapping && page.result.is_err())
                             {
                                 continue;
                             }
@@ -739,6 +769,9 @@ impl VisualSession {
                                         && cached.digest == digest
                                     {
                                         cached.verify_source = false;
+                                        self.reused_read_pages = self
+                                            .reused_read_pages
+                                            .saturating_add(u64::from(overlapping));
                                         self.unavailable.remove(&page.pos);
                                         continue;
                                     }
@@ -750,7 +783,11 @@ impl VisualSession {
                                         let victim = self
                                             .cache
                                             .iter()
-                                            .filter(|(pos, _)| !self.dirty.contains(pos))
+                                            .filter(|(pos, _)| {
+                                                !self
+                                                    .dirty
+                                                    .contains(&column_priority(**pos, self.center))
+                                            })
                                             .filter(|(pos, _)| {
                                                 !self.desired.sections.contains(pos)
                                                     || (distance(**pos, self.center), **pos)
@@ -787,6 +824,9 @@ impl VisualSession {
                                         continue;
                                     }
                                     self.bytes += cost;
+                                    self.reused_read_pages = self
+                                        .reused_read_pages
+                                        .saturating_add(u64::from(overlapping));
                                     self.cache.insert(
                                         page.pos,
                                         Cached {
@@ -797,7 +837,7 @@ impl VisualSession {
                                             verify_source: false,
                                         },
                                     );
-                                    self.dirty.insert(page.pos);
+                                    self.dirty.insert(column_priority(page.pos, self.center));
                                     self.unavailable.remove(&page.pos);
                                 }
                                 Err(reason) => {
@@ -834,7 +874,7 @@ impl VisualSession {
                     // floor. Verify the new source without first removing the page.
                     cached.stamp = current;
                     cached.verify_source = true;
-                    self.dirty.insert(pos);
+                    self.dirty.insert(column_priority(pos, self.center));
                     self.unavailable.remove(&pos);
                 } else {
                     self.remove(pos);
@@ -844,7 +884,7 @@ impl VisualSession {
             if let Some(page) = self.cache.get_mut(&pos) {
                 page.touched = self.clock;
                 if self.sent.get(&pos) != Some(&page.digest) {
-                    self.dirty.insert(pos);
+                    self.dirty.insert(column_priority(pos, self.center));
                 }
             } else if current == Stamp::Missing && self.observed.get(&pos) != Some(&current) {
                 self.observed.insert(pos, current);
@@ -853,14 +893,14 @@ impl VisualSession {
             if self.observed.get(&pos) != Some(&current)
                 || self.cache.get(&pos).is_some_and(|p| p.verify_source)
             {
-                self.candidates.insert((distance(pos, self.center), pos));
+                self.candidates.insert(column_priority(pos, self.center));
             }
         }
         if !self.busy {
             let mut items = Vec::new();
             let mut resident_bytes = 0u64;
             let mut inspected = 0;
-            while let Some(candidate @ (_, pos)) = self.candidates.pop_first() {
+            while let Some(candidate @ (.., pos)) = self.candidates.pop_first() {
                 if items.len() >= self.limits.pages_per_poll || inspected >= scan {
                     self.candidates.insert(candidate);
                     break;
@@ -918,6 +958,7 @@ impl VisualSession {
                     .expect("live visual worker")
                     .try_send(Job {
                         generation: self.generation,
+                        refresh: self.refresh,
                         items,
                     })
                     .map_err(|_| {
@@ -945,7 +986,7 @@ impl VisualSession {
                 .map(|(p, c)| (*p, c.digest))
                 .collect();
             for (pos, _) in &retained {
-                self.dirty.remove(pos);
+                self.dirty.remove(&column_priority(*pos, self.center));
             }
             let reset = TerrainReset {
                 sections: self.desired.sections.iter().copied().collect(),
@@ -966,7 +1007,7 @@ impl VisualSession {
         let reset = None;
         let mut pages = Vec::new();
         let mut bytes = 0u64;
-        for pos in self
+        for key @ (.., pos) in self
             .dirty
             .iter()
             .copied()
@@ -974,17 +1015,17 @@ impl VisualSession {
             .collect::<Vec<_>>()
         {
             if !self.desired.sections.contains(&pos) {
-                self.dirty.remove(&pos);
+                self.dirty.remove(&key);
                 continue;
             }
             let Some(cached) = self.cache.get(&pos) else {
-                self.dirty.remove(&pos);
+                self.dirty.remove(&key);
                 continue;
             };
             // A bounded metadata scan may not have reached this dirty page yet.
             // Recheck immediately before delivery so no stale terrain escapes.
             if cached.stamp != stamp(host, pos) {
-                self.candidates.insert((distance(pos, self.center), pos));
+                self.candidates.insert(key);
                 continue;
             }
             let cost = terrain_bytes(&cached.page);
@@ -1001,6 +1042,7 @@ impl VisualSession {
                 terrain: cached.page.clone(),
             });
         }
+        pages.sort_unstable_by_key(|p| p.terrain.sections[0].pos);
         if reset.is_none() && pages.is_empty() && self.unavailable.is_empty() {
             return Ok(None);
         }
@@ -1061,7 +1103,7 @@ impl VisualSession {
         for page in &update.pages {
             let pos = page.terrain.sections[0].pos;
             self.sent.insert(pos, page.digest);
-            self.dirty.remove(&pos);
+            self.dirty.remove(&column_priority(pos, self.center));
         }
         for (pos, _) in &update.unavailable {
             self.unavailable.remove(pos);

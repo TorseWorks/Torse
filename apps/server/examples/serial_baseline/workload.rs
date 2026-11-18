@@ -128,6 +128,7 @@ pub fn state_bytes(host: &ExecutionHost) -> Result<Vec<u8>, Fault> {
         },
         state: torse_sim::durable::ExecutionSnapshot {
             parked: Default::default(),
+            parking_reservation: None,
             world: snapshot(host),
             runtime: host.runtime().clone(),
         },

@@ -278,6 +278,46 @@ fn pending_output_and_superseded_reads_converge_to_only_the_latest_window() {
 }
 
 #[test]
+fn overlapping_window_reuses_only_current_source_reads() {
+    let dir = Directory::new();
+    let (mut server, pages, expected) = create(&dir);
+    let (mut hub, id, mut client, _, _) = connect(&mut server, scope(0, 1));
+    let mut display = mirror(&server);
+    let previous = scope(2, 3);
+    let current = scope(3, 2);
+    let replaced = SectionPos::new(4, 0, 0);
+    let mut budget = limits();
+    budget.pages_per_poll = 3;
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages.clone(),
+        approval(),
+        previous,
+        SectionPos::new(2, 0, 0),
+        budget,
+    )
+    .unwrap();
+    hub.poll(&mut server).unwrap();
+    assert!(hub.visual_terrain_diagnostics(id).unwrap().io_pending);
+    hub.set_visual_interest(id, current.clone(), SectionPos::new(3, 0, 0))
+        .unwrap();
+    server.reload_section(&pages, replaced, &mut hub).unwrap();
+    fill(&mut hub, &mut server, &mut client, &mut display);
+    assert_eq!(
+        hub.visual_terrain_diagnostics(id)
+            .unwrap()
+            .reused_read_pages,
+        1
+    );
+    assert_eq!(display.desired(), &current.sections);
+    assert!(display.page(SectionPos::new(2, 0, 0)).is_none());
+    for pos in current.sections {
+        assert_eq!(display.page(pos), expected.get(&pos));
+    }
+}
+
+#[test]
 fn display_approval_cannot_grant_interaction_and_principal_change_purges_output() {
     use torse_sim::{
         action::ActionTarget,

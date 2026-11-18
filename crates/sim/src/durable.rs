@@ -277,6 +277,20 @@ pub struct ExecutionSnapshot {
     pub world: Snapshot,
     pub runtime: RuntimeState,
     pub parked: std::collections::BTreeMap<torse_types::SectionPos, ParkedSection>,
+    /// In-flight range needed only to replay a publication after this snapshot.
+    pub parking_reservation: Option<ParkingReservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParkingReservation {
+    pub first: u128,
+    pub end: u128,
+}
+
+impl ParkingReservation {
+    pub fn valid(self) -> bool {
+        self.first != 0 && (1..=1_000_000).contains(&self.end.saturating_sub(self.first))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -316,6 +330,8 @@ pub struct ExecutionChanges {
 pub enum RuntimeUpdate {
     Full(RuntimeState),
     Progress(RuntimeProgress),
+    ReserveParking(ParkingReservation),
+    PublishParking(ParkingReservation),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -330,6 +346,7 @@ impl RuntimeUpdate {
     pub fn resolve(&self, before: &RuntimeState) -> Result<RuntimeState, Fault> {
         match self {
             Self::Full(state) => Ok(state.clone()),
+            Self::ReserveParking(_) | Self::PublishParking(_) => Ok(before.clone()),
             Self::Progress(progress) => {
                 let work = before
                     .work

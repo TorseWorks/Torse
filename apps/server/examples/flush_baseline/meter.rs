@@ -141,6 +141,7 @@ impl CommitJournal<ExecutionModel> for Observed {
                 RuntimeUpdate::Full(state) if state.work.is_some() => c.freezes += 1,
                 RuntimeUpdate::Full(_) => c.advances += 1,
                 RuntimeUpdate::Progress(_) => c.tasks += 1,
+                RuntimeUpdate::ReserveParking(_) | RuntimeUpdate::PublishParking(_) => {}
             });
         }
         result

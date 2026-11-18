@@ -136,6 +136,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     meta,
                     state: ExecutionSnapshot {
                         parked: Default::default(),
+                        parking_reservation: None,
                         world: host.world().capture_snapshot(meta)?,
                         runtime: host.runtime().clone(),
                     },

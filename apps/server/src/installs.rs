@@ -55,7 +55,10 @@ impl TrustedSectionInstalls {
     }
 }
 
-fn remap(value: &mut SnapshotValue, ids: &BTreeMap<EntityId, EntityId>) -> Result<(), Fault> {
+pub(super) fn remap(
+    value: &mut SnapshotValue,
+    ids: &BTreeMap<EntityId, EntityId>,
+) -> Result<(), Fault> {
     remap_at(value, ids, 0)
 }
 
