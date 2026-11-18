@@ -478,3 +478,11 @@ do not establish stable observer overhead or any speedup. CPU time was not separ
 宿主可用`LightOpticsTable::new`创建只读光学表，再通过`NetworkHub::enable_shared_lighting_with_optics`装配。表身份由版本、内容注册表身份和按状态排列的光学系数共同确定。自定义客户端需在首个显示更新前用`TerrainMirror::set_light_optics`配置本地预期身份。内置表默认使用绑定的权威规则摘要，光照页同时携带规则版本和表身份。
 
 `shared_light_resources`另报输入峰值、输入范围页数、已准入消费关联数、累计未准入目标数、I/O在途数量及固定预留。
+
+An ordinary `replace_policy` cannot transfer display approval to a different
+principal. On an idle connection, an explicit `reset_policy` retires that approval
+and the consumer's shared-light interest. It sends an empty terrain reset before
+the complete `Seed`. The host must call `enable_visual_interest` with a fresh
+approval for the replacement principal; its generation follows the revocation
+monotonically. Pending output still closes the connection, and authenticated user
+identity remains fixed. A same-principal baseline reset keeps its display approval.

@@ -641,3 +641,174 @@ fn a_near_edit_survives_leaving_saving_and_revisiting_the_display_window() {
     assert_eq!(display.page(pos).unwrap().sections, near.state().sections);
     assert_eq!(server.authority().unwrap().world().store().len(), 2);
 }
+
+#[test]
+fn explicit_principal_reset_retires_display_until_fresh_approval() {
+    let dir = Directory::new();
+    let (mut server, pages, _) = create(&dir);
+    let (mut hub, id, mut client, _, _) = connect(&mut server, scope(0, 1));
+    hub.enable_shared_lighting(
+        &server,
+        pages.clone(),
+        torse_server::lighting::HostLightLimits {
+            input_sections: 1024,
+            input_bytes: 64 * 1024 * 1024,
+            pages_per_poll: 2,
+            field: torse_world_services::lighting::LightFieldLimits {
+                sections: 8,
+                cache_bytes: 8 * 1024 * 1024,
+                solver_cache_bytes: 8 * 1024 * 1024,
+                consumers: 4,
+                interests: 32,
+                job: torse_world_services::lighting::LightLimits {
+                    cells: 1_000_000,
+                    dependencies: 512,
+                    frontier: 1_000_000,
+                    bytes: 64 * 1024 * 1024,
+                },
+            },
+        },
+        1000,
+    )
+    .unwrap();
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages.clone(),
+        approval(),
+        scope(2, 2),
+        SectionPos::ZERO,
+        limits(),
+    )
+    .unwrap();
+    assert!(hub.shared_light_resources().unwrap().admitted_links > 0);
+    let mut display = mirror(&server);
+    fill(&mut hub, &mut server, &mut client, &mut display);
+    let before = hub.visual_terrain_diagnostics(id).unwrap().generation;
+    hub.reset_policy(
+        &mut server,
+        id,
+        PeerPolicy {
+            actor: torse_sim::action::ActorContext::new(torse_server::bootstrap::key(
+                "test:replacement",
+            )),
+            scope: scope(0, 1),
+        },
+    )
+    .unwrap();
+    assert!(hub.contains(id));
+    assert_eq!(
+        hub.actor_principal(id),
+        Some(&torse_server::bootstrap::key("test:replacement"))
+    );
+    assert!(hub.visual_terrain_diagnostics(id).is_none());
+    assert_eq!(hub.shared_light_resources().unwrap().admitted_links, 0);
+    let (messages, _) = drain(&mut client);
+    assert_eq!(messages.len(), 2);
+    let ServerMessage::Terrain(revoked) = &messages[0] else {
+        panic!("display revocation must precede the baseline");
+    };
+    assert!(revoked.generation > before);
+    assert!(revoked.reset.as_ref().unwrap().sections.is_empty());
+    let retired = revoked.generation;
+    display.apply(revoked.clone()).unwrap();
+    assert!(display.desired().is_empty());
+    assert_eq!(display.pages().count(), 0);
+    assert!(matches!(messages[1], ServerMessage::Seed(_)));
+    hub.poll(&mut server).unwrap();
+    assert!(
+        !drain(&mut client)
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMessage::Terrain(_) | ServerMessage::Light(_)))
+    );
+    assert!(
+        hub.set_visual_interest(id, scope(3, 1), SectionPos::ZERO)
+            .is_err()
+    );
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages,
+        approval(),
+        scope(3, 2),
+        SectionPos::ZERO,
+        limits(),
+    )
+    .unwrap();
+    assert!(hub.visual_terrain_diagnostics(id).unwrap().generation > retired);
+    fill(&mut hub, &mut server, &mut client, &mut display);
+    assert_eq!(display.pages().count(), 2);
+    assert!(display.page(SectionPos::new(3, 0, 0)).is_some());
+    assert!(display.apply(revoked.clone()).is_err());
+    assert_eq!(display.pages().count(), 2);
+}
+
+#[test]
+fn explicit_principal_reset_closes_and_purges_pending_display_output() {
+    let dir = Directory::new();
+    let (mut server, pages, _) = create(&dir);
+    let (mut hub, id, mut client, _, _) = connect(&mut server, scope(0, 1));
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages,
+        approval(),
+        scope(2, 1),
+        SectionPos::ZERO,
+        limits(),
+    )
+    .unwrap();
+    hub.poll(&mut server).unwrap();
+    let error = hub
+        .reset_policy(
+            &mut server,
+            id,
+            PeerPolicy {
+                actor: torse_sim::action::ActorContext::new(torse_server::bootstrap::key(
+                    "test:replacement",
+                )),
+                scope: scope(0, 1),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code, FaultCode::ResetRequired);
+    assert!(!hub.contains(id));
+    assert!(client.receive().is_err());
+}
+
+#[test]
+fn same_principal_baseline_reset_keeps_its_display_approval() {
+    let dir = Directory::new();
+    let (mut server, pages, _) = create(&dir);
+    let (mut hub, id, mut client, _, _) = connect(&mut server, scope(0, 1));
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages,
+        approval(),
+        scope(2, 1),
+        SectionPos::ZERO,
+        limits(),
+    )
+    .unwrap();
+    let mut display = mirror(&server);
+    fill(&mut hub, &mut server, &mut client, &mut display);
+    let before = hub.visual_terrain_diagnostics(id).unwrap();
+    hub.reset_policy(
+        &mut server,
+        id,
+        PeerPolicy {
+            actor: actor(),
+            scope: scope(0, 1),
+        },
+    )
+    .unwrap();
+    let (messages, _) = drain(&mut client);
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(messages[0], ServerMessage::Seed(_)));
+    let after = hub.visual_terrain_diagnostics(id).unwrap();
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.cache_pages, before.cache_pages);
+    assert_eq!(display.pages().count(), 1);
+}
