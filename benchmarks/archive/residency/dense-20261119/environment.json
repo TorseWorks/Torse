@@ -1,0 +1,21 @@
+{
+  "date": "2026-11-19",
+  "source": "a9071182b322c90c1d4241ff1ea55d21e3282339",
+  "cpu": "Intel Core i9-14900HX",
+  "os": "Windows 11 Pro 10.0.26200",
+  "physical_memory_bytes": 33959641088,
+  "journal_disk": "NVMe WD PC SN560 SDDPNQE-1T00-1102",
+  "filesystem": "NTFS",
+  "power_plan": "Balanced",
+  "rust": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "build": "Release; CARGO_PROFILE_RELEASE_DEBUG=0; CARGO_INCREMENTAL=0",
+  "command": "cargo build --locked --release -p torse-server --example dense_install_baseline",
+  "order": "one pilot mixed process; fixed final series of eight mixed processes followed by one uniform process; no concurrent builds or tests requested",
+  "fixture": "seed 8327473519530246828; 24 pages per column, 16 dense in mixed mode, three entities; 25 initial columns; 200 paced 50ms ticks at virtual 10.9 cells/s; 30 measured column installs per process",
+  "assertions": "one append, one sync and one flush request per measured column; exact authorized replica and reopened world/allocator per successful process",
+  "metrics": "monotonic wall clocks, including scheduling; durability wait includes append and sync; journal sync measures blocking call and scheduling, not device-only time; publication_ns is commit remainder excluding encoding and durable wait",
+  "scope": "current-source observation, not a controlled comparison or original external host workload; no Socket traffic, external gameplay workload, device trace, scheduler trace, process RSS or power-loss test",
+  "samples": "240 final mixed, 30 final uniform, all retained; pilot 30 mixed retained separately and excluded from final aggregate",
+  "quantiles": "nearest rank ceil(p*n)-1; nanoseconds in CSV/JSON; no outlier removal",
+  "baseline": "no paired old-source executable was run; historical reports are context only, not a measured speedup"
+}
