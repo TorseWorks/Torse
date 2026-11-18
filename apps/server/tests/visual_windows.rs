@@ -566,3 +566,249 @@ fn full_height_display_route_measurement() {
         );
     }
 }
+
+#[test]
+#[ignore = "release control/display scheduling comparison"]
+fn separate_display_control_route_measurement() {
+    use torse_server::lighting::{HostLightLimits, HostLightWorkBudget};
+    use torse_world_services::lighting::{LightFieldLimits, LightLimits};
+    println!(
+        "mode,sample,center,control_calls,control_total_ms,control_max_ms,move_ms,display_ms,first_near_ms,received_pages,host_cache_bytes,light_input_bytes,light_pending,slow_connected"
+    );
+    for split in [false, true] {
+        let dir = Directory::new();
+        let (mut server, pages) = create(&dir);
+        let approval = VisualTerrainApproval::rectangular(
+            SectionPos::new(-16, -4, -12),
+            SectionPos::new(16, 19, 12),
+        )
+        .unwrap();
+        let stone = server
+            .authority()
+            .unwrap()
+            .world()
+            .registry()
+            .default_state(&base::key("base:stone"))
+            .unwrap();
+        let input: Vec<_> = (-8..=8)
+            .flat_map(|x| (-4..=19).map(move |y| SectionPos::new(x, y, 0)))
+            .filter(|p| {
+                server
+                    .authority()
+                    .unwrap()
+                    .world()
+                    .store()
+                    .phase(*p)
+                    .is_none()
+            })
+            .map(|pos| {
+                let mut page =
+                    fixture::streaming::generated(server.authority().unwrap().world(), pos);
+                page.sections[0].cells = SnapshotCells::Dense(
+                    (0..4096)
+                        .map(|i| {
+                            if (i + pos.x.unsigned_abs() as usize) % 7 < 3 {
+                                stone
+                            } else {
+                                torse_world::BlockStateId::EMPTY
+                            }
+                        })
+                        .collect(),
+                );
+                page.states = vec![StateEntry {
+                    id: stone,
+                    block: base::key("base:stone"),
+                    values: vec![],
+                }];
+                page
+            })
+            .collect();
+        server
+            .begin_generated_parking(
+                pages.clone(),
+                input,
+                SectionInstallLimits {
+                    max_pages: 512,
+                    max_bytes: 64 * 1024 * 1024,
+                },
+            )
+            .unwrap();
+        let prepared = Instant::now();
+        while !matches!(
+            server.poll_generated_parking(&mut NoReplicas).unwrap(),
+            ParkingProgress::Finished { .. }
+        ) {
+            assert!(prepared.elapsed() < Duration::from_secs(30));
+            std::thread::yield_now();
+        }
+        let mut hub = NetworkHub::<MemoryTransport>::new(server.binding(), network()).unwrap();
+        hub.enable_shared_lighting(
+            &server,
+            pages.clone(),
+            HostLightLimits {
+                input_sections: 2048,
+                input_bytes: 32 * 1024 * 1024,
+                pages_per_poll: 4,
+                field: LightFieldLimits {
+                    sections: 64,
+                    cache_bytes: 8 * 1024 * 1024,
+                    solver_cache_bytes: 32 * 1024 * 1024,
+                    consumers: 4,
+                    interests: 256,
+                    job: LightLimits {
+                        cells: 1_000_000,
+                        dependencies: 2048,
+                        frontier: 1_000_000,
+                        bytes: 32 * 1024 * 1024,
+                    },
+                },
+            },
+            20_000,
+        )
+        .unwrap();
+        let near = ReplicaScope {
+            sections: [SectionPos::ZERO].into(),
+        };
+        let (id, mut client, _, _) = fixture::interest::attach(&mut hub, &mut server, near.clone());
+        let (slow, _stalled, _, _) = fixture::interest::attach(&mut hub, &mut server, near);
+        let mut config = limits();
+        config.pages_per_poll = 4;
+        config.cache_bytes = 16 * 1024 * 1024;
+        for peer in [id, slow] {
+            hub.enable_visual_interest(
+                &server,
+                peer,
+                pages.clone(),
+                approval.clone(),
+                desired(&approval, 0, 12),
+                SectionPos::ZERO,
+                config,
+            )
+            .unwrap();
+        }
+        let mut mirror = TerrainMirror::new(
+            server.binding(),
+            16,
+            server.authority().unwrap().world().store().bounds(),
+            TerrainLimits {
+                max_sections: 15000,
+                max_bytes: 32 * 1024 * 1024,
+                metadata_bytes: 16 * 1024 * 1024,
+            },
+            None,
+        )
+        .unwrap();
+        for (sample, center) in [0, 1, 2, 1, 0].into_iter().enumerate() {
+            let move_start = Instant::now();
+            if split {
+                hub.set_visual_interest_deferred(
+                    id,
+                    desired(&approval, center, 12),
+                    SectionPos::new(center, 0, 0),
+                )
+                .unwrap();
+            } else {
+                hub.set_visual_interest(
+                    id,
+                    desired(&approval, center, 12),
+                    SectionPos::new(center, 0, 0),
+                )
+                .unwrap();
+            }
+            let move_time = move_start.elapsed();
+            let mut control_total = Duration::ZERO;
+            let mut control_max = Duration::ZERO;
+            let mut display_time = Duration::ZERO;
+            let mut first_near = None;
+            let mut received = 0;
+            for _ in 0..24 {
+                for _ in 0..17 {
+                    fixture::interest::send(&mut client, ClientMessage::Ping);
+                    let start = Instant::now();
+                    if split {
+                        hub.poll_control(&mut server).unwrap();
+                    } else {
+                        hub.poll(&mut server).unwrap();
+                    }
+                    let elapsed = start.elapsed();
+                    control_total += elapsed;
+                    control_max = control_max.max(elapsed);
+                    for msg in drain(&mut client) {
+                        match msg {
+                            ServerMessage::Terrain(update) => {
+                                if update.pages.iter().any(|page| {
+                                    page.terrain.sections[0].pos.x.abs_diff(center) <= 1
+                                }) {
+                                    first_near.get_or_insert(move_start.elapsed());
+                                }
+                                received += update.pages.len();
+                                mirror.apply(update).unwrap();
+                            }
+                            ServerMessage::Light(update) => {
+                                mirror.apply_light(update).unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if split {
+                    let start = Instant::now();
+                    hub.poll_display(
+                        &server,
+                        DisplayWorkBudget {
+                            sessions: 2,
+                            light_admissions: 1,
+                            metadata_checks_per_session: 256,
+                            light_checks_per_session: 32,
+                            lighting: HostLightWorkBudget {
+                                input_checks: 256,
+                                validation_checks: 16,
+                                readiness_checks: 32,
+                                solver_work: 340_000,
+                            },
+                        },
+                    )
+                    .unwrap();
+                    display_time += start.elapsed();
+                    for msg in drain(&mut client) {
+                        match msg {
+                            ServerMessage::Terrain(update) => {
+                                if update.pages.iter().any(|page| {
+                                    page.terrain.sections[0].pos.x.abs_diff(center) <= 1
+                                }) {
+                                    first_near.get_or_insert(move_start.elapsed());
+                                }
+                                received += update.pages.len();
+                                mirror.apply(update).unwrap();
+                            }
+                            ServerMessage::Light(update) => {
+                                mirror.apply_light(update).unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                server.drive_tick(&mut hub, 1024).unwrap();
+            }
+            assert!(hub.contains(id));
+            let visual = hub.visual_terrain_diagnostics(id).unwrap();
+            let light = hub.shared_light_resources().unwrap();
+            println!(
+                "{},{sample},{center},408,{:.6},{:.6},{:.6},{:.6},{},{received},{},{},{},{}",
+                if split { "split" } else { "combined" },
+                control_total.as_secs_f64() * 1000.,
+                control_max.as_secs_f64() * 1000.,
+                move_time.as_secs_f64() * 1000.,
+                display_time.as_secs_f64() * 1000.,
+                first_near.map_or("unobserved".into(), |t| format!(
+                    "{:.6}",
+                    t.as_secs_f64() * 1000.
+                )),
+                visual.cache_bytes,
+                light.input_bytes,
+                light.field.pending,
+                hub.contains(slow)
+            );
+        }
+    }
+}

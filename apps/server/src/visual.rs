@@ -42,6 +42,7 @@ pub struct VisualTerrainDiagnostics {
     pub reused_read_pages: u64,
     pub metadata_scanned: usize,
     pub pending_candidates: usize,
+    pub light_scanned: usize,
 }
 impl VisualTerrainLimits {
     fn validate(self, pages: &SectionPages) -> Result<u64, Fault> {
@@ -288,12 +289,17 @@ pub(crate) struct VisualSession {
     order: Vec<SectionPos>,
     scan_cursor: usize,
     last_scan: usize,
+    light_cursor: usize,
+    last_light_scan: usize,
     candidates: BTreeSet<ColumnPriority>,
     _memory: Option<MemoryLease>,
 }
 impl VisualSession {
     pub(crate) fn desired_positions(&self) -> Vec<SectionPos> {
         self.desired.sections.iter().copied().collect()
+    }
+    pub(crate) fn center(&self) -> SectionPos {
+        self.center
     }
     pub(crate) fn check_request(&self, desired: &ReplicaScope) -> Result<(), Fault> {
         self.approved
@@ -357,6 +363,7 @@ impl VisualSession {
             .map(|&(.., pos)| column_priority(pos, self.center))
             .collect();
         self.scan_cursor = 0;
+        self.light_cursor = 0;
     }
     fn light_page(
         &self,
@@ -419,13 +426,21 @@ impl VisualSession {
         host: &ExecutionHost,
         budget: OutputBudget,
         codec: torse_codec::CodecLimits,
+        checks: usize,
     ) -> Result<Option<TerrainLightUpdate>, Fault> {
+        self.last_light_scan = 0;
         if self.reset {
             return Ok(None);
         }
         let mut pages = Vec::new();
         let mut bytes = 0u64;
-        for &pos in &self.desired.sections {
+        for _ in 0..checks.min(self.order.len()) {
+            if pages.len() == self.limits.pages_per_poll {
+                break;
+            }
+            let pos = self.order[self.light_cursor];
+            self.light_cursor = (self.light_cursor + 1) % self.order.len();
+            self.last_light_scan += 1;
             let Some(cached) = self.cache.get(&pos) else {
                 continue;
             };
@@ -648,6 +663,8 @@ impl VisualSession {
             order: Vec::new(),
             scan_cursor: 0,
             last_scan: 0,
+            light_cursor: 0,
+            last_light_scan: 0,
             candidates: BTreeSet::new(),
             _memory: memory,
         };
@@ -720,6 +737,7 @@ impl VisualSession {
             reused_read_pages: self.reused_read_pages,
             metadata_scanned: self.last_scan,
             pending_candidates: self.candidates.len(),
+            light_scanned: self.last_light_scan,
         }
     }
     pub(crate) fn poll(
@@ -727,6 +745,19 @@ impl VisualSession {
         host: &ExecutionHost,
         can_send: bool,
     ) -> Result<Option<TerrainUpdate<ReplicaSnapshot>>, Fault> {
+        self.poll_with_budget(host, can_send, usize::MAX)
+    }
+    pub(crate) fn poll_with_budget(
+        &mut self,
+        host: &ExecutionHost,
+        can_send: bool,
+        metadata_checks: usize,
+    ) -> Result<Option<TerrainUpdate<ReplicaSnapshot>>, Fault> {
+        self.last_scan = 0;
+        self.last_light_scan = 0;
+        if metadata_checks == 0 {
+            return Ok(None);
+        }
         if host.binding() != self.binding {
             return Err(Fault::new(
                 FaultCode::ResetRequired,
@@ -859,8 +890,13 @@ impl VisualSession {
         }
         // Metadata inspection has a separate bounded slice. The priority order
         // is rebuilt only when interest/center changes, never for every batch.
-        let scan = self.order.len().min(self.limits.pages_per_poll * 64);
+        let scan = self
+            .order
+            .len()
+            .min(self.limits.pages_per_poll * 64)
+            .min(metadata_checks);
         self.last_scan = scan;
+        let mut reset_retained = Vec::new();
         for _ in 0..scan {
             let pos = self.order[self.scan_cursor];
             self.scan_cursor = (self.scan_cursor + 1) % self.order.len();
@@ -885,6 +921,8 @@ impl VisualSession {
                 page.touched = self.clock;
                 if self.sent.get(&pos) != Some(&page.digest) {
                     self.dirty.insert(column_priority(pos, self.center));
+                } else if self.reset && page.stamp == current {
+                    reset_retained.push((pos, page.digest));
                 }
             } else if current == Stamp::Missing && self.observed.get(&pos) != Some(&current) {
                 self.observed.insert(pos, current);
@@ -975,16 +1013,20 @@ impl VisualSession {
         }
         let through = host.cursor();
         if self.reset {
-            let retained: Vec<_> = self
-                .cache
-                .iter()
-                .filter(|(p, c)| {
-                    self.desired.sections.contains(p)
-                        && c.stamp == stamp(host, **p)
-                        && self.sent.get(p) == Some(&c.digest)
-                })
-                .map(|(p, c)| (*p, c.digest))
-                .collect();
+            let retained: Vec<_> = if metadata_checks == usize::MAX {
+                self.cache
+                    .iter()
+                    .filter(|(p, c)| {
+                        self.desired.sections.contains(p)
+                            && c.stamp == stamp(host, **p)
+                            && self.sent.get(p) == Some(&c.digest)
+                    })
+                    .map(|(p, c)| (*p, c.digest))
+                    .collect()
+            } else {
+                reset_retained.sort_unstable_by_key(|(pos, _)| *pos);
+                reset_retained
+            };
             for (pos, _) in &retained {
                 self.dirty.remove(&column_priority(*pos, self.center));
             }
