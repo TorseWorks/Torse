@@ -282,6 +282,36 @@ impl MemoryLedger {
         self.budget
     }
 
+    /// Atomically replace the ceilings without revoking charges or waiting demands.
+    ///
+    /// A ceiling below live usage, the retained entry count, or an individual
+    /// retained demand is refused. Release residents or forget unwanted demands
+    /// before retrying. Success preserves every handle and does not retry demands.
+    pub fn set_budget(&mut self, budget: MemoryBudget) -> Result<(), Fault> {
+        if self.total_usage() > budget.total_bytes() {
+            return Err(Fault::resource_limit(
+                "new memory total is below live usage",
+            ));
+        }
+        for class in MemoryClass::ALL {
+            if self.usage(class) > budget.class_limit(class) {
+                return Err(class_limit_fault(class));
+            }
+        }
+        if self.retained.len() > budget.retained_limit()
+            || self.retained.iter().any(|item| {
+                item.resident.bytes > budget.total_bytes()
+                    || item.resident.bytes > budget.class_limit(item.resident.class)
+            })
+        {
+            return Err(Fault::resource_limit(
+                "new memory budget cannot retain waiting demands",
+            ));
+        }
+        self.budget = budget;
+        Ok(())
+    }
+
     /// Bytes currently charged to `class`.
     pub const fn usage(&self, class: MemoryClass) -> u64 {
         self.used[class.index()]

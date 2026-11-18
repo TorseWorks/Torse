@@ -1,14 +1,17 @@
 //! Shared logical memory reservations with ownership-bound release.
+use crate::memory_policy::MemoryController;
 use crate::{
     EvictionPlan, EvictionRank, Fault, MemoryBudget, MemoryChargeId, MemoryClass, MemoryLedger,
-    MemoryResident,
+    MemoryPolicy, MemoryPressure, MemoryResident,
 };
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 struct Account {
     ledger: MemoryLedger,
     peak: [u64; MemoryClass::COUNT],
     total_peak: u64,
+    controller: MemoryController,
 }
 impl Account {
     fn sample(&mut self) {
@@ -35,12 +38,32 @@ pub struct MemoryUsage {
     pub total: u64,
     pub total_peak: u64,
 }
+/// One coherent snapshot of shared limits, target and lifetime peaks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryStatus {
+    pub budget: MemoryBudget,
+    pub policy: MemoryPolicy,
+    pub target_bytes: u64,
+    pub usage: MemoryUsage,
+}
+impl MemoryStatus {
+    /// Bytes above the advisory target. Pinned residents may prevent reclamation.
+    pub fn reclaim_bytes(self) -> u64 {
+        self.usage.total.saturating_sub(self.target_bytes)
+    }
+}
 impl MemoryPool {
     pub fn new(budget: MemoryBudget) -> Self {
         Self(Arc::new(Mutex::new(Account {
             ledger: MemoryLedger::new(budget),
             peak: [0; MemoryClass::COUNT],
             total_peak: 0,
+            controller: MemoryController::new(
+                MemoryPolicy::Fixed {
+                    target_bytes: budget.total_bytes(),
+                },
+                budget.total_bytes(),
+            ),
         })))
     }
     fn account(&self) -> MutexGuard<'_, Account> {
@@ -52,13 +75,58 @@ impl MemoryPool {
         self.account().ledger.budget()
     }
     pub fn usage(&self) -> MemoryUsage {
+        self.status().usage
+    }
+    pub fn status(&self) -> MemoryStatus {
         let account = self.account();
-        MemoryUsage {
-            current: MemoryClass::ALL.map(|class| account.ledger.usage(class)),
-            peak: account.peak,
-            total: account.ledger.total_usage(),
-            total_peak: account.total_peak,
+        MemoryStatus {
+            budget: account.ledger.budget(),
+            policy: account.controller.policy,
+            target_bytes: account.controller.target,
+            usage: MemoryUsage {
+                current: MemoryClass::ALL.map(|class| account.ledger.usage(class)),
+                peak: account.peak,
+                total: account.ledger.total_usage(),
+                total_peak: account.total_peak,
+            },
         }
+    }
+    /// Atomically change hard limits across all clones. Live leases stay valid.
+    /// Refuses limits below live usage, retained demands, or the policy range.
+    /// Lower the policy first, reclaim through owners, then retry a hard shrink.
+    /// Growth leaves the target and historical peaks unchanged; select a higher
+    /// fixed target or adaptive range separately when more cache is desired.
+    pub fn set_budget(&self, budget: MemoryBudget) -> Result<(), Fault> {
+        let mut account = self.account();
+        account.controller.policy.validate(budget.total_bytes())?;
+        account.ledger.set_budget(budget)
+    }
+    /// Change the advisory target policy without altering hard limits or leases.
+    /// Adaptive mode starts at the previous target clamped into its new range.
+    /// Replacing a policy resets its sample clock; use one host controller.
+    pub fn set_policy(&self, policy: MemoryPolicy) -> Result<(), Fault> {
+        let mut account = self.account();
+        policy.validate(account.ledger.budget().total_bytes())?;
+        account.controller = MemoryController::new(policy, account.controller.target);
+        Ok(())
+    }
+    /// Apply a host sample using monotonic elapsed time from one host origin.
+    /// This changes only the target; it never frees residents or expands hard caps.
+    /// Duplicate/backward timestamps are rejected without any state changes.
+    pub fn observe_pressure(&self, now: Duration, pressure: MemoryPressure) -> Result<(), Fault> {
+        let mut account = self.account();
+        let usage = account.ledger.total_usage();
+        account.controller.observe(now, usage, pressure)
+    }
+    /// Advisory plan at the current target. Only owners may drop the selected data.
+    /// The plan may become stale before use; it does not reserve reclaimed space.
+    pub fn reclaim_plan(&self) -> EvictionPlan {
+        let account = self.account();
+        let needed = account
+            .ledger
+            .total_usage()
+            .saturating_sub(account.controller.target);
+        account.ledger.eviction_plan(needed)
     }
     /// Reserve before constructing owned input or buffers. Zero creates an empty lease.
     pub fn reserve(

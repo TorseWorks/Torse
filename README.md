@@ -24,7 +24,7 @@ Torse目前处于早期开发阶段，已有可运行的图形客户端、独立
 | 持久化 | 日志、检查点、实体生命周期恢复、持久任务与定时事件、请求结果与去重 | [世界恢复](benchmarks/archive/persistence/M3-local-world.md)、[执行与网络](benchmarks/archive/network/B6-B7-execution-network.md) |
 | 联机 | 双向TLS与用户授权、TCP连接、授权复制、多人编辑、越界拒绝、撤权与重连 | [用户认证](benchmarks/archive/network/M5-user-authentication.md)、[授权验收](benchmarks/archive/network/A8-acceptance.md) |
 | Mod扩展 | Wasm包、类型化交互、嵌套状态、批量库存与实体生命周期，共同准备和提交 | [Mod动作](benchmarks/archive/mods/M4-mod-actions.md)、[Mod持久执行](benchmarks/archive/mods/M4-mod-durable.md) |
-| 内存预算 | 主程序共享世界、资源、复制、编解码、任务和缓存预留，支持背压、重试及生命周期释放 | [共享内存](benchmarks/archive/performance/M6-shared-memory.md) |
+| 内存预算 | 共享预留支持运行时原子扩缩容、固定或自适应软目标、背压及生命周期释放 | [共享内存](benchmarks/archive/performance/M6-shared-memory.md)、[运行时策略示例](crates/types/examples/memory_policy.rs) |
 
 联网移动已接入服务端固定Tick结算、持久运动状态与客户端预测校正。服务端可在批准范围内自动跟随玩家调整兴趣窗口，也可由宿主显式替换范围并重建订阅基线。物品模块已连接放置消耗、破坏回收与库存原子提交，回收产物直接进入背包，尚无地面掉落实体。当前图形机器面板使用示例数据，真实Mod机器面板仍待装配。默认服务端演示使用有限世界，不代表已经验证大规模世界或高并发性能。
 

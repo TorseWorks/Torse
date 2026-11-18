@@ -130,6 +130,72 @@ impl Drop for InputDrop {
 }
 
 #[test]
+fn runtime_budget_shrink_keeps_cancelled_work_charged_until_its_input_is_released() {
+    use torse_types::{MemoryBudget, MemoryPolicy};
+    let memory = MemoryPool::new(MemoryBudget::new(4096));
+    let executor = Executor::with_memory(config(2), memory.clone()).unwrap();
+    let baseline = memory.usage().total;
+    let probe = executor.try_reserve(budget()).unwrap();
+    let job_bytes = memory.usage().total - baseline;
+    drop(probe);
+    memory
+        .set_policy(MemoryPolicy::Fixed {
+            target_bytes: baseline,
+        })
+        .unwrap();
+    memory
+        .set_budget(MemoryBudget::new(baseline + 2 * job_bytes))
+        .unwrap();
+    let (started, observed) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let mut running =
+        executor
+            .try_reserve(budget())
+            .unwrap()
+            .submit(Priority::Background, move |_| {
+                started.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(JobOutput { value: 1, bytes: 8 })
+            });
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let input = InputDrop(dropped.clone());
+    let queued = executor
+        .try_reserve(budget())
+        .unwrap()
+        .submit(Priority::Background, move |_| {
+            drop(input);
+            panic!("cancelled queued callback must not run")
+        });
+    assert_eq!(memory.usage().total, baseline + 2 * job_bytes);
+    assert!(
+        memory
+            .set_budget(MemoryBudget::new(baseline + job_bytes))
+            .is_err()
+    );
+    drop(queued);
+    assert_eq!(dropped.load(Ordering::Acquire), 1);
+    memory
+        .set_budget(MemoryBudget::new(baseline + job_bytes))
+        .unwrap();
+    running.cancel();
+    assert!(memory.set_budget(MemoryBudget::new(baseline)).is_err());
+    assert!(matches!(
+        executor.try_reserve(budget()),
+        Err(ReserveError::Busy)
+    ));
+    assert_eq!(memory.usage().total, baseline + job_bytes);
+    release.send(()).unwrap();
+    assert_eq!(take(&mut running), Err(JobError::Cancelled));
+    drop(running);
+    wait(|| memory.usage().total == baseline);
+    memory.set_budget(MemoryBudget::new(baseline)).unwrap();
+    assert_eq!(memory.usage().total_peak, baseline + 2 * job_bytes);
+    drop(executor);
+    assert_eq!(memory.usage().total, 0);
+}
+
+#[test]
 fn queued_cancel_drops_input_and_running_cancel_keeps_its_lease_until_completion() {
     let pool = Executor::new(config(2)).unwrap();
     let (started, observed) = mpsc::channel();

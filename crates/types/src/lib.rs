@@ -19,8 +19,10 @@ pub use diagnostics::{
 };
 mod lifecycle;
 mod memory;
+mod memory_policy;
 mod memory_pool;
-pub use memory_pool::{MemoryLease, MemoryPool, MemoryUsage};
+pub use memory_policy::{AdaptiveMemoryPolicy, MemoryPolicy, MemoryPressure};
+pub use memory_pool::{MemoryLease, MemoryPool, MemoryStatus, MemoryUsage};
 mod replication;
 mod spatial;
 mod terrain;
