@@ -8,6 +8,8 @@ Measured [20261119] at `a9071182b322c90c1d4241ff1ea55d21e3282339` on Windows 11 
 
 Eight independent Release processes each initialized a 5-by-5 window of 600 sections, then ran 200 paced 50 ms ticks at a virtual 10.9 cells/s. Each process installed 30 columns of 24 pages, including 16 dense pages and three attached entities, while encoding/applying authorized replica updates and unloading the rear window. One final uniform process adds 30 contrast samples. No concurrent local builds or tests were requested during measurement.
 
+`host_total_ns` covers input construction and synchronous installation for one column. Initial filling, subsequent tick/replica processing, rear-window unloading and final recovery are outside that timer. `kernel_total_ns` covers the synchronous installation call only.
+
 Every measured column asserted one journal append, one journal sync and one flush request. Every process verified its authorized mirror against a fresh projection, then reopened the directory and checked the complete world snapshot and entity allocator. These checks passed for all nine final processes and the pilot. No durability settings, wire format, API or runtime code changed.
 
 An initial 30-column pilot preceded the fixed final series. Its raw rows remain in [pilot](pilot/samples.csv), outside the final aggregates. All 270 final samples, including all outliers, are retained. [Environment](environment.json), [per-process results](runs.json) and [full stage summaries](summary.json) accompany the CSV files.
