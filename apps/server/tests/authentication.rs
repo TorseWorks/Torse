@@ -19,6 +19,9 @@ struct Verified {
     security: TransportSecurity,
 }
 impl Transport for Verified {
+    fn output_idle(&self) -> bool {
+        self.inner.output_idle()
+    }
     fn security(&self) -> TransportSecurity {
         self.security
     }
@@ -370,4 +373,59 @@ fn each_user_subscription_is_checked_against_its_own_scope() {
             .section(near)
             .is_some()
     );
+}
+
+#[test]
+fn explicit_visual_reset_cannot_replace_the_authenticated_user() {
+    let dir = Directory::new();
+    let mut server = create(&dir);
+    let mut hub = hub(&server);
+    let (alice, mut client) = add(&mut hub, TransportSecurity::MutualTls(Digest([1; 32]))).unwrap();
+    hello(&mut client, &server);
+    send(
+        &mut client,
+        ClientMessage::Subscribe {
+            sections: base::scope().sections.iter().copied().collect(),
+        },
+    );
+    hub.poll(&mut server).unwrap();
+    receive(&mut client);
+    let pages = torse_server::section_pages::SectionPages::new(
+        &dir.0,
+        base::budget(),
+        base::codec_limits(),
+        100,
+    )
+    .unwrap();
+    hub.enable_visual_interest(
+        &server,
+        alice,
+        pages,
+        base::scope(),
+        base::scope(),
+        SectionPos::ZERO,
+        torse_server::visual::VisualTerrainLimits {
+            max_sections: 4,
+            cache_bytes: 256 * 1024,
+            io_bytes: base::budget().max_bytes * 4,
+            batch_bytes: 128 * 1024,
+            control_bytes: 64 * 1024,
+            pages_per_poll: 1,
+        },
+    )
+    .unwrap();
+    assert!(
+        hub.reset_policy(
+            &mut server,
+            alice,
+            PeerPolicy {
+                actor: grant("user:bob", 4, false).actor,
+                scope: base::scope()
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(hub.user(alice), Some(&base::key("user:alice")));
+    assert!(hub.contains(alice));
+    assert!(hub.visual_terrain_diagnostics(alice).is_some());
 }

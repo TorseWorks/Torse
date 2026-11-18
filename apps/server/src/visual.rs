@@ -241,6 +241,11 @@ fn resident(
     })
 }
 
+pub(crate) struct VisualStart {
+    pub center: SectionPos,
+    pub generation: u64,
+}
+
 pub(crate) struct VisualSession {
     binding: Binding,
     approved: VisualTerrainApproval,
@@ -477,7 +482,7 @@ impl VisualSession {
         pages: SectionPages,
         approved: VisualTerrainApproval,
         desired: ReplicaScope,
-        center: SectionPos,
+        start: VisualStart,
         limits: VisualTerrainLimits,
         network: crate::network::NetworkLimits,
     ) -> Result<Self, Fault> {
@@ -497,6 +502,7 @@ impl VisualSession {
             network.budget,
             network.codec,
         )?;
+        let VisualStart { center, generation } = start;
         let binding = host.binding();
         let side = host.world().store().side();
         let bounds = host.world().store().bounds();
@@ -600,7 +606,7 @@ impl VisualSession {
                 handle: Some(handle),
             },
             busy: false,
-            generation: 1,
+            generation,
             seq: 0,
             reset: true,
             cache: BTreeMap::new(),
