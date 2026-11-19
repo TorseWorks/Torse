@@ -2178,7 +2178,7 @@ fn session_grant_memory_is_reserved_on_use_and_failed_growth_retains_access() {
     );
     pool.set_budget(MemoryBudget::new(256 * 1024 * 1024))
         .unwrap();
-    let before_failed_projection = pool.usage().total;
+    let before_failed_projection = pool.usage();
     assert!(
         server
             .change_session_interest(
@@ -2190,16 +2190,23 @@ fn session_grant_memory_is_reserved_on_use_and_failed_growth_retains_access() {
             .is_err()
     );
     assert_eq!(
-        pool.usage().total,
-        before_failed_projection,
+        pool.usage().current[MemoryClass::Executor as usize],
+        before_failed_projection.current[MemoryClass::Executor as usize],
         "failed projection releases prepared grant growth"
     );
-    assert!(
+    // Projection encoding failures retain their existing explicit reset contract;
+    // they must not publish the replacement actor or leak its prepared memory.
+    assert_eq!(
         server
             .take_replica(old.subscription, base::budget())
-            .unwrap()
-            .is_empty()
+            .unwrap_err()
+            .code,
+        FaultCode::ResetRequired
     );
+    server.close_replica(old.subscription).unwrap();
+    server
+        .open_replica(SessionId(1), base::scope(), base::budget())
+        .unwrap();
     let queued = request(&server, 1, transfer());
     let id = queued.id;
     server.submit(queued);

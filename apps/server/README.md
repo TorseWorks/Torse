@@ -11,7 +11,7 @@ limits.replicas.max_sections = 1176;
 // 将limits传入ExecutionHost::new或恢复构造器。
 ```
 
-运行期间可在驱动调用之间使用`Server::set_actor_section_limit`；`ExecutionHost::actor_section_limit`读取当前值。设置0或调低到任一现存会话授权量以下会拒绝且不修改额度、授权或复制队列。需要撤权时先显式替换授权，不能通过调低额度隐式撤权。提高额度本身不预分配集合；附着`MemoryPool`时注册和范围替换按实际授权及范围的保守逻辑计费预留，增长失败不失效旧会话，缩减和断开释放租约。未附着内存池的宿主仍执行数量额度，但没有进程共享内存计费。
+运行期间可在驱动调用之间使用`Server::set_actor_section_limit`；`ExecutionHost::actor_section_limit`读取当前值。设置0或调低到任一现存会话授权量以下会拒绝且不修改额度、授权或复制队列。需要撤权时先显式替换授权，不能通过调低额度隐式撤权。提高额度本身不预分配集合；附着`MemoryPool`时注册和范围替换按实际授权及范围的保守逻辑计费预留，增长失败不失效旧会话，缩减和断开释放租约。未附着内存池的宿主仍执行数量额度，但没有进程共享内存计费。兴趣更新在投影编码阶段失败时仍按既有契约重置订阅，不发布新授权，并释放本次预留的授权增长。
 
 认证入口`UserGrant::validate`及`CertificateUsers::validate_world`分别接收复制和授权额度；请传入宿主实际配置。较大的本机认证策略使用`CertificateUsers::new_with_limits(users, replica_sections, actor_sections)`或`load_with_limits(path, replica_sections, actor_sections)`。原`new`和`load`保留小策略默认值，文件解析仍有独立的64KiB大小约束。会话元数据不入存档，重开时由宿主重新提供配置；本改动不改变协议及存档格式。
 
