@@ -1316,3 +1316,128 @@ fn shared_light_fixed_route_measurement() {
         resources.input_peak, resources.reserved_bytes, resources.io_pending
     );
 }
+
+#[test]
+fn standalone_light_frames_sort_coordinates_after_selecting_nearest_pages() {
+    use torse_net::{
+        MemoryTransport,
+        terrain::{TerrainLimits, TerrainMirror},
+    };
+    use torse_server::{bootstrap as base, network::*};
+    let dir = Directory::new();
+    let (mut server, pages, _) = visual_fixture::create(&dir);
+    let mut hub =
+        NetworkHub::<MemoryTransport>::new(server.binding(), base::network_limits()).unwrap();
+    let mut light_limits = limits();
+    light_limits.input_sections = 512;
+    light_limits.input_bytes = 8 * 1024 * 1024;
+    light_limits.field.interests = 512;
+    light_limits.field.cache_bytes = 64 * 1024 * 1024;
+    light_limits.field.solver_cache_bytes = 64 * 1024 * 1024;
+    light_limits.field.job = LightLimits {
+        cells: 1_000_000,
+        dependencies: 512,
+        frontier: 1_000_000,
+        bytes: 32 * 1024 * 1024,
+    };
+    hub.enable_shared_lighting(&server, pages.clone(), light_limits, 20_000)
+        .unwrap();
+    let (id, mut client, _, _) =
+        interest::attach(&mut hub, &mut server, visual_fixture::scope(0, 1));
+    let center = SectionPos::new(4, 0, 0);
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages,
+        visual_fixture::approval(),
+        visual_fixture::scope(2, 3),
+        center,
+        visual_fixture::limits(),
+    )
+    .unwrap();
+    let mut mirror = TerrainMirror::new(
+        server.binding(),
+        16,
+        server.authority().unwrap().world().store().bounds(),
+        TerrainLimits {
+            max_sections: 8,
+            max_bytes: 1_000_000,
+            metadata_bytes: 8 * 512,
+        },
+        None,
+    )
+    .unwrap();
+    let start = Instant::now();
+    let terrain_only = DisplayWorkBudget {
+        sessions: 1,
+        metadata_checks_per_session: 64,
+        ..Default::default()
+    };
+    while mirror.cached_pages() != 3 {
+        hub.poll_control(&mut server).unwrap();
+        hub.poll_display(&server, terrain_only).unwrap();
+        for message in interest::drain(&mut client).0 {
+            if let ServerMessage::Terrain(update) = message {
+                mirror.apply(update).unwrap();
+            }
+        }
+        assert!(start.elapsed() < Duration::from_secs(10));
+        std::thread::yield_now();
+    }
+    // Finish all publications without sending, so the next frame can batch
+    // candidates in distance order (4, 3, 2), opposite to wire coordinate order.
+    while hub.shared_light_diagnostics().unwrap().published != 3 {
+        hub.poll_display(
+            &server,
+            DisplayWorkBudget {
+                lighting: torse_server::lighting::HostLightWorkBudget {
+                    input_checks: 64,
+                    validation_checks: 64,
+                    readiness_checks: 64,
+                    solver_work: 200_000,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            hub.shared_light_diagnostics()
+        );
+        std::thread::yield_now();
+    }
+    for expected in [
+        vec![SectionPos::new(3, 0, 0), center],
+        vec![SectionPos::new(2, 0, 0)],
+    ] {
+        hub.poll_display(
+            &server,
+            DisplayWorkBudget {
+                sessions: 1,
+                light_checks_per_session: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let update = interest::drain(&mut client)
+            .0
+            .into_iter()
+            .find_map(|message| {
+                if let ServerMessage::Light(update) = message {
+                    Some(update)
+                } else {
+                    None
+                }
+            })
+            .expect("standalone light frame");
+        assert_eq!(
+            update.pages.iter().map(|page| page.pos).collect::<Vec<_>>(),
+            expected
+        );
+        mirror.apply_light(update).unwrap();
+    }
+    for pos in visual_fixture::scope(2, 3).sections {
+        assert!(mirror.light(pos).is_some());
+    }
+}
