@@ -43,6 +43,12 @@ pub enum InterestUpdate {
 impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
     Server<ExecutionHost, J, S>
 {
+    /// Update trusted grant admission between driver calls. Existing grants and
+    /// replication remain unchanged; lowering below live usage is refused.
+    pub fn set_actor_section_limit(&mut self, sections: usize) -> Result<(), Fault> {
+        self.authority()?;
+        self.authority.set_actor_section_limit(sections)
+    }
     /// Reserve journal/checkpoint capacity and connect the recovered authority to one account.
     pub fn attach_memory(&mut self, pool: MemoryPool, storage_bytes: u64) -> Result<(), Fault> {
         self.authority()?;
@@ -672,11 +678,9 @@ impl<T: Transport> NetworkHub<T> {
             })
             .transpose()?;
         if let Some(viewer) = peer.viewer {
-            if policy.scope.sections.len() > server.authority()?.replica_section_limit()
-                || policy.actor.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS
-            {
-                return Err(Fault::resource_limit("session scope too large"));
-            }
+            server
+                .authority()?
+                .check_session_scope(&policy.actor, &policy.scope)?;
             // A grant change cannot let queued frames or partial TLS records
             // escape afterward. Without a proven idle transport, close rather
             // than silently skipping control frames or corrupting stream framing.
@@ -1078,7 +1082,10 @@ impl<T: Transport> NetworkHub<T> {
                             return Err(Fault::incompatible("TLS identity is not verified"));
                         }
                         let grant = verifier.verify(peer.transport.security())?;
-                        grant.validate(server.authority()?.replica_section_limit())?;
+                        grant.validate(
+                            server.authority()?.replica_section_limit(),
+                            server.authority()?.actor_section_limit(),
+                        )?;
                         if users.contains(&grant.user)
                             || grant.player.is_some_and(|entity| players.contains(&entity))
                         {

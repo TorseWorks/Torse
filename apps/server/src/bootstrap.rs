@@ -38,6 +38,7 @@ pub fn execution_limits() -> ExecutionLimits {
             max_bytes: 16_384,
         },
         sessions: 32,
+        actor_sections: 1024,
         receipt_window: 32,
         phase_tasks: 128,
         events: 128,

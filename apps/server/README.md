@@ -1,5 +1,20 @@
 # 服务端
 
+## 会话授权分区额度
+
+`ExecutionLimits::actor_sections`限制每个会话的可信分区授权数量，独立于`replicas.max_sections`的复制范围额度。`bootstrap::execution_limits()`默认授权额度为1024，这是可覆盖的预设，不是内核强制上限。高度24层、半径3的完整窗口需要1176个分区；宿主应根据自己的模拟和交互策略计算额度，只读显示范围不自动加入交互授权。
+
+```rust
+let mut limits = torse_server::bootstrap::execution_limits();
+limits.actor_sections = 2048;
+limits.replicas.max_sections = 1176;
+// 将limits传入ExecutionHost::new或恢复构造器。
+```
+
+运行期间可在驱动调用之间使用`Server::set_actor_section_limit`；`ExecutionHost::actor_section_limit`读取当前值。设置0或调低到任一现存会话授权量以下会拒绝且不修改额度、授权或复制队列。需要撤权时先显式替换授权，不能通过调低额度隐式撤权。提高额度本身不预分配集合；附着`MemoryPool`时注册和范围替换按实际授权及范围的保守逻辑计费预留，增长失败不失效旧会话，缩减和断开释放租约。未附着内存池的宿主仍执行数量额度，但没有进程共享内存计费。
+
+认证入口`UserGrant::validate`及`CertificateUsers::validate_world`分别接收复制和授权额度；请传入宿主实际配置。较大的本机认证策略使用`CertificateUsers::new_with_limits(users, replica_sections, actor_sections)`或`load_with_limits(path, replica_sections, actor_sections)`。原`new`和`load`保留小策略默认值，文件解析仍有独立的64KiB大小约束。会话元数据不入存档，重开时由宿主重新提供配置；本改动不改变协议及存档格式。
+
 ## 独立地形显示范围
 
 `NetworkHub::enable_visual_interest`为连接设置不可变的只读批准范围、显示范围、中心与`VisualTerrainLimits`，初次近景订阅后交付。`set_visual_interest`在批准范围内移动，`refresh_visual_interest`重试缺失、损坏或预算拒绝的来源。库入口默认关闭，主程序不自动扩大视野。

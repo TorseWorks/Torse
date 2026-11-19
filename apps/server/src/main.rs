@@ -335,6 +335,7 @@ fn run() -> Result<(), Fault> {
         users.validate_world(
             server.authority()?.world(),
             base::execution_limits().replicas.max_sections,
+            server.authority()?.actor_section_limit(),
         )?;
         hub.require_authentication(std::sync::Arc::new(users))?;
         Some(tls)

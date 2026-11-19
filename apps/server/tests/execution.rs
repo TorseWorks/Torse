@@ -382,7 +382,7 @@ fn rejected_scope_replacement_retains_authority_and_live_replica_queues() {
             .is_err()
     );
     let mut oversized_actor = ActorContext::new(key("test:none"));
-    for x in 0..=torse_sim::action::MAX_ACTOR_SECTIONS {
+    for x in 0..=base::execution_limits().actor_sections {
         oversized_actor = oversized_actor.section(SectionPos::new(x as i64, 0, 0));
     }
     assert!(
@@ -1998,4 +1998,282 @@ fn ordered_path_frozen_before_commit_replays_once_without_replanning() {
             .position,
         position
     );
+}
+
+fn full_height_grants(mut actor: ActorContext) -> ActorContext {
+    for x in -3..=3 {
+        for z in -3..=3 {
+            for y in -4..20 {
+                actor = actor.section(SectionPos::new(x, y, z));
+            }
+        }
+    }
+    assert_eq!(actor.section_count(), 1176);
+    actor
+}
+
+#[test]
+fn actor_limit_changes_are_atomic_and_independent_of_replica_scope() {
+    let dir = Directory::new();
+    let mut server = create(&dir, Vec::new());
+    let viewer = Viewer {
+        session: SessionId(1),
+        actor: ActorContextId(1),
+    };
+    assert_eq!(
+        server
+            .register_session(viewer, full_height_grants(actor()), base::scope())
+            .unwrap_err()
+            .code,
+        FaultCode::ResourceLimit
+    );
+    server.set_actor_section_limit(1176).unwrap();
+    // A refused registration must not consume the session sequence.
+    server
+        .register_session(viewer, full_height_grants(actor()), base::scope())
+        .unwrap();
+    let seed = server
+        .open_replica(viewer.session, base::scope(), base::budget())
+        .unwrap();
+    for limit in [0, 1175] {
+        assert!(server.set_actor_section_limit(limit).is_err());
+        assert_eq!(server.authority().unwrap().actor_section_limit(), 1176);
+    }
+    let oversized = full_height_grants(actor()).section(SectionPos::new(4, 0, 0));
+    assert_eq!(
+        server
+            .change_session_interest(viewer.session, oversized, base::scope(), base::budget())
+            .unwrap_err()
+            .code,
+        FaultCode::ResourceLimit
+    );
+    assert!(
+        server
+            .take_replica(seed.subscription, base::budget())
+            .unwrap()
+            .is_empty()
+    );
+    let queued = request(&server, 1, transfer());
+    let id = queued.id;
+    server.submit(queued);
+    tick(&mut server);
+    assert_eq!(
+        server.receipt(id).unwrap().unwrap().reply.status,
+        ReplyStatus::Committed
+    );
+    server
+        .replace_session_scope(viewer.session, actor(), base::scope())
+        .unwrap();
+    server.set_actor_section_limit(1).unwrap();
+}
+
+#[test]
+fn full_height_radius_three_scope_is_admitted_by_explicit_host_limits() {
+    let dir = Directory::new();
+    let (world, actions) = base::world().unwrap();
+    let mut snapshot = world
+        .capture_snapshot(torse_sim::streaming::page_meta(&world))
+        .unwrap();
+    snapshot.bounds = WorldBounds::new(-64, 320).unwrap();
+    let mut recovery = world.begin_restore();
+    recovery.restore_snapshot(&snapshot).unwrap();
+    let world = recovery.finish().unwrap();
+    let mut limits = base::execution_limits();
+    limits.actor_sections = 1176;
+    limits.replicas.max_sections = 1176;
+    let mut server = base::Files::create_file(
+        dir.acquire(),
+        world.coordinator().compatibility(),
+        base::Codec::new(base::codec_limits()).unwrap(),
+        base::file_policy(),
+        |binding| ExecutionHost::new(binding, world, actions, Vec::new(), limits),
+    )
+    .unwrap();
+    let scope = torse_sim::replica::ReplicaScope {
+        sections: (-3..=3)
+            .flat_map(|x| {
+                (-3..=3).flat_map(move |z| (-4..20).map(move |y| SectionPos::new(x, y, z)))
+            })
+            .collect(),
+    };
+    server
+        .register_session(
+            Viewer {
+                session: SessionId(1),
+                actor: ActorContextId(1),
+            },
+            full_height_grants(actor()),
+            scope.clone(),
+        )
+        .unwrap();
+    server
+        .open_replica(SessionId(1), scope.clone(), base::budget())
+        .unwrap();
+    server
+        .replace_session_scope(SessionId(1), full_height_grants(actor()), scope)
+        .unwrap();
+}
+
+#[test]
+fn session_grant_memory_is_reserved_on_use_and_failed_growth_retains_access() {
+    let dir = Directory::new();
+    let mut server = create(&dir, Vec::new());
+    let pool = MemoryPool::new(MemoryBudget::new(256 * 1024 * 1024));
+    server
+        .attach_memory(pool.clone(), 48 * 1024 * 1024)
+        .unwrap();
+    let initial = pool.usage().total;
+    server.set_actor_section_limit(1176).unwrap();
+    assert_eq!(
+        pool.usage().total,
+        initial,
+        "raising policy does not preallocate grants"
+    );
+    session(&mut server);
+    let old = server
+        .open_replica(SessionId(1), base::scope(), base::budget())
+        .unwrap();
+    let before = pool.usage().total;
+    pool.set_policy(MemoryPolicy::Fixed {
+        target_bytes: before,
+    })
+    .unwrap();
+    pool.set_budget(MemoryBudget::new(before)).unwrap();
+    assert_eq!(
+        server
+            .replace_session_scope(SessionId(1), full_height_grants(actor()), base::scope())
+            .unwrap_err()
+            .code,
+        FaultCode::ResourceLimit
+    );
+    assert_eq!(
+        server
+            .change_session_interest(
+                SessionId(1),
+                full_height_grants(actor()),
+                base::scope(),
+                base::budget()
+            )
+            .unwrap_err()
+            .code,
+        FaultCode::ResourceLimit
+    );
+    assert_eq!(pool.usage().total, before);
+    assert!(
+        server
+            .take_replica(old.subscription, base::budget())
+            .unwrap()
+            .is_empty()
+    );
+    let viewer = Viewer {
+        session: SessionId(2),
+        actor: ActorContextId(1),
+    };
+    assert_eq!(
+        server
+            .register_session(viewer, full_height_grants(actor()), base::scope())
+            .unwrap_err()
+            .code,
+        FaultCode::ResourceLimit
+    );
+    pool.set_budget(MemoryBudget::new(256 * 1024 * 1024))
+        .unwrap();
+    let before_failed_projection = pool.usage().total;
+    assert!(
+        server
+            .change_session_interest(
+                SessionId(1),
+                full_height_grants(actor()),
+                base::scope(),
+                OutputBudget::new(1, 1)
+            )
+            .is_err()
+    );
+    assert_eq!(
+        pool.usage().total,
+        before_failed_projection,
+        "failed projection releases prepared grant growth"
+    );
+    assert!(
+        server
+            .take_replica(old.subscription, base::budget())
+            .unwrap()
+            .is_empty()
+    );
+    let queued = request(&server, 1, transfer());
+    let id = queued.id;
+    server.submit(queued);
+    tick(&mut server);
+    assert_eq!(
+        server.receipt(id).unwrap().unwrap().reply.status,
+        ReplyStatus::Committed
+    );
+    server
+        .register_session(viewer, full_height_grants(actor()), base::scope())
+        .unwrap();
+    let large = pool.usage().total;
+    assert!(large > before);
+    pool.set_budget(MemoryBudget::new(large)).unwrap();
+    // Shrinking needs no temporary full-copy reservation, even at the hard cap.
+    server
+        .replace_session_scope(SessionId(2), actor(), base::scope())
+        .unwrap();
+    assert!(pool.usage().total < large);
+    let before_revoke = pool.usage().total;
+    server.disconnect(SessionId(2)).unwrap();
+    assert!(pool.usage().total < before_revoke);
+}
+
+#[test]
+fn network_replacement_uses_the_current_host_actor_limit() {
+    let dir = Directory::new();
+    let mut server = create(&dir, Vec::new());
+    server.set_actor_section_limit(1176).unwrap();
+    let mut hub = NetworkHub::new(server.binding(), base::network_limits()).unwrap();
+    let (peer, mut client) = add(&mut hub, &server, actor());
+    hello(&mut client, server.binding());
+    hub.poll(&mut server).unwrap();
+    receive(&mut client);
+    send(
+        &mut client,
+        ClientMessage::Subscribe {
+            sections: base::scope().sections.into_iter().collect(),
+        },
+    );
+    hub.poll(&mut server).unwrap();
+    let mut mirror = seed(receive(&mut client));
+    hub.replace_policy(
+        &mut server,
+        peer,
+        PeerPolicy {
+            actor: full_height_grants(actor()),
+            scope: base::scope(),
+        },
+    )
+    .unwrap();
+    let batch = receive(&mut client)
+        .into_iter()
+        .find_map(|msg| {
+            if let ServerMessage::Interest(batch) = msg {
+                Some(batch)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    mirror.apply_interest(batch).unwrap();
+    assert!(
+        hub.replace_policy(
+            &mut server,
+            peer,
+            PeerPolicy {
+                actor: full_height_grants(actor()).section(SectionPos::new(4, 0, 0)),
+                scope: base::scope()
+            }
+        )
+        .is_err()
+    );
+    send(&mut client, ClientMessage::Ping);
+    hub.poll(&mut server).unwrap();
+    assert!(hub.contains(peer));
 }

@@ -286,18 +286,30 @@ fn duplicate_or_inconsistent_user_configuration_is_rejected() {
     let server = create(&dir);
     let users = CertificateUsers::new([(Digest([1; 32]), grant("user:alice", 3, true))]).unwrap();
     users
-        .validate_world(server.authority().unwrap().world(), 4)
+        .validate_world(
+            server.authority().unwrap().world(),
+            4,
+            base::execution_limits().actor_sections,
+        )
         .unwrap();
     assert!(
         users
-            .validate_world(server.authority().unwrap().world(), 1)
+            .validate_world(
+                server.authority().unwrap().world(),
+                1,
+                base::execution_limits().actor_sections
+            )
             .is_err()
     );
     let missing =
         CertificateUsers::new([(Digest([1; 32]), grant("user:alice", 99, true))]).unwrap();
     assert!(
         missing
-            .validate_world(server.authority().unwrap().world(), 4)
+            .validate_world(
+                server.authority().unwrap().world(),
+                4,
+                base::execution_limits().actor_sections
+            )
             .is_err()
     );
 }
@@ -315,7 +327,11 @@ fn each_user_subscription_is_checked_against_its_own_scope() {
     b.player = None;
     let users = CertificateUsers::new([(Digest([1; 32]), a), (Digest([2; 32]), b)]).unwrap();
     users
-        .validate_world(server.authority().unwrap().world(), 4)
+        .validate_world(
+            server.authority().unwrap().world(),
+            4,
+            base::execution_limits().actor_sections,
+        )
         .unwrap();
     let mut hub = NetworkHub::new(server.binding(), base::network_limits()).unwrap();
     hub.require_authentication(Arc::new(users)).unwrap();
@@ -428,4 +444,74 @@ fn explicit_visual_reset_cannot_replace_the_authenticated_user() {
     assert_eq!(hub.user(alice), Some(&base::key("user:alice")));
     assert!(hub.contains(alice));
     assert!(hub.visual_terrain_diagnostics(alice).is_some());
+}
+
+#[test]
+fn authenticated_large_grants_follow_host_limits_instead_of_a_global_ceiling() {
+    let dir = Directory::new();
+    let mut server = create(&dir);
+    let mut large = grant("user:alice", 3, true);
+    for x in -3..=3 {
+        for z in -3..=3 {
+            for y in -4..20 {
+                large.actor = large.actor.section(SectionPos::new(x, y, z));
+            }
+        }
+    }
+    assert_eq!(large.actor.section_count(), 1176);
+    assert!(
+        CertificateUsers::new_with_limits([(Digest([1; 32]), large.clone())], 4, 1175).is_err()
+    );
+    assert!(
+        CertificateUsers::new_with_limits([(Digest([1; 32]), large.clone())], 1, 1176).is_err()
+    );
+    let users = CertificateUsers::new_with_limits([(Digest([1; 32]), large)], 4, 1176).unwrap();
+    users
+        .validate_world(server.authority().unwrap().world(), 4, 1176)
+        .unwrap();
+    let mut hub = NetworkHub::new(server.binding(), base::network_limits()).unwrap();
+    hub.require_authentication(Arc::new(users)).unwrap();
+    // Construction permits the configured policy; admission still uses the host's live limit.
+    let (_, mut refused) = add(&mut hub, TransportSecurity::MutualTls(Digest([1; 32]))).unwrap();
+    hello(&mut refused, &server);
+    hub.poll(&mut server).unwrap();
+    assert!(
+        refused.receive().is_err(),
+        "over-limit authentication closes before admission"
+    );
+    server.set_actor_section_limit(1176).unwrap();
+    let (peer, mut client) = add(&mut hub, TransportSecurity::MutualTls(Digest([1; 32]))).unwrap();
+    hello(&mut client, &server);
+    hub.poll(&mut server).unwrap();
+    session(&receive(&mut client));
+    assert!(hub.contains(peer));
+    assert_eq!(hub.user(peer), Some(&base::key("user:alice")));
+}
+
+#[test]
+fn explicit_policy_file_limits_accept_full_height_grants_and_preserve_parser_bounds() {
+    let dir = Directory::new();
+    let path = dir.0.join("large-users.toml");
+    let sections: Vec<_> = (-3..=3)
+        .flat_map(|x| (-3..=3).flat_map(move |z| (-4..20).map(move |y| format!("[{x},{y},{z}]"))))
+        .collect();
+    let text = format!(
+        "[[users]]\nid='user:alice'\ncertificate_sha256='{}'\nsections=[{}]\n",
+        "01".repeat(32),
+        sections.join(",")
+    );
+    assert!(text.len() < 65536);
+    std::fs::write(&path, text).unwrap();
+    assert!(CertificateUsers::load(&path).is_err());
+    let users = CertificateUsers::load_with_limits(&path, 1176, 1176).unwrap();
+    let grant = users
+        .verify(TransportSecurity::MutualTls(Digest([1; 32])))
+        .unwrap();
+    assert_eq!(grant.actor.section_count(), 1176);
+    assert_eq!(grant.scope.sections.len(), 1176);
+    assert!(CertificateUsers::load_with_limits(&path, 1175, 1176).is_err());
+    assert!(CertificateUsers::load_with_limits(&path, 1176, 1175).is_err());
+    assert!(CertificateUsers::load_with_limits(&path, 0, 1176).is_err());
+    std::fs::write(&path, vec![b' '; 65537]).unwrap();
+    assert!(CertificateUsers::load_with_limits(&path, 1176, 1176).is_err());
 }

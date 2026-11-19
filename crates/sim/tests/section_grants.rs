@@ -207,18 +207,18 @@ fn section_grants_do_not_widen_entity_or_permission_access() {
 }
 
 #[test]
-fn section_grants_have_a_registration_budget() {
+fn section_grants_are_deduplicated_without_an_embedded_host_limit() {
     let mut actor = editor();
-    let mut index = 1i64;
-    while actor.section_count() < torse_sim::action::MAX_ACTOR_SECTIONS {
-        actor = actor.section(SectionPos::new(index, 0, 0));
-        index += 1;
+    for x in -3..=3 {
+        for z in -3..=3 {
+            for y in 0..24 {
+                actor = actor.section(SectionPos::new(x, y, z));
+            }
+        }
     }
-    assert_eq!(actor.section_count(), torse_sim::action::MAX_ACTOR_SECTIONS);
-    // The builder stays infallible; registration is where the bound bites.
-    // Use the next unused coordinate so the count really grows.
-    let overflowing = actor.section(SectionPos::new(index, 0, 0));
-    assert!(overflowing.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS);
+    assert_eq!(actor.section_count(), 1176);
+    actor = actor.section(SectionPos::ZERO);
+    assert_eq!(actor.section_count(), 1176);
 }
 
 #[test]

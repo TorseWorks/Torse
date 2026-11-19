@@ -88,14 +88,6 @@ pub enum ActionTarget {
     Entity(EntityId),
 }
 
-/// Upper bound on section grants one actor may carry at registration.
-///
-/// A resident 5 by 5 column scope reaches 600 grants once a world fills 24
-/// vertical sections per column, so the bound must cover full-height worlds.
-/// It stays a host mistake backstop rather than a scope policy; the replica
-/// subscription budget remains independent.
-pub const MAX_ACTOR_SECTIONS: usize = 1024;
-
 /// Identity and finite access grants established by the trusted host.
 ///
 /// Never deserialize this object from client assertions. A grant can represent
@@ -145,8 +137,8 @@ impl ActorContext {
     }
     /// Grant every cell of one section. Hosts use this for scope-wide access
     /// such as editing a subscribed area; it never widens entity access.
-    /// Registration rejects actors carrying more than [`MAX_ACTOR_SECTIONS`]
-    /// grants; the builder itself stays infallible.
+    /// The trusted host enforces its configured admission and memory limits;
+    /// this deduplicating builder itself stays infallible.
     pub fn section(mut self, pos: SectionPos) -> Self {
         self.sections.insert(pos);
         self
