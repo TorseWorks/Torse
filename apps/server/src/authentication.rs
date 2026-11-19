@@ -17,11 +17,11 @@ pub struct UserGrant {
     pub player: Option<EntityId>,
 }
 impl UserGrant {
-    pub fn validate(&self, sections: usize) -> Result<(), Fault> {
+    pub fn validate(&self, sections: usize, actor_sections: usize) -> Result<(), Fault> {
         if self.actor.principal() != &self.user
             || self.scope.sections.is_empty()
             || self.scope.sections.len() > sections
-            || self.actor.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS
+            || self.actor.section_count() > actor_sections
             || self.player.is_some_and(|id| id.0 == 0)
         {
             return Err(Fault::invalid_data("invalid authenticated user grant"));
@@ -42,9 +42,10 @@ impl CertificateUsers {
         &self,
         world: &torse_sim::WorldAuthority,
         section_limit: usize,
+        actor_section_limit: usize,
     ) -> Result<(), Fault> {
         for grant in self.users.values() {
-            grant.validate(section_limit)?;
+            grant.validate(section_limit, actor_section_limit)?;
             for section in &grant.scope.sections {
                 let origin = section
                     .to_block(
@@ -100,12 +101,28 @@ impl CertificateUsers {
         }
         Ok(())
     }
+    /// Conservative defaults for small static policy files. Larger trusted
+    /// registries must choose explicit limits with `new_with_limits`.
     pub fn new(users: impl IntoIterator<Item = (Digest, UserGrant)>) -> Result<Self, Fault> {
+        Self::new_with_limits(
+            users,
+            64,
+            crate::bootstrap::execution_limits().actor_sections,
+        )
+    }
+    pub fn new_with_limits(
+        users: impl IntoIterator<Item = (Digest, UserGrant)>,
+        section_limit: usize,
+        actor_section_limit: usize,
+    ) -> Result<Self, Fault> {
+        if section_limit == 0 || actor_section_limit == 0 {
+            return Err(Fault::invalid_data("user grant limits must be nonzero"));
+        }
         let mut registry = BTreeMap::new();
         let mut identities = BTreeSet::new();
         let mut players = BTreeSet::new();
         for (certificate, grant) in users {
-            grant.validate(64)?;
+            grant.validate(section_limit, actor_section_limit)?;
             if registry.len() >= 64
                 || !identities.insert(grant.user.clone())
                 || grant.player.is_some_and(|player| !players.insert(player))
@@ -123,6 +140,19 @@ impl CertificateUsers {
     }
     /// Bounded local configuration. It contains certificate fingerprints, never private keys.
     pub fn load(path: &Path) -> Result<Self, Fault> {
+        Self::load_with_limits(
+            path,
+            64,
+            crate::bootstrap::execution_limits().actor_sections,
+        )
+    }
+    /// Scope limits are host policy; the file still retains its own 64 KiB
+    /// parser bound and bounded user/permission/entity collections.
+    pub fn load_with_limits(
+        path: &Path,
+        section_limit: usize,
+        actor_section_limit: usize,
+    ) -> Result<Self, Fault> {
         use std::io::Read;
         let file = std::fs::File::open(path)
             .map_err(|_| Fault::invalid_data("cannot open user policy"))?;
@@ -140,12 +170,14 @@ impl CertificateUsers {
         if document.users.len() > 64 {
             return Err(Fault::resource_limit("user policy count"));
         }
-        Self::new(
+        Self::new_with_limits(
             document
                 .users
                 .into_iter()
-                .map(|user| user.grant())
+                .map(|user| user.grant(section_limit.min(actor_section_limit)))
                 .collect::<Result<Vec<_>, _>>()?,
+            section_limit,
+            actor_section_limit,
         )
     }
 }
@@ -186,8 +218,11 @@ struct User {
     player: Option<u128>,
 }
 impl User {
-    fn grant(self) -> Result<(Digest, UserGrant), Fault> {
-        if self.sections.len() > 64 || self.permissions.len() > 32 || self.entities.len() > 64 {
+    fn grant(self, section_limit: usize) -> Result<(Digest, UserGrant), Fault> {
+        if self.sections.len() > section_limit
+            || self.permissions.len() > 32
+            || self.entities.len() > 64
+        {
             return Err(Fault::resource_limit("user grant collection limit"));
         }
         let parse = |value: &str| {

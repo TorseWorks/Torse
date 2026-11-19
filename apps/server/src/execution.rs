@@ -61,6 +61,9 @@ pub struct ExecutionLimits {
     pub pending_bytes: u64,
     pub input: OutputBudget,
     pub sessions: usize,
+    /// Per-session trusted section grants, independent of replica subscription size.
+    /// This is an admission limit; collections and memory are charged as used.
+    pub actor_sections: usize,
     pub receipt_window: usize,
     /// Retained tasks per ordinary/event batch and event callbacks per admission attempt.
     pub phase_tasks: usize,
@@ -74,6 +77,7 @@ impl ExecutionLimits {
         if [
             self.pending_requests,
             self.sessions,
+            self.actor_sections,
             self.receipt_window,
             self.phase_tasks,
             self.events,
@@ -164,6 +168,7 @@ struct LiveSession {
     scope: ReplicaScope,
     high: u64,
     completed: u64,
+    memory: Option<MemoryLease>,
 }
 struct Queued {
     request: WorldRequest<Call>,
@@ -526,6 +531,41 @@ impl ExecutionHost {
     pub(crate) fn replica_section_limit(&self) -> usize {
         self.limits.replicas.max_sections
     }
+    pub fn actor_section_limit(&self) -> usize {
+        self.limits.actor_sections
+    }
+    /// Change admission policy between driver calls, without changing any grants.
+    /// Shrinking below a live actor's usage is rejected atomically. Raising this
+    /// limit allocates no grant storage; actual changes must reserve memory.
+    pub fn set_actor_section_limit(&mut self, sections: usize) -> Result<(), Fault> {
+        if sections == 0 {
+            return Err(Fault::invalid_data("actor section limit must be nonzero"));
+        }
+        if self
+            .sessions
+            .values()
+            .any(|live| live.actor.section_count() > sections)
+        {
+            return Err(Fault::resource_limit(
+                "actor section limit below live usage",
+            ));
+        }
+        self.limits.actor_sections = sections;
+        Ok(())
+    }
+    pub(crate) fn check_session_scope(
+        &self,
+        actor: &ActorContext,
+        scope: &ReplicaScope,
+    ) -> Result<(), Fault> {
+        if scope.sections.len() > self.limits.replicas.max_sections {
+            return Err(Fault::resource_limit("session scope too large"));
+        }
+        if actor.section_count() > self.limits.actor_sections {
+            return Err(Fault::resource_limit("actor section grants too large"));
+        }
+        Ok(())
+    }
     pub fn runtime(&self) -> &RuntimeState {
         &self.runtime
     }
@@ -560,12 +600,8 @@ impl ExecutionHost {
         {
             return Err(Fault::resource_limit("session unavailable"));
         }
-        if scope.sections.len() > self.limits.replicas.max_sections {
-            return Err(Fault::resource_limit("session scope too large"));
-        }
-        if actor.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS {
-            return Err(Fault::resource_limit("actor section grants too large"));
-        }
+        self.check_session_scope(&actor, &scope)?;
+        let memory = self.reserve_session_memory(None, &actor, &scope)?;
         self.highest_session = viewer.session.0;
         self.sessions.insert(
             viewer.session.0,
@@ -575,6 +611,7 @@ impl ExecutionHost {
                 scope,
                 high: 0,
                 completed: 0,
+                memory: memory.map(|(growth, _)| growth),
             },
         );
         Ok(())
@@ -588,11 +625,8 @@ impl ExecutionHost {
         actor: ActorContext,
         scope: ReplicaScope,
     ) -> Result<Vec<SubscriptionId>, Fault> {
-        if scope.sections.len() > self.limits.replicas.max_sections
-            || actor.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS
-        {
-            return Err(Fault::resource_limit("session scope too large"));
-        }
+        self.check_session_scope(&actor, &scope)?;
+        let memory = self.reserve_session_memory(Some(session), &actor, &scope)?;
         let live = self
             .sessions
             .get_mut(&session.0)
@@ -600,6 +634,7 @@ impl ExecutionHost {
         let invalidated = self.source.invalidate_viewer(live.viewer);
         live.actor = actor;
         live.scope = scope;
+        live.commit_memory(memory);
         Ok(invalidated)
     }
 
@@ -624,11 +659,8 @@ impl ExecutionHost {
         scope: ReplicaScope,
         budget: OutputBudget,
     ) -> Result<Vec<WorldReplicaBatch>, Fault> {
-        if scope.sections.len() > self.limits.replicas.max_sections
-            || actor.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS
-        {
-            return Err(Fault::resource_limit("session scope too large"));
-        }
+        self.check_session_scope(&actor, &scope)?;
+        let memory = self.reserve_session_memory(Some(session), &actor, &scope)?;
         let live = self
             .sessions
             .get(&session.0)
@@ -639,6 +671,7 @@ impl ExecutionHost {
         let live = self.sessions.get_mut(&session.0).expect("checked session");
         live.actor = actor;
         live.scope = scope;
+        live.commit_memory(memory);
         Ok(batches)
     }
 

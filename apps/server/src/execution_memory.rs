@@ -12,6 +12,17 @@ pub(super) struct Prepared {
     work: MemoryLease,
     runtime_bytes: u64,
 }
+impl LiveSession {
+    pub(super) fn commit_memory(&mut self, memory: Option<(MemoryLease, u64)>) {
+        if let Some((mut growth, bytes)) = memory {
+            self.memory
+                .as_mut()
+                .expect("attached session memory")
+                .absorb(&mut growth, bytes)
+                .expect("prepared same-pool session growth covers the new resident");
+        }
+    }
+}
 fn runtime_bytes(state: &RuntimeState, limits: ExecutionLimits) -> Result<u64, Fault> {
     let cost = wire::measure_inner(state, limits.runtime, limits.codec)?;
     cost.owned_bytes
@@ -20,6 +31,39 @@ fn runtime_bytes(state: &RuntimeState, limits: ExecutionLimits) -> Result<u64, F
         .ok_or_else(|| Fault::resource_limit("runtime memory reservation overflow"))
 }
 impl ExecutionHost {
+    pub(super) fn reserve_session_memory(
+        &self,
+        session: Option<SessionId>,
+        actor: &ActorContext,
+        scope: &ReplicaScope,
+    ) -> Result<Option<(MemoryLease, u64)>, Fault> {
+        let live = session
+            .map(|id| {
+                self.sessions
+                    .get(&id.0)
+                    .ok_or_else(|| Fault::invalid_data("unknown session"))
+            })
+            .transpose()?;
+        let Some(pool) = self.memory_pool() else {
+            return Ok(None);
+        };
+        let bytes = actor
+            .accounted_bytes()
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add((scope.sections.len() as u64).checked_mul(128)?))
+            .ok_or_else(|| Fault::resource_limit("session memory reservation overflow"))?;
+        let old = live
+            .and_then(|live| live.memory.as_ref())
+            .map_or(0, MemoryLease::bytes);
+        Ok(Some((
+            pool.reserve(
+                MemoryClass::Executor,
+                bytes.saturating_sub(old),
+                EvictionRank::Pinned,
+            )?,
+            bytes,
+        )))
+    }
     /// Attach after recovery and before accepting sessions or replicas.
     pub fn attach_memory(&mut self, pool: MemoryPool) -> Result<(), Fault> {
         if self.memory.is_some()
@@ -41,7 +85,10 @@ impl ExecutionHost {
             .pending_bytes
             .checked_mul(2)
             .and_then(|bytes| {
-                bytes.checked_add((self.limits.sessions as u64).checked_mul(1024 * 128)?)
+                bytes.checked_add(
+                    (self.limits.sessions as u64)
+                        .checked_mul(size_of::<LiveSession>() as u64 + 128)?,
+                )
             })
             .and_then(|bytes| bytes.checked_add(self.limits.runtime.max_bytes.checked_mul(2)?))
             .and_then(|bytes| {
