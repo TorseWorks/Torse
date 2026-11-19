@@ -497,9 +497,13 @@ impl VisualSession {
                 Err(error) => return Err(error),
             }
         }
-        let crate::network::ServerMessage::Light(update) = message else {
+        let crate::network::ServerMessage::Light(mut update) = message else {
             unreachable!()
         };
+        // Keep distance priority while selecting and shrinking the frame, then
+        // satisfy the mirror's strict wire order. Reordering fixed-width pages
+        // does not change the encoded frame size.
+        update.pages.sort_unstable_by_key(|page| page.pos);
         for light in &update.pages {
             self.light_sent.insert(light.pos, light.generation);
         }
