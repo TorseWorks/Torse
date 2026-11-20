@@ -178,7 +178,12 @@ pub fn order_phase(specs: &[SystemSpec]) -> Result<Vec<ContentKey>, OrderError> 
     let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); specs.len()];
     let mut incoming = vec![0usize; specs.len()];
     for (position, spec) in specs.iter().enumerate() {
-        for target in spec.before.iter().chain(spec.after.iter()) {
+        for (target, before) in spec
+            .before
+            .iter()
+            .map(|target| (target, true))
+            .chain(spec.after.iter().map(|target| (target, false)))
+        {
             let Some(target_position) = index.get(target) else {
                 return Err(OrderError::UnknownDependency {
                     system: spec.id.clone(),
@@ -191,7 +196,7 @@ pub fn order_phase(specs: &[SystemSpec]) -> Result<Vec<ContentKey>, OrderError> 
                     target: target.clone(),
                 });
             }
-            let (from, to) = if spec.before.contains(target) {
+            let (from, to) = if before {
                 (position, *target_position)
             } else {
                 (*target_position, position)
@@ -361,6 +366,39 @@ mod tests {
             order_phase(&specs),
             Err(OrderError::UnknownDependency { .. })
         ));
+    }
+
+    #[test]
+    fn contradictory_before_and_after_dependencies_are_rejected() {
+        for reverse in [false, true] {
+            let mut specs = vec![
+                spec("base:a", 0, &["base:b"], &["base:b"]),
+                spec("base:b", 1, &[], &[]),
+            ];
+            if reverse {
+                specs.reverse();
+            }
+            match order_phase(&specs) {
+                Err(OrderError::Cycle { remaining }) => {
+                    assert_eq!(remaining.len(), 2);
+                    assert!(remaining.contains(&key("base:a")));
+                    assert!(remaining.contains(&key("base:b")));
+                }
+                other => panic!("expected contradictory edges to form a cycle, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_consistent_dependencies_count_each_edge_once() {
+        let specs = vec![
+            spec("base:b", -1, &[], &["base:a", "base:a"]),
+            spec("base:a", 1, &["base:b", "base:b"], &[]),
+        ];
+        assert_eq!(
+            order_phase(&specs).unwrap(),
+            vec![key("base:a"), key("base:b")]
+        );
     }
 
     #[test]
