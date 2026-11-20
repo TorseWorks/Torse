@@ -24,13 +24,21 @@ impl LightJob {
             .and_then(|n| n.checked_add(self.observed.dependencies.len() * size_of::<SectionPos>()))
             .and_then(|n| n.checked_add(size_of::<Incremental>()))
             .ok_or_else(|| Fault::resource_limit("incremental lighting buffers"))?;
-        let peak = self.allocated_bytes().checked_add(extra).and_then(|n| {
-            n.checked_add(
-                (self.observed.side as usize).pow(3)
-                    + size_of::<LightSection>()
-                    + self.observed.bytes(),
-            )
-        });
+        // Cold frontiers grow on demand, but retained solvers must still be
+        // admitted for their possible future peak, including edit propagation.
+        let unallocated_frontier =
+            (self.frontier_limit - self.queue.capacity()) * size_of::<(u8, u32)>();
+        let peak = self
+            .allocated_bytes()
+            .checked_add(unallocated_frontier)
+            .and_then(|n| n.checked_add(extra))
+            .and_then(|n| {
+                n.checked_add(
+                    (self.observed.side as usize).pow(3)
+                        + size_of::<LightSection>()
+                        + self.observed.bytes(),
+                )
+            });
         if peak.is_none_or(|n| n as u64 > max_bytes) {
             return Err(Fault::resource_limit("incremental lighting byte budget"));
         }
@@ -70,6 +78,7 @@ impl LightJob {
     ) -> Result<(), Fault> {
         if self.failed
             || self.seeded != self.levels.len()
+            || self.frontier_seeded != self.levels.len()
             || !self.queue.is_empty()
             || self.observed.binding != binding
             || source.binding().is_some_and(|b| b != binding)
