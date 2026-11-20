@@ -7,6 +7,26 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use torse_types::{EvictionRank, MemoryClass, MemoryLease, MemoryPool};
 
+/// Trusted host concurrency settings, independent of shared memory capacity.
+/// Worker and queue counts stay fixed for the lifetime of an executor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutorCapacity {
+    pub workers: usize,
+    /// Reservations, running work and unconsumed results share this count.
+    pub max_jobs: usize,
+}
+impl ExecutorCapacity {
+    fn validate(self) -> io::Result<()> {
+        if self.workers == 0 || self.max_jobs == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid CPU executor capacity",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutorConfig {
     pub workers: usize,
@@ -19,12 +39,12 @@ pub struct ExecutorConfig {
 
 impl ExecutorConfig {
     pub(crate) fn validate(self) -> io::Result<()> {
-        if self.workers == 0
-            || self.workers > 64
-            || self.max_jobs == 0
-            || self.max_input_bytes == 0
-            || self.max_output_bytes == 0
-        {
+        ExecutorCapacity {
+            workers: self.workers,
+            max_jobs: self.max_jobs,
+        }
+        .validate()?;
+        if self.max_input_bytes == 0 || self.max_output_bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid CPU executor limits",
@@ -144,7 +164,8 @@ struct Shared<T> {
     ready: Condvar,
     stopped: Arc<AtomicBool>,
     charges: Arc<Charges>,
-    config: ExecutorConfig,
+    capacity: ExecutorCapacity,
+    byte_limits: Option<JobBudget>,
     memory: Option<MemoryPool>,
     _queue_memory: Option<MemoryLease>,
 }
@@ -158,14 +179,53 @@ pub struct Executor<T> {
 
 impl<T: Send + 'static> Executor<T> {
     pub fn new(config: ExecutorConfig) -> io::Result<Self> {
-        Self::build(config, None)
+        Self::from_config(config, None)
     }
+    /// Retain independent fixed input/output quotas in addition to the shared pool.
     pub fn with_memory(config: ExecutorConfig, memory: MemoryPool) -> io::Result<Self> {
-        Self::build(config, Some(memory))
+        Self::from_config(config, Some(memory))
     }
-    fn build(config: ExecutorConfig, memory: Option<MemoryPool>) -> io::Result<Self> {
+    /// Use the shared pool as the only byte-capacity authority. Every reservation
+    /// observes its current hard budget and class limit, including runtime changes.
+    /// Input, scratch and result estimates remain required; queue metadata and
+    /// cancelled work stay charged. Soft targets still require an owner controller.
+    ///
+    /// ```
+    /// use torse_runtime::{Executor, ExecutorCapacity};
+    /// use torse_types::{MemoryBudget, MemoryPool};
+    /// let memory = MemoryPool::new(MemoryBudget::new(32 * 1024 * 1024));
+    /// let cpu = Executor::<u64>::in_memory_pool(
+    ///     ExecutorCapacity { workers: 2, max_jobs: 8 }, memory.clone(),
+    /// ).unwrap();
+    /// // All executors using this pool observe the new allowance on admission.
+    /// memory.set_budget(MemoryBudget::new(64 * 1024 * 1024)).unwrap();
+    /// drop(cpu);
+    /// assert_eq!(memory.usage().total, 0);
+    /// ```
+    pub fn in_memory_pool(capacity: ExecutorCapacity, memory: MemoryPool) -> io::Result<Self> {
+        capacity.validate()?;
+        Self::build(capacity, None, Some(memory))
+    }
+    fn from_config(config: ExecutorConfig, memory: Option<MemoryPool>) -> io::Result<Self> {
         config.validate()?;
-        let queue_bytes = config
+        Self::build(
+            ExecutorCapacity {
+                workers: config.workers,
+                max_jobs: config.max_jobs,
+            },
+            Some(JobBudget {
+                input_bytes: config.max_input_bytes,
+                output_bytes: config.max_output_bytes,
+            }),
+            memory,
+        )
+    }
+    fn build(
+        capacity: ExecutorCapacity,
+        byte_limits: Option<JobBudget>,
+        memory: Option<MemoryPool>,
+    ) -> io::Result<Self> {
+        let queue_bytes = capacity
             .max_jobs
             .checked_mul(size_of::<Task<T>>())
             .ok_or_else(|| io::Error::other("executor queue size overflow"))?;
@@ -182,7 +242,7 @@ impl<T: Send + 'static> Executor<T> {
             .map_err(io::Error::other)?;
         let mut tasks = VecDeque::new();
         tasks
-            .try_reserve_exact(config.max_jobs)
+            .try_reserve_exact(capacity.max_jobs)
             .map_err(io::Error::other)?;
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
@@ -192,7 +252,8 @@ impl<T: Send + 'static> Executor<T> {
             ready: Condvar::new(),
             stopped: Arc::new(AtomicBool::new(false)),
             charges: Arc::new(Charges::default()),
-            config,
+            capacity,
+            byte_limits,
             memory,
             _queue_memory: queue_memory,
         });
@@ -200,7 +261,7 @@ impl<T: Send + 'static> Executor<T> {
             shared,
             workers: Vec::new(),
         };
-        for index in 0..config.workers {
+        for index in 0..capacity.workers {
             let state = Arc::clone(&executor.shared);
             executor.workers.push(
                 thread::Builder::new()
@@ -219,19 +280,41 @@ impl<T: Send + 'static> Executor<T> {
         if shared.stopped.load(Ordering::Acquire) {
             return Err(ReserveError::Stopped);
         }
-        if budget.input_bytes > shared.config.max_input_bytes
-            || budget.output_bytes > shared.config.max_output_bytes
+        let charges = &shared.charges;
+        if let Some(limits) = shared.byte_limits {
+            if budget.input_bytes > limits.input_bytes || budget.output_bytes > limits.output_bytes
+            {
+                return Err(ReserveError::TooLarge);
+            }
+            if budget.input_bytes
+                > limits
+                    .input_bytes
+                    .saturating_sub(charges.input.load(Ordering::Acquire))
+                || budget.output_bytes
+                    > limits
+                        .output_bytes
+                        .saturating_sub(charges.output.load(Ordering::Acquire))
+            {
+                return Err(ReserveError::Busy);
+            }
+        }
+        if charges.jobs.load(Ordering::Acquire) >= shared.capacity.max_jobs {
+            return Err(ReserveError::Busy);
+        }
+        // Admission is serialized, but releases can happen concurrently. A
+        // conservative snapshot also protects accounting on narrower hosts.
+        if charges
+            .input
+            .load(Ordering::Acquire)
+            .checked_add(budget.input_bytes)
+            .is_none()
+            || charges
+                .output
+                .load(Ordering::Acquire)
+                .checked_add(budget.output_bytes)
+                .is_none()
         {
             return Err(ReserveError::TooLarge);
-        }
-        let charges = &shared.charges;
-        if charges.jobs.load(Ordering::Acquire) >= shared.config.max_jobs
-            || budget.input_bytes
-                > shared.config.max_input_bytes - charges.input.load(Ordering::Acquire)
-            || budget.output_bytes
-                > shared.config.max_output_bytes - charges.output.load(Ordering::Acquire)
-        {
-            return Err(ReserveError::Busy);
         }
         let bytes = budget
             .input_bytes

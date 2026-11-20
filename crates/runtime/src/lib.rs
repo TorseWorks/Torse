@@ -5,8 +5,8 @@
 mod executor;
 mod scoped;
 pub use executor::{
-    Cancellation, Executor, ExecutorConfig, Job, JobBudget, JobError, JobOutput, Priority,
-    Reservation, ReserveError, Usage,
+    Cancellation, Executor, ExecutorCapacity, ExecutorConfig, Job, JobBudget, JobError, JobOutput,
+    Priority, Reservation, ReserveError, Usage,
 };
 pub use scoped::run_scoped;
 
