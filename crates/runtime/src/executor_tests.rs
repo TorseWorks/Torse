@@ -421,7 +421,7 @@ fn pooled_executor_follows_live_budget_growth_and_preserves_fixed_quota_mode() {
     };
     assert!(matches!(
         executor.try_reserve(large),
-        Err(ReserveError::TooLarge)
+        Err(ReserveError::Busy)
     ));
     assert_eq!(memory.usage().total, queue);
     memory.set_budget(MemoryBudget::new(16_384)).unwrap();
@@ -434,7 +434,7 @@ fn pooled_executor_follows_live_budget_growth_and_preserves_fixed_quota_mode() {
     memory.set_budget(MemoryBudget::new(4096)).unwrap();
     assert!(matches!(
         executor.try_reserve(large),
-        Err(ReserveError::TooLarge)
+        Err(ReserveError::Busy)
     ));
     assert!(matches!(
         executor.try_reserve(JobBudget {
@@ -533,4 +533,77 @@ fn executor_capacity_accepts_host_selected_parallelism_above_sixty_four() {
         .validate()
         .is_err()
     );
+}
+
+#[test]
+fn detailed_admission_identifies_slots_local_quotas_and_shared_pressure() {
+    let local = Executor::<()>::new(config(2)).unwrap();
+    let held = local
+        .try_reserve(JobBudget {
+            input_bytes: 12,
+            output_bytes: 1,
+        })
+        .unwrap();
+    assert!(matches!(
+        local.try_reserve_detailed(budget()),
+        Err(ReserveFailure::Busy(ReserveResource::InputBytes))
+    ));
+    drop(held);
+    let held = local
+        .try_reserve(JobBudget {
+            input_bytes: 1,
+            output_bytes: 12,
+        })
+        .unwrap();
+    assert!(matches!(
+        local.try_reserve_detailed(budget()),
+        Err(ReserveFailure::Busy(ReserveResource::OutputBytes))
+    ));
+    drop(held);
+    assert!(matches!(
+        local.try_reserve_detailed(JobBudget {
+            input_bytes: 17,
+            output_bytes: 0
+        }),
+        Err(ReserveFailure::FixedLimit(ReserveResource::InputBytes))
+    ));
+    let single = Executor::<()>::new(config(1)).unwrap();
+    let _held = single
+        .try_reserve(JobBudget {
+            input_bytes: 1,
+            output_bytes: 1,
+        })
+        .unwrap();
+    assert!(matches!(
+        single.try_reserve_detailed(JobBudget {
+            input_bytes: 1,
+            output_bytes: 1
+        }),
+        Err(ReserveFailure::Busy(ReserveResource::Jobs))
+    ));
+    let pooled = Executor::<()>::in_memory_pool(
+        ExecutorCapacity {
+            workers: 1,
+            max_jobs: 2,
+        },
+        MemoryPool::new(torse_types::MemoryBudget::new(4096)),
+    )
+    .unwrap();
+    let failure = pooled
+        .try_reserve_detailed(JobBudget {
+            input_bytes: 4096,
+            output_bytes: 4096,
+        })
+        .err()
+        .unwrap();
+    assert_eq!(failure, ReserveFailure::Busy(ReserveResource::SharedMemory));
+    assert!(failure.is_retryable());
+    assert_eq!(ReserveError::from(failure), ReserveError::Busy);
+    assert!(matches!(
+        pooled.try_reserve_detailed(JobBudget {
+            input_bytes: usize::MAX,
+            output_bytes: 1
+        }),
+        Err(ReserveFailure::InvalidSize)
+    ));
 }

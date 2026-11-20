@@ -73,6 +73,39 @@ pub enum ReserveError {
     Stopped,
 }
 
+/// The capacity that blocked an otherwise representable request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReserveResource {
+    Jobs,
+    InputBytes,
+    OutputBytes,
+    SharedMemory,
+}
+
+/// Detailed admission outcome. Busy requests may be retried after work drains
+/// or the shared pool grows; fixed limits require a configuration change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReserveFailure {
+    Stopped,
+    InvalidSize,
+    FixedLimit(ReserveResource),
+    Busy(ReserveResource),
+}
+impl ReserveFailure {
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Busy(_))
+    }
+}
+impl From<ReserveFailure> for ReserveError {
+    fn from(failure: ReserveFailure) -> Self {
+        match failure {
+            ReserveFailure::Stopped => Self::Stopped,
+            ReserveFailure::InvalidSize | ReserveFailure::FixedLimit(_) => Self::TooLarge,
+            ReserveFailure::Busy(_) => Self::Busy,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobError {
     Cancelled,
@@ -275,31 +308,45 @@ impl<T: Send + 'static> Executor<T> {
     /// Reserve before copying input. Busy leaves the demand with the caller.
     /// Byte accounting is conservative and supplied by trusted task adapters.
     pub fn try_reserve(&self, budget: JobBudget) -> Result<Reservation<T>, ReserveError> {
+        self.try_reserve_detailed(budget).map_err(Into::into)
+    }
+    /// Diagnose slot, local quota and shared-memory pressure independently.
+    /// Shared-pool mode reports insufficient current bytes as retryable pressure,
+    /// including a request that can fit only after the owner grows the budget.
+    pub fn try_reserve_detailed(
+        &self,
+        budget: JobBudget,
+    ) -> Result<Reservation<T>, ReserveFailure> {
         let shared = &self.shared;
         let _queue = shared.queue.lock().expect("CPU queue lock");
         if shared.stopped.load(Ordering::Acquire) {
-            return Err(ReserveError::Stopped);
+            return Err(ReserveFailure::Stopped);
         }
         let charges = &shared.charges;
         if let Some(limits) = shared.byte_limits {
-            if budget.input_bytes > limits.input_bytes || budget.output_bytes > limits.output_bytes
-            {
-                return Err(ReserveError::TooLarge);
+            if budget.input_bytes > limits.input_bytes {
+                return Err(ReserveFailure::FixedLimit(ReserveResource::InputBytes));
+            }
+            if budget.output_bytes > limits.output_bytes {
+                return Err(ReserveFailure::FixedLimit(ReserveResource::OutputBytes));
             }
             if budget.input_bytes
                 > limits
                     .input_bytes
                     .saturating_sub(charges.input.load(Ordering::Acquire))
-                || budget.output_bytes
-                    > limits
-                        .output_bytes
-                        .saturating_sub(charges.output.load(Ordering::Acquire))
             {
-                return Err(ReserveError::Busy);
+                return Err(ReserveFailure::Busy(ReserveResource::InputBytes));
+            }
+            if budget.output_bytes
+                > limits
+                    .output_bytes
+                    .saturating_sub(charges.output.load(Ordering::Acquire))
+            {
+                return Err(ReserveFailure::Busy(ReserveResource::OutputBytes));
             }
         }
         if charges.jobs.load(Ordering::Acquire) >= shared.capacity.max_jobs {
-            return Err(ReserveError::Busy);
+            return Err(ReserveFailure::Busy(ReserveResource::Jobs));
         }
         // Admission is serialized, but releases can happen concurrently. A
         // conservative snapshot also protects accounting on narrower hosts.
@@ -314,13 +361,13 @@ impl<T: Send + 'static> Executor<T> {
                 .checked_add(budget.output_bytes)
                 .is_none()
         {
-            return Err(ReserveError::TooLarge);
+            return Err(ReserveFailure::InvalidSize);
         }
         let bytes = budget
             .input_bytes
             .checked_add(budget.output_bytes)
             .and_then(|bytes| bytes.checked_add(size_of::<State<T>>()))
-            .ok_or(ReserveError::TooLarge)?;
+            .ok_or(ReserveFailure::InvalidSize)?;
         let memory = shared
             .memory
             .as_ref()
@@ -329,10 +376,14 @@ impl<T: Send + 'static> Executor<T> {
                 if bytes as u64 > limit.class_limit(MemoryClass::Executor)
                     || bytes as u64 > limit.total_bytes()
                 {
-                    return Err(ReserveError::TooLarge);
+                    return Err(if shared.byte_limits.is_none() {
+                        ReserveFailure::Busy(ReserveResource::SharedMemory)
+                    } else {
+                        ReserveFailure::FixedLimit(ReserveResource::SharedMemory)
+                    });
                 }
                 pool.reserve(MemoryClass::Executor, bytes as u64, EvictionRank::Pinned)
-                    .map_err(|_| ReserveError::Busy)
+                    .map_err(|_| ReserveFailure::Busy(ReserveResource::SharedMemory))
             })
             .transpose()?;
         charges.jobs.fetch_add(1, Ordering::AcqRel);
