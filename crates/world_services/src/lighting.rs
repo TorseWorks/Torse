@@ -156,6 +156,9 @@ pub struct LightJob {
     queue: BinaryHeap<(u8, u32)>,
     frontier_limit: usize,
     seeded: usize,
+    // Sky seeds above the current layer have fully sampled neighbors. The
+    // bottom layer is finalized after terrain seeding, before propagation.
+    frontier_seeded: usize,
     complete: bool,
     failed: bool,
     sky: bool,
@@ -312,9 +315,10 @@ impl LightJob {
             dims,
             absorption: vec![15; cells],
             levels: vec![0; cells],
-            queue: BinaryHeap::with_capacity(frontier),
+            queue: BinaryHeap::new(),
             frontier_limit: frontier,
             seeded: 0,
+            frontier_seeded: if sky { 0 } else { cells },
             complete: true,
             failed: false,
             sky,
@@ -327,7 +331,9 @@ impl LightJob {
         })
     }
 
-    /// At most `work` seed cells or frontier pops, plus the bounded dependency check.
+    /// At most `work` seed cells, final-layer source checks or frontier pops,
+    /// plus the bounded dependency check. A sky seed also checks the source
+    /// immediately above it, whose neighbors have now all been sampled.
     /// Return true only after every seed and every propagation entry is resolved.
     pub fn poll(
         &mut self,
@@ -389,8 +395,10 @@ impl LightJob {
                         self.sky_columns[column].saturating_sub(direct_absorption);
                     let level = self.sky_columns[column];
                     self.levels[index] = level;
-                    if level > 0 {
-                        self.push(level, index)?;
+                    let layer = self.dims[0] * self.dims[2];
+                    if index + layer < self.levels.len() {
+                        self.seed_sky_frontier(index + layer)?;
+                        self.frontier_seeded += 1;
                     }
                 }
                 if let Some(incremental) = self.incremental.as_mut() {
@@ -398,6 +406,11 @@ impl LightJob {
                     incremental.direct[index] = direct_absorption;
                 }
                 self.seeded += 1;
+            } else if self.frontier_seeded < self.levels.len() {
+                let layer = self.dims[0] * self.dims[2];
+                let index = self.frontier_seeded - (self.levels.len() - layer);
+                self.seed_sky_frontier(index)?;
+                self.frontier_seeded += 1;
             } else if let Some((level, index)) = self.queue.pop() {
                 let index = index as usize;
                 if self.levels[index] != level {
@@ -435,11 +448,47 @@ impl LightJob {
                 return Ok(true);
             }
         }
-        Ok(self.seeded == self.levels.len() && self.queue.is_empty())
+        Ok(self.seeded == self.levels.len()
+            && self.frontier_seeded == self.levels.len()
+            && self.queue.is_empty())
+    }
+    fn seed_sky_frontier(&mut self, index: usize) -> Result<(), Fault> {
+        let level = self.levels[index];
+        if level <= 1 {
+            return Ok(());
+        }
+        let [x, y, z] = self.coordinates(index);
+        let layer = self.dims[0] * self.dims[2];
+        let neighbors = [
+            (x > 0).then(|| index - 1),
+            (x + 1 < self.dims[0]).then(|| index + 1),
+            (z > 0).then(|| index - self.dims[0]),
+            (z + 1 < self.dims[2]).then(|| index + self.dims[0]),
+            (y > 0).then(|| index - layer),
+            (y + 1 < self.dims[1]).then(|| index + layer),
+        ];
+        if neighbors
+            .into_iter()
+            .flatten()
+            .any(|other| level.saturating_sub(self.absorption[other]) > self.levels[other])
+        {
+            self.push(level, index)?;
+        }
+        Ok(())
     }
     fn push(&mut self, level: u8, index: usize) -> Result<(), Fault> {
         if self.queue.len() == self.frontier_limit {
             return Err(Fault::resource_limit("lighting frontier exhausted"));
+        }
+        if self.queue.len() == self.queue.capacity() {
+            let additional = self
+                .queue
+                .capacity()
+                .max(64)
+                .min(self.frontier_limit - self.queue.len());
+            self.queue
+                .try_reserve_exact(additional)
+                .map_err(|_| Fault::resource_limit("lighting frontier allocation failed"))?;
         }
         self.queue.push((level, index as u32));
         Ok(())
@@ -476,6 +525,7 @@ impl LightJob {
     ) -> Result<LightSection, Fault> {
         if self.failed
             || self.seeded != self.levels.len()
+            || self.frontier_seeded != self.levels.len()
             || !self.queue.is_empty()
             || self.incremental.as_ref().is_some_and(|i| i.scan.is_some())
             || !self.observed.valid(binding, store, optics)
@@ -718,3 +768,7 @@ mod identity_tests {
         assert_eq!(counter.load(Ordering::Relaxed), 801);
     }
 }
+
+#[cfg(test)]
+#[path = "lighting/cold_tests.rs"]
+mod cold_tests;
