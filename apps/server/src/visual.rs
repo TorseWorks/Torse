@@ -894,11 +894,14 @@ impl VisualSession {
         }
         // Metadata inspection has a separate bounded slice. The priority order
         // is rebuilt only when interest/center changes, never for every batch.
-        let scan = self
-            .order
-            .len()
-            .min(self.limits.pages_per_poll * 64)
-            .min(metadata_checks);
+        let checks = if metadata_checks == usize::MAX {
+            // Preserve the legacy poll slice. An explicit owner budget is
+            // independent of the number of pages allowed in an output batch.
+            self.limits.pages_per_poll * 64
+        } else {
+            metadata_checks
+        };
+        let scan = self.order.len().min(checks);
         self.last_scan = scan;
         let mut reset_retained = Vec::new();
         for _ in 0..scan {

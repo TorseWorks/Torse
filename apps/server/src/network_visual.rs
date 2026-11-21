@@ -13,6 +13,8 @@ use crate::{
 pub struct DisplayWorkBudget {
     pub sessions: usize,
     pub light_admissions: usize,
+    /// Source checks, independent of page delivery limits. Zero pauses terrain
+    /// work; `usize::MAX` selects the legacy default scan slice.
     pub metadata_checks_per_session: usize,
     pub light_checks_per_session: usize,
     pub lighting: crate::lighting::HostLightWorkBudget,

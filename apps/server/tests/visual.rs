@@ -9,6 +9,107 @@ use torse_sim::replica::ReplicaScope;
 use torse_types::*;
 
 #[test]
+fn explicit_metadata_budget_retains_distant_pages_with_a_single_page_batch() {
+    let dir = Directory::new();
+    let (mut server, pages, expected) = create(&dir);
+    let pos = SectionPos::new(20, 0, 0);
+    let (mut hub, id, mut client, _, _) = connect(&mut server, scope(0, 1));
+    let mut display = torse_net::terrain::TerrainMirror::new(
+        server.binding(),
+        16,
+        server.authority().unwrap().world().store().bounds(),
+        torse_net::terrain::TerrainLimits {
+            max_sections: 128,
+            max_bytes: 1_000_000,
+            metadata_bytes: 128 * 512,
+        },
+        None,
+    )
+    .unwrap();
+    let mut limits = limits();
+    limits.max_sections = 128;
+    limits.pages_per_poll = 1;
+    hub.enable_visual_interest(&server, id, pages, approval(), scope(20, 1), pos, limits)
+        .unwrap();
+    fill(&mut hub, &mut server, &mut client, &mut display);
+    let mut wide = ReplicaScope {
+        sections: (-8..=0)
+            .flat_map(|x| (0..9).map(move |y| SectionPos::new(x, y, 0)))
+            .collect(),
+    };
+    wide.sections.insert(pos);
+    let count = wide.sections.len();
+    hub.set_visual_interest(id, wide, SectionPos::ZERO).unwrap();
+    // A zero slice must not consume the reset or any source checks.
+    let paused = hub
+        .poll_display(
+            &server,
+            DisplayWorkBudget {
+                sessions: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(paused.metadata_checks, 0);
+    assert!(drain(&mut client).0.is_empty());
+    let progress = hub
+        .poll_display(
+            &server,
+            DisplayWorkBudget {
+                sessions: 1,
+                metadata_checks_per_session: count,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(progress.metadata_checks, count);
+    let reset = drain(&mut client)
+        .0
+        .into_iter()
+        .find_map(|message| {
+            if let ServerMessage::Terrain(update) = message {
+                Some(update)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(reset.reset.as_ref().unwrap().retained.len(), 1);
+    assert_eq!(reset.reset.as_ref().unwrap().retained[0].0, pos);
+    assert!(reset.pages.is_empty());
+    display.apply(reset).unwrap();
+    assert_eq!(display.page(pos), expected.get(&pos));
+
+    // Subsequent data delivery still honors the independent single-page limit.
+    hub.set_visual_interest(id, scope(20, 2), pos).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while display.page(SectionPos::new(21, 0, 0)).is_none() {
+        hub.poll_display(
+            &server,
+            DisplayWorkBudget {
+                sessions: 1,
+                metadata_checks_per_session: 128,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for message in drain(&mut client).0 {
+            if let ServerMessage::Terrain(update) = message {
+                assert!(update.pages.len() <= 1);
+                display.apply(update).unwrap();
+            }
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(display.page(pos), expected.get(&pos));
+    assert_eq!(
+        display.page(SectionPos::new(21, 0, 0)),
+        expected.get(&SectionPos::new(21, 0, 0))
+    );
+}
+
+#[test]
 fn successive_resets_cannot_retain_a_page_omitted_from_the_previous_reset() {
     let dir = Directory::new();
     let (mut server, pages, expected) = create(&dir);
