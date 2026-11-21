@@ -6,7 +6,7 @@ use std::{
     thread,
 };
 use torse_types::*;
-use torse_world::{ArchiveManifest, SectionPhase, Snapshot, SnapshotArchive};
+use torse_world::{ArchiveManifest, Snapshot, SnapshotArchive};
 use torse_world_services::lighting::{
     LightFieldDiagnostics, LightFieldLimits, LightOptics, LightOpticsTable, LightPublication,
     LightSource, LightTerrain, SharedLightField,
@@ -119,14 +119,8 @@ pub struct HostLightField {
 }
 fn source(host: &ExecutionHost, pos: SectionPos) -> Source {
     let store = host.world().store();
-    if matches!(
-        store.phase(pos),
-        Some(SectionPhase::Ready | SectionPhase::Active)
-    ) {
-        Source::Resident(
-            store.revision(pos).expect("readable section revision"),
-            store.retired_revision(pos),
-        )
+    if let Some(section) = store.readable_section(pos) {
+        Source::Resident(section.revision(), store.retired_revision(pos))
     } else {
         host.parked_sections()
             .get(&pos)

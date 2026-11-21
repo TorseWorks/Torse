@@ -41,12 +41,57 @@ impl LightSource for SectionStore {
         self.bounds()
     }
     fn version(&self, pos: SectionPos) -> LightInputVersion {
+        if let Some(section) = self.readable_section(pos) {
+            return LightInputVersion::Resident {
+                revision: Some(section.revision()),
+                readable: true,
+            };
+        }
         LightInputVersion::Resident {
             revision: self.revision(pos),
-            readable: super::readable(self, pos),
+            readable: false,
         }
     }
     fn query(&self, pos: BlockPos) -> TerrainQuery {
         self.query(pos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use torse_world::{Section, SectionPhase, TicketKind};
+
+    #[test]
+    fn resident_versions_preserve_unfinished_data_and_lifecycle_identity() {
+        let mut store = SectionStore::new(16, WorldBounds::new(0, 256).unwrap()).unwrap();
+        let pos = SectionPos::ZERO;
+        let check = |store: &SectionStore| {
+            assert_eq!(
+                store.version(pos),
+                LightInputVersion::Resident {
+                    revision: store.revision(pos),
+                    readable: matches!(
+                        store.phase(pos),
+                        Some(SectionPhase::Ready | SectionPhase::Active)
+                    ),
+                }
+            );
+        };
+        check(&store);
+        for _ in 0..2 {
+            store.request(pos).unwrap();
+            check(&store);
+            store.install(pos, Section::empty(16).unwrap()).unwrap();
+            check(&store);
+            store.finish_load(pos).unwrap();
+            check(&store);
+            let ticket = store.acquire_ticket(pos, TicketKind::Background).unwrap();
+            check(&store);
+            store.release_ticket(ticket).unwrap();
+            check(&store);
+            store.unload(pos).unwrap();
+            check(&store);
+        }
     }
 }
