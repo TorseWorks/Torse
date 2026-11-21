@@ -604,6 +604,16 @@ impl SectionStore {
         self.sections.get(&pos).map(|entry| &entry.section)
     }
 
+    /// Borrow ready or active terrain with a single section-index lookup.
+    ///
+    /// Unknown, requested and loading sections return `None`. Unlike [`Self::section`],
+    /// this does not expose placeholder or unfinished data. The borrow prevents
+    /// lifecycle changes while the returned section is in use; it grants no authority.
+    pub fn readable_section(&self, pos: SectionPos) -> Option<&Section> {
+        let entry = self.sections.get(&pos)?;
+        matches!(entry.phase, SectionPhase::Ready | SectionPhase::Active).then_some(&entry.section)
+    }
+
     /// Every tracked section coordinate, ascending.
     ///
     /// The iterator includes sections that are still loading; callers that need
@@ -934,6 +944,46 @@ mod tests {
             TerrainQuery::Exterior
         );
         assert_eq!(store.phase(SectionPos::ZERO), None);
+    }
+
+    #[test]
+    fn readable_borrow_tracks_loading_tickets_edits_and_reload() {
+        let mut store = store();
+        let pos = SectionPos::ZERO;
+        assert!(store.readable_section(pos).is_none());
+        assert!(store.section(pos).is_none());
+        for fill in [BlockStateId(1), BlockStateId(2)] {
+            store.request(pos).unwrap();
+            assert!(store.readable_section(pos).is_none());
+            assert!(store.section(pos).is_some());
+            assert!(store.revision(pos).is_some());
+            store.install(pos, Section::new(16, fill).unwrap()).unwrap();
+            assert!(store.readable_section(pos).is_none());
+            assert_eq!(
+                store
+                    .section(pos)
+                    .unwrap()
+                    .get(LocalPos { x: 0, y: 0, z: 0 })
+                    .unwrap(),
+                fill
+            );
+            store.finish_load(pos).unwrap();
+            let section = store.readable_section(pos).unwrap();
+            assert!(std::ptr::eq(section, store.section(pos).unwrap()));
+            assert_eq!(Some(section.revision()), store.revision(pos));
+            assert_eq!(section.get(LocalPos { x: 0, y: 0, z: 0 }).unwrap(), fill);
+            let ticket = store.acquire_ticket(pos, TicketKind::Player).unwrap();
+            assert!(store.readable_section(pos).is_some());
+            let revision = store.edit(BlockPos::ZERO, BlockStateId(3)).unwrap();
+            assert_eq!(store.readable_section(pos).unwrap().revision(), revision);
+            assert!(store.unload(pos).is_err());
+            assert!(store.readable_section(pos).is_some());
+            store.release_ticket(ticket).unwrap();
+            assert!(store.readable_section(pos).is_some());
+            store.unload(pos).unwrap();
+            assert!(store.readable_section(pos).is_none());
+            assert!(store.section(pos).is_none());
+        }
     }
 
     #[test]

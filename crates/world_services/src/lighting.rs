@@ -18,7 +18,7 @@ pub use terrain::LightTerrain;
 mod incremental;
 mod shared;
 pub use shared::{LightFieldDiagnostics, LightFieldLimits, LightPublication, SharedLightField};
-use torse_world::{SectionPhase, SectionStore, TerrainQuery, WorldBounds};
+use torse_world::{SectionStore, TerrainQuery, WorldBounds};
 
 pub const MAX_LIGHT: u8 = 15;
 pub const LIGHT_RULES_VERSION: u32 = 1;
@@ -724,12 +724,6 @@ fn section_origin(pos: SectionPos, side: i64) -> Result<BlockPos, Fault> {
             .checked_mul(side)
             .ok_or_else(|| invalid("lighting coordinate overflow"))?,
     ))
-}
-fn readable(store: &SectionStore, pos: SectionPos) -> bool {
-    matches!(
-        store.phase(pos),
-        Some(SectionPhase::Ready | SectionPhase::Active)
-    )
 }
 fn invalid(error: impl std::fmt::Display) -> Fault {
     Fault::invalid_data(error.to_string())
