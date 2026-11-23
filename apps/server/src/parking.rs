@@ -1,4 +1,6 @@
 //! Background preparation of a single durable generated parking batch.
+#[cfg(feature = "parking-profile")]
+use std::time::{Duration, Instant};
 use std::{collections::BTreeSet, thread::JoinHandle};
 
 use torse_sim::durable::{ParkingReservation, SectionChange};
@@ -33,9 +35,27 @@ pub enum ParkingProgress {
     },
 }
 
+/// Timings for a successfully published generated parking batch.
+#[cfg(feature = "parking-profile")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParkingTimings {
+    /// From admission until the background worker started, including ID reservation.
+    pub writer_start_wait: Duration,
+    /// Encoding, file publication, and worker-side result preparation.
+    pub writer_work: Duration,
+    /// From worker completion until the host took its result.
+    pub result_wait: Duration,
+    /// Host validation and publication work, including attempts blocked by a busy journal.
+    pub publication_work: Duration,
+    /// Waiting for the published journal record to become durable.
+    pub durability_wait: Duration,
+}
+
 struct SavedBatch {
     changes: Vec<SectionChange>,
     page_file_syncs: u32,
+    #[cfg(feature = "parking-profile")]
+    writer_interval: (Instant, Instant),
 }
 
 pub(crate) struct ParkingJob {
@@ -49,6 +69,10 @@ pub(crate) struct ParkingJob {
     before_write: Option<std::sync::mpsc::Receiver<()>>,
     positions: Vec<(SectionPos, Option<Revision>)>,
     _memory: Option<MemoryLease>,
+    #[cfg(feature = "parking-profile")]
+    admitted_at: Instant,
+    #[cfg(feature = "parking-profile")]
+    timings: ParkingTimings,
 }
 
 impl Drop for ParkingJob {
@@ -62,6 +86,12 @@ impl Drop for ParkingJob {
 impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
     Server<ExecutionHost, J, S>
 {
+    /// The most recent successful generated parking batch, if one has finished.
+    #[cfg(feature = "parking-profile")]
+    pub fn last_generated_parking_timings(&self) -> Option<ParkingTimings> {
+        self.last_parking_timings
+    }
+
     /// Submit one ordered batch of generated pages at the current generation
     /// cut. The first poll admits attached IDs durably before starting the writer.
     /// Input IDs extend the generation cut's allocator in page order.
@@ -144,6 +174,10 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
             before_write: None,
             positions: observed,
             _memory: memory,
+            #[cfg(feature = "parking-profile")]
+            admitted_at: Instant::now(),
+            #[cfg(feature = "parking-profile")]
+            timings: ParkingTimings::default(),
         });
         Ok(())
     }
@@ -257,6 +291,8 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
             )?);
             return Ok(ParkingProgress::Pending);
         }
+        #[cfg(feature = "parking-profile")]
+        let publication_started = Instant::now();
         if let Some(worker) = job.worker.take() {
             let saved = worker.join().map_err(|_| {
                 Fault::new(
@@ -264,6 +300,13 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
                     "generated parking worker panicked",
                 )
             })??;
+            #[cfg(feature = "parking-profile")]
+            {
+                let (started, finished) = saved.writer_interval;
+                job.timings.writer_start_wait = started.duration_since(job.admitted_at);
+                job.timings.writer_work = finished.duration_since(started);
+                job.timings.result_wait = publication_started.duration_since(finished);
+            }
             for change in &saved.changes {
                 if job.pages.digest(&change.page)? != change.reference.digest {
                     return Err(Fault::invalid_data("generated parking digest mismatch"));
@@ -273,17 +316,31 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         }
         let saved = job.saved.take().expect("written parking bundle");
         self.authority.queue_parked_sections(saved.changes)?;
-        match self.publish_one(sink, None)? {
+        let publication = self.publish_one(sink, None)?;
+        #[cfg(feature = "parking-profile")]
+        {
+            job.timings.publication_work += publication_started.elapsed();
+        }
+        match publication {
             PublishedStep::Blocked(StageError::Busy, prepared) => {
                 job.saved = Some(SavedBatch {
                     changes: ExecutionHost::take_blocked_parking(prepared),
                     page_file_syncs: saved.page_file_syncs,
+                    #[cfg(feature = "parking-profile")]
+                    writer_interval: saved.writer_interval,
                 });
                 Ok(ParkingProgress::Pending)
             }
             PublishedStep::Blocked(error, _) => Err(parking_stage_fault(error)),
             PublishedStep::Published(publication) => {
+                #[cfg(feature = "parking-profile")]
+                let durability_started = Instant::now();
                 let durability = self.flush_to(publication.at)?;
+                #[cfg(feature = "parking-profile")]
+                {
+                    job.timings.durability_wait = durability_started.elapsed();
+                    self.last_parking_timings = Some(job.timings);
+                }
                 Ok(ParkingProgress::Finished {
                     commit: CommitStep::Durable(DurablePublication {
                         publication,
@@ -315,6 +372,8 @@ fn start_writer(
     std::thread::Builder::new()
         .name("torse-generated-parking".into())
         .spawn(move || {
+            #[cfg(feature = "parking-profile")]
+            let started = Instant::now();
             #[cfg(test)]
             if let Some(gate) = before_write {
                 gate.recv()
@@ -334,6 +393,8 @@ fn start_writer(
             Ok(SavedBatch {
                 changes,
                 page_file_syncs: u32::from(synced),
+                #[cfg(feature = "parking-profile")]
+                writer_interval: (started, Instant::now()),
             })
         })
         .map_err(|error| {
