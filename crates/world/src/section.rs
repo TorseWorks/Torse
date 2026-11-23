@@ -36,6 +36,11 @@ pub struct DenseCells {
 }
 
 impl DenseCells {
+    /// Distinct states currently present, in ascending identifier order.
+    pub fn states(&self) -> &[BlockStateId] {
+        &self.states
+    }
+
     fn from_cells(cells: Vec<BlockStateId>) -> Self {
         let mut order = cells.clone();
         order.sort_unstable();
@@ -731,6 +736,24 @@ mod tests {
             &SectionStorage::Uniform(BlockStateId(60000))
         );
         assert_eq!(section.allocated_bytes(), 0);
+    }
+
+    #[test]
+    fn dense_state_census_tracks_completed_edits() {
+        let values = (0..4096)
+            .map(|index| BlockStateId(if index < 512 { index } else { 0 }))
+            .collect::<Vec<_>>();
+        let mut section = Section::from_storage(16, SectionStorage::Dense(values.into())).unwrap();
+        section.set(local(1, 0, 0), BlockStateId(60000)).unwrap();
+        let SectionStorage::Dense(cells) = section.storage() else {
+            panic!("section still has more states than the palette can represent");
+        };
+        let mut expected: Vec<_> = section.values().collect();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(cells.states(), expected);
+        assert!(!cells.states().contains(&BlockStateId(1)));
+        assert_eq!(cells.states().last(), Some(&BlockStateId(60000)));
     }
 
     #[test]

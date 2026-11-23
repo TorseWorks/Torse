@@ -259,7 +259,7 @@ fn resident(
             used.insert(*id);
         }
         torse_world::SectionStorage::Dense(ids) => {
-            used.extend(ids.iter().copied());
+            used.extend(ids.states());
         }
         torse_world::SectionStorage::Palette(ids) => {
             used.extend(ids.states());
@@ -1282,6 +1282,40 @@ impl VisualSession {
 #[cfg(test)]
 mod proof_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "release-only dense display symbol census benchmark"]
+    fn dense_projection_symbol_census() {
+        use std::{hint::black_box, time::Instant};
+        use torse_world::{BlockStateId, DenseCells};
+
+        for side in [16usize, 32] {
+            let ids: Vec<_> = (0..side.pow(3))
+                .map(|index| BlockStateId((index.wrapping_mul(173) % 512) as u16))
+                .collect();
+            let cells = DenseCells::from(ids);
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            for _ in 0..31 {
+                let cells = black_box(&cells);
+                let started = Instant::now();
+                let mut old = BTreeSet::new();
+                old.extend(cells.iter().copied());
+                before.push(started.elapsed().as_nanos());
+                let started = Instant::now();
+                let mut new = BTreeSet::new();
+                new.extend(cells.states().iter().copied());
+                after.push(started.elapsed().as_nanos());
+                assert_eq!(old, new);
+            }
+            before.sort_unstable();
+            after.sort_unstable();
+            println!(
+                "dense census: side={side} before={}ns after={}ns",
+                before[15], after[15]
+            );
+        }
+    }
 
     #[test]
     fn forgotten_batch_entries_require_a_cut_at_or_after_the_publication() {

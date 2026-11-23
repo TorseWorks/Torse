@@ -754,7 +754,7 @@ fn project_sections(
             SectionStorage::Uniform(state) => mark(*state)?,
             SectionStorage::Dense(cells) => {
                 cost.bytes(cells.len() * size_of::<u16>())?;
-                for state in cells {
+                for state in cells.states() {
                     mark(*state)?;
                 }
             }
