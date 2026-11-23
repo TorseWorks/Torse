@@ -50,7 +50,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::create_dir(&output)?;
     let mut raw = File::create(output.join("ticks.csv"))?;
     let mut summary = File::create(output.join("summary.csv"))?;
-    writeln!(raw, "bodies,clustered,workers,tick,planning_ns,tick_ns")?;
+    write!(raw, "bodies,clustered,workers,tick,planning_ns,tick_ns")?;
+    for stage in Stage::ALL
+        .into_iter()
+        .filter(|stage| *stage != Stage::Planning)
+    {
+        write!(raw, ",{}_ns", stage.name())?;
+    }
+    writeln!(raw, ",unattributed_ns,encoded_bytes")?;
     writeln!(
         summary,
         "bodies,clustered,workers,planning_p50_ns,tick_p50_ns,tick_p95_ns,native_jobs,peak_lanes,state_crc32c,journal_crc32c"
@@ -108,9 +115,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let start = Instant::now();
                 server.drive_tick(&mut NoReplicas, 4096)?;
                 let time = start.elapsed().as_nanos() as u64;
-                let plan = profiler.totals()[Stage::Planning as usize].total_ns as u64;
+                let totals = profiler.totals();
+                let plan = totals[Stage::Planning as usize].total_ns as u64;
                 if tick >= warmup {
-                    writeln!(raw, "{bodies},{clustered},{workers},{tick},{plan},{time}")?;
+                    write!(raw, "{bodies},{clustered},{workers},{tick},{plan},{time}")?;
+                    for stage in Stage::ALL
+                        .into_iter()
+                        .filter(|stage| *stage != Stage::Planning)
+                    {
+                        write!(raw, ",{}", totals[stage as usize].total_ns)?;
+                    }
+                    let measured: u128 = totals.iter().map(|stage| stage.total_ns).sum();
+                    let unattributed = u128::from(time).saturating_sub(measured);
+                    writeln!(
+                        raw,
+                        ",{unattributed},{}",
+                        totals[Stage::Encoding as usize].bytes
+                    )?;
                     elapsed.push(time);
                     planning.push(plan);
                 }

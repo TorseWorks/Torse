@@ -987,15 +987,6 @@ impl ExecutionHost {
         runtime: RuntimeState,
         remove_pending: Vec<RequestId>,
     ) -> Result<ExecutionPrepared, Fault> {
-        self.record_outcome(prepared, runtime, remove_pending, None)
-    }
-    fn record_outcome(
-        &self,
-        prepared: torse_sim::PreparedChange,
-        runtime: RuntimeState,
-        remove_pending: Vec<RequestId>,
-        outcome: Option<ReplyStatus>,
-    ) -> Result<ExecutionPrepared, Fault> {
         checked_state_cached(
             &runtime,
             self.limits,
@@ -1003,6 +994,17 @@ impl ExecutionHost {
             self.binding.world,
             self.validation_cache(),
         )?;
+        self.record_checked(prepared, runtime, remove_pending, None)
+    }
+
+    /// Assemble a record after checking runtime state against the prepared metadata.
+    fn record_checked(
+        &self,
+        prepared: torse_sim::PreparedChange,
+        runtime: RuntimeState,
+        remove_pending: Vec<RequestId>,
+        outcome: Option<ReplyStatus>,
+    ) -> Result<ExecutionPrepared, Fault> {
         receipt_bounds(&runtime, prepared.meta().cursor)?;
         let changes = persistent_changes_from_prepared(
             self.world().registry(),
@@ -1079,7 +1081,7 @@ impl ExecutionHost {
             task,
             &status,
             prepared.meta().cursor,
-            self.resume_point(),
+            prepared.meta().resume_at,
             self.limits,
             self.validation_cache(),
         ) {
@@ -1096,14 +1098,15 @@ impl ExecutionHost {
                     task,
                     &status,
                     prepared.meta().cursor,
-                    self.resume_point(),
+                    prepared.meta().resume_at,
                     self.limits,
                     self.validation_cache(),
                 )?
             }
             Err(error) => return Err(error),
         };
-        self.record_outcome(prepared, state, Vec::new(), Some(status))
+        // settle checks the final state against the same prepared metadata.
+        self.record_checked(prepared, state, Vec::new(), Some(status))
     }
 }
 fn matches_plan(
