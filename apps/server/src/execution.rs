@@ -195,7 +195,7 @@ pub struct ExecutionHost {
     stopping: Option<Tick>,
     highest_session: u128,
     profiler: SerialProfiler,
-    planning: Option<PlanningConfig>,
+    planning: Option<(PlanningConfig, torse_runtime::ScopedPool)>,
     native_planning_stats: std::cell::Cell<NativePlanningStats>,
     compact_records: bool,
     budget_cache: RefCell<RuntimeBudget>,

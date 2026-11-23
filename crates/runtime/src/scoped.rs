@@ -6,6 +6,67 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
+#[cfg(feature = "scoped-pool")]
+use rayon::prelude::*;
+
+/// Reusable workers for synchronous batches borrowing the caller's data.
+#[cfg(feature = "scoped-pool")]
+pub struct ScopedPool(rayon::ThreadPool);
+
+#[cfg(feature = "scoped-pool")]
+impl ScopedPool {
+    pub fn new(workers: usize) -> io::Result<Self> {
+        if workers == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zero scoped workers",
+            ));
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("torse-planning-{index}"))
+            .build()
+            .map(Self)
+            .map_err(io::Error::other)
+    }
+
+    /// Complete the admitted batch before returning results in input order.
+    pub fn run<T: Send, F>(
+        &self,
+        config: ExecutorConfig,
+        budget: JobBudget,
+        count: usize,
+        work: F,
+    ) -> io::Result<Vec<Result<T, JobError>>>
+    where
+        F: Fn(usize) -> Result<JobOutput<T>, JobError> + Sync,
+    {
+        validate_batch(config, budget, count)?;
+        if self.0.current_thread_index().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nested scoped CPU batch",
+            ));
+        }
+        if self.0.current_num_threads().min(count) > config.workers {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scoped CPU worker budget",
+            ));
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let work = &work;
+        Ok(self.0.install(|| {
+            (0..count)
+                .into_par_iter()
+                .map(|index| run_job(budget, || work(index)))
+                .collect()
+        }))
+    }
+}
+
 /// Run a bounded batch and return results in input order. Every worker joins
 /// before the borrowed context can change, including on callback/spawn failure.
 /// Budgets cover the whole batch, including completed results. Trusted adapters
@@ -20,22 +81,7 @@ pub fn run_scoped<T: Send, F>(
 where
     F: Fn(usize) -> Result<JobOutput<T>, JobError> + Sync,
 {
-    config.validate()?;
-    if count > config.max_jobs
-        || budget
-            .input_bytes
-            .checked_mul(count)
-            .is_none_or(|n| n > config.max_input_bytes)
-        || budget
-            .output_bytes
-            .checked_mul(count)
-            .is_none_or(|n| n > config.max_output_bytes)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "scoped CPU batch exceeds capacity",
-        ));
-    }
+    validate_batch(config, budget, count)?;
     let results: Vec<_> = (0..count).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     thread::scope(|scope| -> io::Result<()> {
@@ -49,15 +95,7 @@ where
                         if index >= results.len() {
                             break;
                         }
-                        let result = catch_unwind(AssertUnwindSafe(|| work(index)))
-                            .unwrap_or(Err(JobError::Panicked))
-                            .and_then(|output| {
-                                if output.bytes > budget.output_bytes {
-                                    Err(JobError::OutputLimit)
-                                } else {
-                                    Ok(output.value)
-                                }
-                            });
+                        let result = run_job(budget, || work(index));
                         *results[index].lock().expect("scoped result lock") = Some(result);
                     }
                 })?;
@@ -74,6 +112,38 @@ where
         .collect())
 }
 
+fn validate_batch(config: ExecutorConfig, budget: JobBudget, count: usize) -> io::Result<()> {
+    config.validate()?;
+    if count > config.max_jobs
+        || budget
+            .input_bytes
+            .checked_mul(count)
+            .is_none_or(|n| n > config.max_input_bytes)
+        || budget
+            .output_bytes
+            .checked_mul(count)
+            .is_none_or(|n| n > config.max_output_bytes)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "scoped CPU batch exceeds capacity",
+        ));
+    }
+    Ok(())
+}
+
+fn run_job<T>(
+    budget: JobBudget,
+    work: impl FnOnce() -> Result<JobOutput<T>, JobError>,
+) -> Result<T, JobError> {
+    let output = catch_unwind(AssertUnwindSafe(work)).unwrap_or(Err(JobError::Panicked))?;
+    if output.bytes > budget.output_bytes {
+        Err(JobError::OutputLimit)
+    } else {
+        Ok(output.value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +156,41 @@ mod tests {
             max_input_bytes: 16,
             max_output_bytes: 16,
         }
+    }
+
+    #[cfg(feature = "scoped-pool")]
+    #[test]
+    fn pool_reuses_worker_across_batches_and_rejects_nested_admission() {
+        let pool = ScopedPool::new(1).unwrap();
+        let budget = JobBudget {
+            input_bytes: 4,
+            output_bytes: 4,
+        };
+        let worker = || {
+            pool.run(config(), budget, 1, |_| {
+                assert!(
+                    pool.run(
+                        config(),
+                        budget,
+                        1,
+                        |_| -> Result<JobOutput<()>, JobError> {
+                            panic!("nested batch must not run");
+                        }
+                    )
+                    .is_err()
+                );
+                Ok(JobOutput {
+                    value: thread::current().id(),
+                    bytes: 4,
+                })
+            })
+            .unwrap()[0]
+                .clone()
+                .unwrap()
+        };
+        let first = worker();
+        assert_ne!(first, thread::current().id());
+        assert_eq!(first, worker());
     }
 
     #[test]

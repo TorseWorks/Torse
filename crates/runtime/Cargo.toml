@@ -7,8 +7,10 @@ license.workspace = true
 
 [features]
 ecs-probe = ["dep:bevy_ecs", "dep:bevy_tasks"]
+scoped-pool = ["dep:rayon"]
 
 [dependencies]
 torse-types = { path = "../types" }
+rayon = { version = "1.12", optional = true }
 bevy_ecs = { version = "=0.18.1", features = ["multi_threaded"], optional = true }
 bevy_tasks = { version = "=0.18.1", features = ["multi_threaded"], optional = true }
