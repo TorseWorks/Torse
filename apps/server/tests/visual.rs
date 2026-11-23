@@ -155,6 +155,8 @@ fn bounded_reset_retains_unchanged_overlap_outside_the_metadata_slice() {
             .collect(),
     };
     wide.sections.extend([pos, reloaded]);
+    // An unsent request must not discard proofs from the last delivered scope.
+    hub.set_visual_interest(id, scope(21, 1), leaving).unwrap();
     hub.set_visual_interest(id, wide, SectionPos::ZERO).unwrap();
     let progress = hub
         .poll_display(

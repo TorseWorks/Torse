@@ -767,7 +767,6 @@ impl VisualSession {
         self.dirty.clear();
         self.unavailable.clear();
         self.observed.clear();
-        self.sent.retain(|p, _| self.desired.sections.contains(p));
         self.prioritize();
         Ok(())
     }
@@ -1123,6 +1122,9 @@ impl VisualSession {
                 self.sent
                     .iter()
                     .filter_map(|(&pos, page)| {
+                        if !self.desired.sections.contains(&pos) {
+                            return None;
+                        }
                         page.verified
                             .filter(|seq| *seq >= self.proof_floor)
                             .map(|_| (pos, page.digest))
