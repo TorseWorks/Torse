@@ -2,8 +2,9 @@ use super::*;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
-fn context(bytes: usize) -> PlanningContext {
+fn context(pool: &ScopedPool, bytes: usize) -> PlanningContext<'_> {
     PlanningContext {
+        pool,
         config: PlanningConfig {
             workers: 2,
             max_in_flight: 2,
@@ -15,7 +16,8 @@ fn context(bytes: usize) -> PlanningContext {
 
 #[test]
 fn native_lanes_overlap_join_and_return_in_input_order() {
-    let context = context(4096);
+    let pool = ScopedPool::new(2).unwrap();
+    let context = context(&pool, 4096);
     let arrived = (Mutex::new(0), Condvar::new());
     let results = context
         .map(8, 128, 128, |index| {
@@ -40,7 +42,8 @@ fn native_lanes_overlap_join_and_return_in_input_order() {
 
 #[test]
 fn rejected_native_work_invokes_no_callback() {
-    let context = context(1024);
+    let pool = ScopedPool::new(2).unwrap();
+    let context = context(&pool, 1024);
     for (count, retained, scratch) in [(8, 128, 128), (8, usize::MAX, 1), (1, 128, usize::MAX)] {
         assert!(
             context
@@ -56,7 +59,8 @@ fn rejected_native_work_invokes_no_callback() {
 #[test]
 fn worker_panic_joins_the_other_lane_before_returning_error() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let context = context(4096);
+    let pool = ScopedPool::new(2).unwrap();
+    let context = context(&pool, 4096);
     let completed = AtomicUsize::new(0);
     assert!(
         context

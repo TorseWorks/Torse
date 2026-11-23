@@ -8,6 +8,8 @@ pub use executor::{
     Cancellation, Executor, ExecutorCapacity, ExecutorConfig, Job, JobBudget, JobError, JobOutput,
     Priority, Reservation, ReserveError, ReserveFailure, ReserveResource, Usage,
 };
+#[cfg(feature = "scoped-pool")]
+pub use scoped::ScopedPool;
 pub use scoped::run_scoped;
 
 #[cfg(feature = "ecs-probe")]

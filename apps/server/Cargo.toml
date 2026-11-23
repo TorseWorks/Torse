@@ -10,7 +10,7 @@ mods = ["torse-mod-host/package"]
 
 [dependencies]
 torse-diagnostics = { path = "../../crates/diagnostics" }
-torse-runtime = { path = "../../crates/runtime" }
+torse-runtime = { path = "../../crates/runtime", features = ["scoped-pool"] }
 crc32c = "=0.6.8"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }

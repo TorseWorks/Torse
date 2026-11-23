@@ -1,7 +1,7 @@
 //! Borrowed phase-start planning; durable publication and replay stay serial.
 use super::*;
 use crate::{HostCheckpointStore, Server};
-use torse_runtime::{ExecutorConfig, JobBudget, JobError, JobOutput, run_scoped};
+use torse_runtime::{ExecutorConfig, JobBudget, JobError, JobOutput, ScopedPool};
 use torse_storage::CommitJournal;
 
 #[cfg(test)]
@@ -68,8 +68,9 @@ impl PlanningConfig {
 /// Borrowed native job admission within an already reserved rule-planning batch.
 /// Adapter estimates cover retained inputs/results and concurrent scratch. This
 /// is a cooperative budget for trusted code, not an allocator sandbox.
-pub struct PlanningContext {
+pub struct PlanningContext<'a> {
     config: PlanningConfig,
+    pool: &'a ScopedPool,
     max_work_bytes: usize,
     stats: std::cell::Cell<NativePlanningStats>,
 }
@@ -83,7 +84,7 @@ pub struct NativePlanningStats {
     pub budget_fallbacks: u64,
 }
 
-impl PlanningContext {
+impl PlanningContext<'_> {
     fn fallback<T>(&self) -> Result<Option<Vec<T>>, Fault> {
         let mut stats = self.stats.get();
         stats.budget_fallbacks = stats.budget_fallbacks.saturating_add(1);
@@ -103,7 +104,7 @@ impl PlanningContext {
             return Ok(Some(Vec::new()));
         }
         // Each lane owns a bounded slice of retained results and reuses scratch
-        // across bodies. Start one joined thread batch rather than one per window.
+        // across bodies. Workers borrow inputs only until the batch joins.
         let retained_bytes_per_job =
             retained_bytes_per_job.max(size_of::<T>().saturating_mul(4).saturating_add(64));
         let Some(retained) = retained_bytes_per_job.checked_mul(count) else {
@@ -149,22 +150,24 @@ impl PlanningContext {
         stats.jobs = stats.jobs.saturating_add(count as u64);
         stats.peak_lanes = stats.peak_lanes.max(lanes);
         self.stats.set(stats);
-        let batches = run_scoped(executor, budget, lanes, |lane| {
-            let values: Vec<_> = (lane..count)
-                .step_by(lanes)
-                .map(|index| (index, work(index)))
-                .collect();
-            Ok(JobOutput {
-                value: values,
-                bytes: per_lane,
+        let batches = self
+            .pool
+            .run(executor, budget, lanes, |lane| {
+                let values: Vec<_> = (lane..count)
+                    .step_by(lanes)
+                    .map(|index| (index, work(index)))
+                    .collect();
+                Ok(JobOutput {
+                    value: values,
+                    bytes: per_lane,
+                })
             })
-        })
-        .map_err(|error| {
-            Fault::new(
-                FaultCode::InvalidState,
-                format!("native planning workers: {error}"),
-            )
-        })?;
+            .map_err(|error| {
+                Fault::new(
+                    FaultCode::InvalidState,
+                    format!("native planning workers: {error}"),
+                )
+            })?;
         let mut indexed = Vec::with_capacity(count);
         for batch in batches {
             indexed.extend(batch.map_err(|error| {
@@ -187,10 +190,22 @@ impl ExecutionHost {
     /// Configure between drive calls, including after recovery. Existing frozen
     /// work is retained; this only affects the next uncollected phase.
     pub fn set_parallel_planning(&mut self, config: Option<PlanningConfig>) -> Result<(), Fault> {
-        if let Some(config) = config {
+        self.planning = if let Some(config) = config {
             config.validate(self.limits)?;
-        }
-        self.planning = config;
+            let workers = config.workers.min(config.max_in_flight);
+            if let Some((previous, _)) = &mut self.planning
+                && workers == previous.workers.min(previous.max_in_flight)
+            {
+                *previous = config;
+                return Ok(());
+            }
+            let pool = ScopedPool::new(workers).map_err(|e| {
+                Fault::new(FaultCode::InvalidState, format!("planning workers: {e}"))
+            })?;
+            Some((config, pool))
+        } else {
+            None
+        };
         Ok(())
     }
 
@@ -226,7 +241,11 @@ impl ExecutionHost {
         let mut next = 0;
         while next < ordered.len() {
             let (_, rule) = ordered[next];
-            let Some(config) = self.planning.filter(|_| rule.parallel_planner().is_some()) else {
+            let Some(&(config, ref pool)) = self
+                .planning
+                .as_ref()
+                .filter(|_| rule.parallel_planner().is_some())
+            else {
                 let plans = rule.plan(self.world(), tick)?;
                 if plans.len() > self.limits.phase_tasks.saturating_sub(tasks.len()) {
                     return Err(Fault::resource_limit("phase task budget"));
@@ -287,6 +306,7 @@ impl ExecutionHost {
             if batch.len() == 1 {
                 let context = PlanningContext {
                     config,
+                    pool,
                     max_work_bytes: budget.output_bytes,
                     stats: Default::default(),
                 };
@@ -325,28 +345,31 @@ impl ExecutionHost {
                 next += 1;
                 continue;
             }
-            let results = run_scoped(executor, budget, batch.len(), |index| {
-                let result = (|| {
-                    let plans = batch[index].plan(world, tick)?;
-                    if plans.len() > limits.phase_tasks {
-                        return Err(Fault::resource_limit("planner task budget"));
-                    }
-                    let frozen = plans
-                        .into_iter()
-                        .map(|plan| freeze_rule_plan(world, plan, phase, None))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let mut bytes = Vec::new();
-                    wire::encode(&frozen, &mut bytes, limits.runtime, limits.codec)?;
-                    drop(frozen);
-                    // Enforce owned allocation/node limits as well as wire size.
-                    wire::decode::<Vec<FrozenTask>>(&bytes, limits.runtime, limits.codec)
-                })();
-                Ok(JobOutput {
-                    value: result,
-                    bytes: budget.output_bytes,
+            let results = pool
+                .run(executor, budget, batch.len(), |index| {
+                    let result = (|| {
+                        let plans = batch[index].plan(world, tick)?;
+                        if plans.len() > limits.phase_tasks {
+                            return Err(Fault::resource_limit("planner task budget"));
+                        }
+                        let frozen = plans
+                            .into_iter()
+                            .map(|plan| freeze_rule_plan(world, plan, phase, None))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let mut bytes = Vec::new();
+                        wire::encode(&frozen, &mut bytes, limits.runtime, limits.codec)?;
+                        drop(frozen);
+                        // Enforce owned allocation/node limits as well as wire size.
+                        wire::decode::<Vec<FrozenTask>>(&bytes, limits.runtime, limits.codec)
+                    })();
+                    Ok(JobOutput {
+                        value: result,
+                        bytes: budget.output_bytes,
+                    })
                 })
-            })
-            .map_err(|e| Fault::new(FaultCode::InvalidState, format!("planning workers: {e}")))?;
+                .map_err(|e| {
+                    Fault::new(FaultCode::InvalidState, format!("planning workers: {e}"))
+                })?;
             next += batch.len();
             // Completion order must never select a contention winner or error.
             for result in results {
