@@ -67,7 +67,7 @@ where
         for index in 1..lanes {
             thread::Builder::new()
                 .name(format!("torse-phase-{index}"))
-                .spawn_scoped(scope, &drain)?;
+                .spawn_scoped(scope, drain)?;
         }
         drain();
         Ok(())
