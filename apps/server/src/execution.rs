@@ -180,6 +180,7 @@ pub struct ExecutionHost {
     parking_reservation: Option<ParkingReservation>,
     visual_transitions:
         std::collections::VecDeque<(SectionPos, crate::visual::Stamp, crate::visual::Stamp)>,
+    pub(crate) visual_history: crate::visual::TerrainHistory,
     section_pending: Option<ExecutionPrepared>,
     pub(crate) section_install_limit: usize,
     section_install_diagnostics: streaming::SectionInstallDiagnostics,
@@ -503,6 +504,7 @@ impl ExecutionHost {
             parked: BTreeMap::new(),
             parking_reservation: None,
             visual_transitions: std::collections::VecDeque::new(),
+            visual_history: crate::visual::TerrainHistory::default(),
             section_pending: None,
             section_install_limit: 24,
             section_install_diagnostics: streaming::SectionInstallDiagnostics::default(),
@@ -1554,6 +1556,18 @@ impl HostAuthority for ExecutionHost {
             let after = crate::visual::stamp(self, pos);
             self.visual_transitions.push_back((pos, before, after));
         }
+        self.visual_history.record(
+            publication.cursor.seq,
+            publication.touched.iter().map(|&(pos, _)| pos).chain(
+                prepared
+                    .record
+                    .changes
+                    .sections
+                    .iter()
+                    .filter(|_| parking)
+                    .map(|change| change.page.sections[0].pos),
+            ),
+        );
         if let Some(request) = &prepared.record.changes.cancelled
             && let Some(live) = self.sessions.get_mut(&request.id.session.0)
         {
