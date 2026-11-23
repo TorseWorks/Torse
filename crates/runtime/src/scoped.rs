@@ -10,7 +10,8 @@ use std::thread;
 /// before the borrowed context can change, including on callback/spawn failure.
 /// Budgets cover the whole batch, including completed results. Trusted adapters
 /// must bound intermediate allocation; this is not a native-code memory sandbox.
-/// Unlike `Executor`, threads live for this call and work cannot outlive it.
+/// The caller participates as one of the configured workers. Additional threads
+/// live only for this call, and work cannot outlive it.
 pub fn run_scoped<T: Send, F>(
     config: ExecutorConfig,
     budget: JobBudget,
@@ -36,32 +37,39 @@ where
             "scoped CPU batch exceeds capacity",
         ));
     }
+    let lanes = config.workers.min(count);
+    let run = |index| {
+        catch_unwind(AssertUnwindSafe(|| work(index)))
+            .unwrap_or(Err(JobError::Panicked))
+            .and_then(|output| {
+                if output.bytes > budget.output_bytes {
+                    Err(JobError::OutputLimit)
+                } else {
+                    Ok(output.value)
+                }
+            })
+    };
+    if lanes <= 1 {
+        return Ok((0..count).map(run).collect());
+    }
+
     let results: Vec<_> = (0..count).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
+    let drain = || loop {
+        let index = next.fetch_add(1, Ordering::Relaxed);
+        if index >= results.len() {
+            break;
+        }
+        let result = run(index);
+        *results[index].lock().expect("scoped result lock") = Some(result);
+    };
     thread::scope(|scope| -> io::Result<()> {
-        for index in 0..config.workers.min(count) {
-            let (results, next, work) = (&results, &next, &work);
+        for index in 1..lanes {
             thread::Builder::new()
                 .name(format!("torse-phase-{index}"))
-                .spawn_scoped(scope, move || {
-                    loop {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        if index >= results.len() {
-                            break;
-                        }
-                        let result = catch_unwind(AssertUnwindSafe(|| work(index)))
-                            .unwrap_or(Err(JobError::Panicked))
-                            .and_then(|output| {
-                                if output.bytes > budget.output_bytes {
-                                    Err(JobError::OutputLimit)
-                                } else {
-                                    Ok(output.value)
-                                }
-                            });
-                        *results[index].lock().expect("scoped result lock") = Some(result);
-                    }
-                })?;
+                .spawn_scoped(scope, drain)?;
         }
+        drain();
         Ok(())
     })?;
     Ok(results
@@ -92,6 +100,8 @@ mod tests {
     fn borrows_context_runs_concurrently_and_retains_input_order() {
         let input = [11, 17, 23, 29];
         let gate = Barrier::new(2);
+        let caller = thread::current().id();
+        let ran_on_caller = std::sync::atomic::AtomicBool::new(false);
         let result = run_scoped(
             config(),
             JobBudget {
@@ -100,6 +110,9 @@ mod tests {
             },
             4,
             |i| {
+                if thread::current().id() == caller {
+                    ran_on_caller.store(true, Ordering::Relaxed);
+                }
                 gate.wait();
                 Ok(JobOutput {
                     value: &input[i],
@@ -108,6 +121,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(ran_on_caller.load(Ordering::Relaxed));
         assert_eq!(
             result
                 .into_iter()
@@ -153,24 +167,30 @@ mod tests {
                 .is_err()
             );
         }
-        let results = run_scoped(config(), budget, 4, |i| {
-            if i == 1 {
-                panic!("injected planner panic");
-            }
-            Ok(JobOutput {
-                value: i,
-                bytes: if i == 2 { 5 } else { 4 },
+        for workers in [1, 2] {
+            let config = ExecutorConfig {
+                workers,
+                ..config()
+            };
+            let results = run_scoped(config, budget, 4, |i| {
+                if i == 1 {
+                    panic!("injected planner panic");
+                }
+                Ok(JobOutput {
+                    value: i,
+                    bytes: if i == 2 { 5 } else { 4 },
+                })
             })
-        })
-        .unwrap();
-        assert_eq!(
-            results,
-            vec![
-                Ok(0),
-                Err(JobError::Panicked),
-                Err(JobError::OutputLimit),
-                Ok(3)
-            ]
-        );
+            .unwrap();
+            assert_eq!(
+                results,
+                vec![
+                    Ok(0),
+                    Err(JobError::Panicked),
+                    Err(JobError::OutputLimit),
+                    Ok(3)
+                ]
+            );
+        }
     }
 }
