@@ -2,6 +2,13 @@
 #[cfg(feature = "parking-profile")]
 use std::time::{Duration, Instant};
 use std::{collections::BTreeSet, thread::JoinHandle};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::Thread,
+};
 
 use torse_sim::durable::{ParkingReservation, SectionChange};
 use torse_storage::CommitJournal;
@@ -58,8 +65,22 @@ struct SavedBatch {
     writer_interval: (Instant, Instant),
 }
 
+struct ParkingWriter {
+    handle: JoinHandle<Result<SavedBatch, Fault>>,
+    ready: Option<Arc<AtomicBool>>,
+}
+
+impl ParkingWriter {
+    fn result_ready(&self) -> bool {
+        self.ready
+            .as_ref()
+            .is_some_and(|ready| ready.load(Ordering::Acquire))
+            || self.handle.is_finished()
+    }
+}
+
 pub(crate) struct ParkingJob {
-    worker: Option<JoinHandle<Result<SavedBatch, Fault>>>,
+    worker: Option<ParkingWriter>,
     allocator: u128,
     input: Option<Vec<Snapshot>>,
     saved: Option<SavedBatch>,
@@ -78,7 +99,7 @@ pub(crate) struct ParkingJob {
 impl Drop for ParkingJob {
     fn drop(&mut self) {
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            let _ = worker.handle.join();
         }
     }
 }
@@ -86,6 +107,21 @@ impl Drop for ParkingJob {
 impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
     Server<ExecutionHost, J, S>
 {
+    /// Register a thread to unpark when a newly started parking writer has a result.
+    /// Publication still requires a successful poll at a valid authority boundary.
+    pub fn set_generated_parking_completion_thread(&mut self, thread: Option<Thread>) {
+        self.parking_completion_thread = thread;
+    }
+
+    /// A completed background writer can be collected without waiting for I/O.
+    /// Queued inputs and journal retries still follow the caller's normal schedule.
+    pub fn generated_parking_writer_ready(&self) -> bool {
+        self.parking
+            .as_ref()
+            .and_then(|job| job.worker.as_ref())
+            .is_some_and(ParkingWriter::result_ready)
+    }
+
     /// The most recent successful generated parking batch, if one has finished.
     #[cfg(feature = "parking-profile")]
     pub fn last_generated_parking_timings(&self) -> Option<ParkingTimings> {
@@ -204,7 +240,7 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         if job
             .worker
             .as_ref()
-            .is_some_and(|writer| !writer.is_finished())
+            .is_some_and(|writer| !writer.result_ready())
             || (!job.canceled && !host.residency_ready(false))
         {
             return Ok(ParkingProgress::Pending);
@@ -286,6 +322,7 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
             job.worker = Some(start_writer(
                 job.pages.clone(),
                 input,
+                self.parking_completion_thread.clone(),
                 #[cfg(test)]
                 job.before_write.take(),
             )?);
@@ -294,7 +331,7 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         #[cfg(feature = "parking-profile")]
         let publication_started = Instant::now();
         if let Some(worker) = job.worker.take() {
-            let saved = worker.join().map_err(|_| {
+            let saved = worker.handle.join().map_err(|_| {
                 Fault::new(
                     FaultCode::StorageUnavailable,
                     "generated parking worker panicked",
@@ -367,42 +404,55 @@ fn parking_stage_fault(error: StageError) -> Fault {
 fn start_writer(
     pages: SectionPages,
     input: Vec<Snapshot>,
+    completion_thread: Option<Thread>,
     #[cfg(test)] before_write: Option<std::sync::mpsc::Receiver<()>>,
-) -> Result<JoinHandle<Result<SavedBatch, Fault>>, Fault> {
-    std::thread::Builder::new()
+) -> Result<ParkingWriter, Fault> {
+    let ready = completion_thread
+        .as_ref()
+        .map(|_| Arc::new(AtomicBool::new(false)));
+    let signal = ready.clone().zip(completion_thread);
+    let handle = std::thread::Builder::new()
         .name("torse-generated-parking".into())
         .spawn(move || {
-            #[cfg(feature = "parking-profile")]
-            let started = Instant::now();
-            #[cfg(test)]
-            if let Some(gate) = before_write {
-                gate.recv()
-                    .map_err(|_| Fault::invalid_data("parking test gate disconnected"))?;
-            }
-            let (digests, synced) = pages.put_bundle(&input)?;
-            let changes = input
-                .into_iter()
-                .zip(digests)
-                .map(|(page, digest)| SectionChange {
-                    reference: reference(&page, digest),
-                    page,
-                    load: false,
-                    fresh: true,
-                })
-                .collect();
-            Ok(SavedBatch {
-                changes,
-                page_file_syncs: u32::from(synced),
+            let result = (|| {
                 #[cfg(feature = "parking-profile")]
-                writer_interval: (started, Instant::now()),
-            })
+                let started = Instant::now();
+                #[cfg(test)]
+                if let Some(gate) = before_write {
+                    gate.recv()
+                        .map_err(|_| Fault::invalid_data("parking test gate disconnected"))?;
+                }
+                let (digests, synced) = pages.put_bundle(&input)?;
+                let changes = input
+                    .into_iter()
+                    .zip(digests)
+                    .map(|(page, digest)| SectionChange {
+                        reference: reference(&page, digest),
+                        page,
+                        load: false,
+                        fresh: true,
+                    })
+                    .collect();
+                Ok(SavedBatch {
+                    changes,
+                    page_file_syncs: u32::from(synced),
+                    #[cfg(feature = "parking-profile")]
+                    writer_interval: (started, Instant::now()),
+                })
+            })();
+            if let Some((ready, thread)) = signal {
+                ready.store(true, Ordering::Release);
+                thread.unpark();
+            }
+            result
         })
         .map_err(|error| {
             Fault::new(
                 FaultCode::StorageUnavailable,
                 format!("start generated parking: {error}"),
             )
-        })
+        })?;
+    Ok(ParkingWriter { handle, ready })
 }
 
 #[cfg(test)]
@@ -424,6 +474,7 @@ mod tests {
     fn paused_writer_preserves_terrain_only_and_reserved_pages() {
         let dir = support::Directory::new();
         let (mut server, pages, template) = fixture::create(dir.acquire()).unwrap();
+        server.set_generated_parking_completion_thread(Some(std::thread::current()));
         for (x, has_entities) in [(2, false), (4, true)] {
             let host = server.authority().unwrap();
             let first = host.world().entities().next_entity_id();
@@ -462,6 +513,11 @@ mod tests {
             }
             release.send(()).unwrap();
             let timeout = Instant::now() + Duration::from_secs(10);
+            while !server.generated_parking_writer_ready() {
+                assert!(Instant::now() < timeout);
+                std::thread::park_timeout(timeout.saturating_duration_since(Instant::now()));
+            }
+            assert!(Instant::now() < timeout);
             loop {
                 match server.poll_generated_parking(&mut NoReplicas).unwrap() {
                     ParkingProgress::Pending => std::thread::yield_now(),
@@ -479,5 +535,22 @@ mod tests {
                 assert_eq!(pages.get(reference.digest).unwrap(), page);
             }
         }
+    }
+
+    #[test]
+    fn writer_error_signals_completion() {
+        let dir = support::Directory::new();
+        let (_server, pages, _template) = fixture::create(dir.acquire()).unwrap();
+        let writer = start_writer(pages, Vec::new(), Some(std::thread::current()), None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !writer.result_ready() {
+            assert!(Instant::now() < deadline);
+            std::thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+        assert!(Instant::now() < deadline);
+        let Err(error) = writer.handle.join().unwrap() else {
+            panic!("empty writer batch must fail");
+        };
+        assert_eq!(error.code, FaultCode::ResourceLimit);
     }
 }

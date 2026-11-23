@@ -103,6 +103,7 @@ pub struct Server<A: HostAuthority, J, S> {
     pub(crate) commit_batch_limit: u32,
     pub(crate) residency: Option<crate::residency::ResidencyScheduler>,
     pub(crate) parking: Option<crate::parking::ParkingJob>,
+    pub(crate) parking_completion_thread: Option<std::thread::Thread>,
     #[cfg(feature = "parking-profile")]
     pub(crate) last_parking_timings: Option<crate::parking::ParkingTimings>,
     pub(crate) storage_memory: Option<torse_types::MemoryLease>,
@@ -166,6 +167,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
             commit_batch_limit: 1,
             residency: None,
             parking: None,
+            parking_completion_thread: None,
             #[cfg(feature = "parking-profile")]
             last_parking_timings: None,
             storage_memory: None,
