@@ -110,6 +110,127 @@ fn explicit_metadata_budget_retains_distant_pages_with_a_single_page_batch() {
 }
 
 #[test]
+fn bounded_reset_retains_unchanged_overlap_outside_the_metadata_slice() {
+    let dir = Directory::new();
+    let (mut server, pages, expected) = create(&dir);
+    let (mut hub, id, mut client, _, _) = connect(&mut server, scope(0, 1));
+    let pos = SectionPos::new(20, 0, 0);
+    let leaving = SectionPos::new(21, 0, 0);
+    let reloaded = SectionPos::new(22, 0, 0);
+    let mut display = torse_net::terrain::TerrainMirror::new(
+        server.binding(),
+        16,
+        server.authority().unwrap().world().store().bounds(),
+        torse_net::terrain::TerrainLimits {
+            max_sections: 2048,
+            max_bytes: 256 * 1024,
+            metadata_bytes: 2048 * 512,
+        },
+        None,
+    )
+    .unwrap();
+    let mut limits = limits();
+    limits.max_sections = 2048;
+    limits.control_bytes = 512 * 1024;
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages.clone(),
+        approval(),
+        scope(20, 3),
+        pos,
+        limits,
+    )
+    .unwrap();
+    fill(&mut hub, &mut server, &mut client, &mut display);
+
+    // The overlap is beyond this poll's entire scan. Only the first page still
+    // has a current proof; the others left scope or changed residency source.
+    server.reload_section(&pages, reloaded, &mut hub).unwrap();
+    let mut wide = ReplicaScope {
+        sections: (-7..=0)
+            .flat_map(|x| {
+                (-8..=-1).flat_map(move |z| (-4..20).map(move |y| SectionPos::new(x, y, z)))
+            })
+            .collect(),
+    };
+    wide.sections.extend([pos, reloaded]);
+    hub.set_visual_interest(id, wide, SectionPos::ZERO).unwrap();
+    let progress = hub
+        .poll_display(
+            &server,
+            DisplayWorkBudget {
+                sessions: 1,
+                metadata_checks_per_session: 1536,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(progress.metadata_checks, 1536);
+    let update = drain(&mut client)
+        .0
+        .into_iter()
+        .find_map(|message| match message {
+            ServerMessage::Terrain(update) => Some(update),
+            _ => None,
+        })
+        .unwrap();
+    let retained = &update.reset.as_ref().unwrap().retained;
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].0, pos);
+    assert_eq!(display.apply(update).unwrap().removed, [leaving, reloaded]);
+    assert_eq!(display.page(pos), expected.get(&pos));
+
+    hub.set_visual_interest(id, scope(20, 1), pos).unwrap();
+    let progress = hub
+        .poll_display(
+            &server,
+            DisplayWorkBudget {
+                sessions: 1,
+                metadata_checks_per_session: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(progress.metadata_checks, 1);
+    for message in drain(&mut client).0 {
+        if let ServerMessage::Terrain(update) = message {
+            assert!(display.apply(update).unwrap().removed.is_empty());
+        }
+    }
+    assert_eq!(display.desired().len(), 1);
+    assert_eq!(display.page(pos), expected.get(&pos));
+
+    // Spending the whole one-entry slice on a terrain change must prevent a
+    // proof for the previous source from reaching the next reset.
+    server.reload_section(&pages, pos, &mut hub).unwrap();
+    hub.set_visual_interest(id, scope(20, 2), pos).unwrap();
+    assert_eq!(
+        hub.poll_display(
+            &server,
+            DisplayWorkBudget {
+                sessions: 1,
+                metadata_checks_per_session: 1,
+                ..Default::default()
+            }
+        )
+        .unwrap()
+        .metadata_checks,
+        1
+    );
+    let update = drain(&mut client)
+        .0
+        .into_iter()
+        .find_map(|message| match message {
+            ServerMessage::Terrain(update) => Some(update),
+            _ => None,
+        })
+        .unwrap();
+    assert!(update.reset.as_ref().unwrap().retained.is_empty());
+    assert_eq!(display.apply(update).unwrap().removed, [pos]);
+}
+
+#[test]
 fn successive_resets_cannot_retain_a_page_omitted_from_the_previous_reset() {
     let dir = Directory::new();
     let (mut server, pages, expected) = create(&dir);

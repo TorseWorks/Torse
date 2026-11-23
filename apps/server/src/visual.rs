@@ -2,7 +2,7 @@
 use crate::{HostAuthority, execution::ExecutionHost, section_pages::SectionPages};
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::mpsc,
     thread,
 };
@@ -40,6 +40,7 @@ pub struct VisualTerrainDiagnostics {
     pub generation: u64,
     pub sequence: u64,
     pub reused_read_pages: u64,
+    /// Source checks and publication-history entries consumed by the last slice.
     pub metadata_scanned: usize,
     pub pending_candidates: usize,
     pub light_scanned: usize,
@@ -85,6 +86,53 @@ pub(crate) fn stamp(host: &ExecutionHost, pos: SectionPos) -> Stamp {
     }
 }
 pub(crate) const TRANSITION_LIMIT: usize = 1024;
+
+/// Recent terrain publications. A peer behind this bounded history must
+/// rebuild its proofs from live metadata before using them in a reset.
+pub(crate) struct TerrainHistory {
+    entries: VecDeque<(CommitSeq, SectionPos)>,
+    forgotten_through: CommitSeq,
+}
+
+impl Default for TerrainHistory {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            forgotten_through: CommitSeq(0),
+        }
+    }
+}
+
+impl TerrainHistory {
+    pub(crate) fn record(
+        &mut self,
+        seq: CommitSeq,
+        positions: impl IntoIterator<Item = SectionPos>,
+    ) {
+        const MAX_CHANGES: usize = 4096;
+        for pos in positions {
+            if self.entries.len() == MAX_CHANGES {
+                self.forgotten_through = self.entries.pop_front().expect("full history").0;
+            }
+            self.entries.push_back((seq, pos));
+        }
+    }
+
+    fn since(
+        &self,
+        cut: CommitSeq,
+    ) -> Option<impl ExactSizeIterator<Item = (CommitSeq, SectionPos)> + '_> {
+        (cut >= self.forgotten_through).then(|| {
+            let first = self.entries.partition_point(|(seq, _)| *seq <= cut);
+            self.entries.range(first..).copied()
+        })
+    }
+}
+
+struct SentPage {
+    digest: Digest,
+    verified: Option<CommitSeq>,
+}
 
 struct Cached {
     stamp: Stamp,
@@ -280,7 +328,9 @@ pub(crate) struct VisualSession {
     dirty: BTreeSet<ColumnPriority>,
     unavailable: BTreeMap<SectionPos, TerrainUnavailable>,
     observed: BTreeMap<SectionPos, Stamp>,
-    sent: BTreeMap<SectionPos, Digest>,
+    sent: BTreeMap<SectionPos, SentPage>,
+    proof_cut: CommitSeq,
+    proof_floor: CommitSeq,
     light_sent: BTreeMap<SectionPos, u64>,
     light_seq: u64,
     reserved_bytes: u64,
@@ -444,7 +494,7 @@ impl VisualSession {
             let Some(cached) = self.cache.get(&pos) else {
                 continue;
             };
-            if self.sent.get(&pos) != Some(&cached.digest) {
+            if self.sent.get(&pos).map(|page| page.digest) != Some(cached.digest) {
                 continue;
             }
             let Some(publication) = field.publication(id, pos, host) else {
@@ -659,6 +709,8 @@ impl VisualSession {
             unavailable: BTreeMap::new(),
             observed: BTreeMap::new(),
             sent: BTreeMap::new(),
+            proof_cut: CommitSeq(0),
+            proof_floor: CommitSeq(0),
             light_sent: BTreeMap::new(),
             light_seq: 0,
             reserved_bytes: charge,
@@ -751,6 +803,33 @@ impl VisualSession {
     ) -> Result<Option<TerrainUpdate<ReplicaSnapshot>>, Fault> {
         self.poll_with_budget(host, can_send, usize::MAX)
     }
+
+    fn advance_proofs(&mut self, host: &ExecutionHost, cut: CommitSeq, budget: usize) -> usize {
+        let previous = std::mem::replace(&mut self.proof_cut, cut);
+        if self.sent.is_empty() {
+            return 0;
+        }
+        let Some(changes) = host
+            .visual_history
+            .since(previous)
+            .filter(|changes| changes.len() <= budget)
+        else {
+            // Old proofs cannot cross a missed or unaffordable mutation range.
+            // The current scan can still establish new proofs at this cut.
+            self.proof_floor = cut;
+            return 0;
+        };
+        let checked = changes.len();
+        for (seq, pos) in changes {
+            if let Some(page) = self.sent.get_mut(&pos)
+                && page.verified.is_some_and(|verified| verified < seq)
+            {
+                page.verified = None;
+            }
+        }
+        checked
+    }
+
     pub(crate) fn poll_with_budget(
         &mut self,
         host: &ExecutionHost,
@@ -901,9 +980,14 @@ impl VisualSession {
         } else {
             metadata_checks
         };
-        let scan = self.order.len().min(checks);
-        self.last_scan = scan;
-        let mut reset_retained = Vec::new();
+        let through = host.cursor();
+        let invalidations = if metadata_checks == usize::MAX {
+            0
+        } else {
+            self.advance_proofs(host, through.seq, checks)
+        };
+        let scan = self.order.len().min(checks - invalidations);
+        self.last_scan = invalidations + scan;
         for _ in 0..scan {
             let pos = self.order[self.scan_cursor];
             self.scan_cursor = (self.scan_cursor + 1) % self.order.len();
@@ -926,10 +1010,16 @@ impl VisualSession {
             }
             if let Some(page) = self.cache.get_mut(&pos) {
                 page.touched = self.clock;
-                if self.sent.get(&pos) != Some(&page.digest) {
+                if let Some(sent) = self
+                    .sent
+                    .get_mut(&pos)
+                    .filter(|sent| sent.digest == page.digest)
+                {
+                    if page.stamp == current {
+                        sent.verified = Some(through.seq);
+                    }
+                } else {
                     self.dirty.insert(column_priority(pos, self.center));
-                } else if self.reset && page.stamp == current {
-                    reset_retained.push((pos, page.digest));
                 }
             } else if current == Stamp::Missing && self.observed.get(&pos) != Some(&current) {
                 self.observed.insert(pos, current);
@@ -1018,7 +1108,6 @@ impl VisualSession {
         if !can_send {
             return Ok(None);
         }
-        let through = host.cursor();
         if self.reset {
             let retained: Vec<_> = if metadata_checks == usize::MAX {
                 self.cache
@@ -1026,13 +1115,19 @@ impl VisualSession {
                     .filter(|(p, c)| {
                         self.desired.sections.contains(p)
                             && c.stamp == stamp(host, **p)
-                            && self.sent.get(p) == Some(&c.digest)
+                            && self.sent.get(p).map(|page| page.digest) == Some(c.digest)
                     })
                     .map(|(p, c)| (*p, c.digest))
                     .collect()
             } else {
-                reset_retained.sort_unstable_by_key(|(pos, _)| *pos);
-                reset_retained
+                self.sent
+                    .iter()
+                    .filter_map(|(&pos, page)| {
+                        page.verified
+                            .filter(|seq| *seq >= self.proof_floor)
+                            .map(|_| (pos, page.digest))
+                    })
+                    .collect()
             };
             for (pos, _) in &retained {
                 self.dirty.remove(&column_priority(*pos, self.center));
@@ -1041,7 +1136,16 @@ impl VisualSession {
             // cached source can be proven unchanged on a later bounded scan.
             // Only an actual page delivery can restore its retention eligibility.
             self.sent.clear();
-            self.sent.extend(retained.iter().copied());
+            self.proof_cut = through.seq;
+            self.sent.extend(retained.iter().map(|&(pos, digest)| {
+                (
+                    pos,
+                    SentPage {
+                        digest,
+                        verified: Some(through.seq),
+                    },
+                )
+            }));
             let reset = TerrainReset {
                 sections: self.desired.sections.iter().copied().collect(),
                 retained,
@@ -1156,7 +1260,13 @@ impl VisualSession {
         };
         for page in &update.pages {
             let pos = page.terrain.sections[0].pos;
-            self.sent.insert(pos, page.digest);
+            self.sent.insert(
+                pos,
+                SentPage {
+                    digest: page.digest,
+                    verified: Some(through.seq),
+                },
+            );
             self.dirty.remove(&column_priority(pos, self.center));
         }
         for (pos, _) in &update.unavailable {
@@ -1164,5 +1274,24 @@ impl VisualSession {
         }
         self.seq = seq;
         Ok(Some(update))
+    }
+}
+
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+
+    #[test]
+    fn forgotten_batch_entries_require_a_cut_at_or_after_the_publication() {
+        let mut history = TerrainHistory::default();
+        history.record(CommitSeq(2), (0..4097).map(|x| SectionPos::new(x, 0, 0)));
+        assert!(history.since(CommitSeq(1)).is_none());
+        assert_eq!(history.since(CommitSeq(2)).unwrap().len(), 0);
+        let pos = SectionPos::ZERO;
+        history.record(CommitSeq(5), [pos]);
+        assert_eq!(
+            history.since(CommitSeq(2)).unwrap().collect::<Vec<_>>(),
+            [(CommitSeq(5), pos)]
+        );
     }
 }
