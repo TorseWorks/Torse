@@ -264,11 +264,8 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
                     "generated parking worker panicked",
                 )
             })??;
-            for change in &saved.changes {
-                if job.pages.digest(&change.page)? != change.reference.digest {
-                    return Err(Fault::invalid_data("generated parking digest mismatch"));
-                }
-            }
+            // The writer returns the same owned pages paired with the ordered
+            // digests of their synced bytes. Live residency is checked above.
             job.saved = Some(saved);
         }
         let saved = job.saved.take().expect("written parking bundle");
@@ -321,6 +318,9 @@ fn start_writer(
                     .map_err(|_| Fault::invalid_data("parking test gate disconnected"))?;
             }
             let (digests, synced) = pages.put_bundle(&input)?;
+            if digests.len() != input.len() {
+                return Err(Fault::invalid_data("generated parking bundle page count"));
+            }
             let changes = input
                 .into_iter()
                 .zip(digests)
@@ -358,6 +358,35 @@ mod tests {
     use super::*;
     use crate::NoReplicas;
     use std::time::{Duration, Instant};
+
+    #[test]
+    #[ignore = "release-only measurement of the old authority-thread digest pass"]
+    fn dense_parking_digest_pass() {
+        let dir = support::Directory::new();
+        let (server, pages, template) = fixture::create(dir.acquire()).unwrap();
+        let column = fixture::column(server.authority().unwrap(), 2, 0, &template, false);
+        let (digests, synced) = pages.put_bundle(&column).unwrap();
+        assert!(synced);
+        assert_eq!(column.len(), 24);
+        for (page, &digest) in column.iter().zip(&digests) {
+            assert_eq!(pages.get(digest).unwrap(), *page);
+        }
+        let mut durations = Vec::new();
+        for _ in 0..31 {
+            let start = Instant::now();
+            for (page, &digest) in std::hint::black_box(&column).iter().zip(&digests) {
+                assert_eq!(pages.digest(page).unwrap(), digest);
+            }
+            durations.push(start.elapsed().as_nanos());
+        }
+        durations.sort_unstable();
+        println!(
+            "parking digest pass: pages={} median={}ns max={}ns",
+            column.len(),
+            durations[15],
+            durations[30]
+        );
+    }
 
     #[test]
     fn paused_writer_preserves_terrain_only_and_reserved_pages() {

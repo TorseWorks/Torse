@@ -9,7 +9,8 @@ const ENTRY_BYTES: u64 = 36;
 impl SectionPages {
     /// Each new member name links to the same synced file. Existing names are
     /// validated and left in place. A failed publication can leave unreachable
-    /// names for the normal page collector.
+    /// names for the normal page collector. Digests are returned in input
+    /// order, independent of the bundle's on-disk index order.
     pub(crate) fn put_bundle(&self, pages: &[Snapshot]) -> Result<(Vec<Digest>, bool), Fault> {
         if !(1..=1024).contains(&pages.len()) {
             return Err(Fault::resource_limit("section bundle page count"));
