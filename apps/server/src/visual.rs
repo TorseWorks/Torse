@@ -148,6 +148,16 @@ fn distance(pos: SectionPos, center: SectionPos) -> u128 {
 }
 type ColumnPriority = (u128, i64, i64, u64, SectionPos);
 
+fn rank_visual_scope(
+    sections: &BTreeSet<SectionPos>,
+    center: SectionPos,
+) -> BTreeSet<ColumnPriority> {
+    sections
+        .iter()
+        .map(|&pos| column_priority(pos, center))
+        .collect()
+}
+
 fn column_priority(pos: SectionPos, center: SectionPos) -> ColumnPriority {
     (
         u128::from(pos.x.abs_diff(center.x)) + u128::from(pos.z.abs_diff(center.z)),
@@ -399,14 +409,10 @@ impl VisualSession {
         check_frame(&message, budget, codec)
     }
     fn prioritize(&mut self) {
-        self.order = self.desired.sections.iter().copied().collect();
+        self.candidates = rank_visual_scope(&self.desired.sections, self.center);
+        self.order.clear();
         self.order
-            .sort_unstable_by_key(|&p| column_priority(p, self.center));
-        self.candidates = self
-            .order
-            .iter()
-            .map(|&p| column_priority(p, self.center))
-            .collect();
+            .extend(self.candidates.iter().map(|&(.., pos)| pos));
         self.dirty = self
             .dirty
             .iter()
@@ -1282,6 +1288,47 @@ impl VisualSession {
 #[cfg(test)]
 mod proof_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "release-only full-height interest ranking benchmark"]
+    fn interest_ranking_large_scope() {
+        use std::{hint::black_box, time::Instant};
+
+        let desired: BTreeSet<_> = (-16..=16)
+            .flat_map(|x| {
+                (-16..=16).flat_map(move |z| (0..24).map(move |y| SectionPos::new(x, y, z)))
+            })
+            .collect();
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        let mut order = Vec::new();
+        for run in 0..21 {
+            let center = black_box(SectionPos::new(run % 5 - 2, 8, 3));
+            let started = Instant::now();
+            let mut old_order: Vec<_> = desired.iter().copied().collect();
+            old_order.sort_unstable_by_key(|&pos| column_priority(pos, center));
+            let old_candidates: BTreeSet<_> = old_order
+                .iter()
+                .map(|&pos| column_priority(pos, center))
+                .collect();
+            before.push(started.elapsed().as_nanos());
+            let started = Instant::now();
+            let candidates = rank_visual_scope(&desired, center);
+            order.clear();
+            order.extend(candidates.iter().map(|&(.., pos)| pos));
+            after.push(started.elapsed().as_nanos());
+            assert_eq!(old_order, order);
+            assert_eq!(old_candidates, candidates);
+        }
+        before.sort_unstable();
+        after.sort_unstable();
+        println!(
+            "interest ranking: positions={} before={}ns after={}ns",
+            desired.len(),
+            before[10],
+            after[10]
+        );
+    }
 
     #[test]
     fn forgotten_batch_entries_require_a_cut_at_or_after_the_publication() {
