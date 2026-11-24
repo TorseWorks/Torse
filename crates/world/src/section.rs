@@ -749,6 +749,24 @@ mod tests {
     }
 
     #[test]
+    fn imported_sparse_palette_keeps_first_appearance_and_reference_counts() {
+        let states = [u16::MAX, 64, 0, 63, 4096].map(BlockStateId);
+        let cells: Vec<_> = (0..16usize.pow(3))
+            .map(|index| if index < 5 { states[index] } else { states[0] })
+            .collect();
+        let mut section = Section::from_cells(16, cells.clone()).unwrap();
+        let SectionStorage::Palette(packed) = section.storage() else {
+            panic!("sparse identifiers fit in a local palette");
+        };
+        assert_eq!(packed.states(), &states);
+        assert!(section.values().eq(cells));
+        for index in 1..states.len() {
+            section.set(section.local_of(index), states[0]).unwrap();
+        }
+        assert_eq!(section.storage(), &SectionStorage::Uniform(states[0]));
+    }
+
+    #[test]
     fn exhausted_revision_and_invalid_import_leave_cells_unchanged() {
         let mut section = Section::empty(16).unwrap();
         section.set(local(1, 1, 1), BlockStateId(1)).unwrap();

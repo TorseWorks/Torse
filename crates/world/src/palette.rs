@@ -4,6 +4,8 @@ use crate::BlockStateId;
 /// Maximum local symbols before falling back to direct state identifiers.
 pub const MAX_PALETTE_STATES: usize = 256;
 
+const STATE_WORDS: usize = (1 << u16::BITS) / u64::BITS as usize;
+
 /// Validated packed cells. Indices and reference counts stay private.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaletteCells {
@@ -69,16 +71,15 @@ impl PaletteCells {
         len: usize,
     ) -> Option<Self> {
         let mut states = Vec::new();
-        let mut counts = Vec::new();
+        let mut seen = [0u64; STATE_WORDS];
         for value in values.clone() {
-            if let Some(index) = states.iter().position(|s| *s == value) {
-                counts[index] += 1;
-            } else {
+            let (word, bit) = state_bit(value);
+            if seen[word] & bit == 0 {
                 if states.len() == MAX_PALETTE_STATES {
                     return None;
                 }
+                seen[word] |= bit;
                 states.push(value);
-                counts.push(1u32);
             }
         }
         if states.len() < 2 {
@@ -88,6 +89,24 @@ impl PaletteCells {
         if !smaller(len, states.len(), bits) {
             return None;
         }
+        // Rank each set bit by state ID, then map that rank back to the
+        // first-appearance order used by the packed representation.
+        let mut prefix = [0u16; STATE_WORDS];
+        let mut preceding = 0;
+        for (prefix, word) in prefix.iter_mut().zip(&seen) {
+            *prefix = preceding;
+            preceding += word.count_ones() as u16;
+        }
+        let rank = |state| {
+            let (word, bit) = state_bit(state);
+            debug_assert_ne!(seen[word] & bit, 0);
+            usize::from(prefix[word]) + (seen[word] & (bit - 1)).count_ones() as usize
+        };
+        let mut symbols = [0u8; MAX_PALETTE_STATES];
+        for (index, &state) in states.iter().enumerate() {
+            symbols[rank(state)] = index as u8;
+        }
+        let counts = vec![0; states.len()];
         let mut packed = Self {
             states,
             counts,
@@ -96,15 +115,11 @@ impl PaletteCells {
             len,
         };
         for (index, value) in values.enumerate() {
-            let symbol = packed
-                .states
-                .iter()
-                .position(|s| *s == value)
-                .expect("counted state");
+            let symbol = usize::from(symbols[rank(value)]);
+            packed.counts[symbol] += 1;
             packed.put(index, symbol);
         }
         packed.states.shrink_to_fit();
-        packed.counts.shrink_to_fit();
         Some(packed)
     }
     /// False requests a dense fallback; the previous packed value is unchanged.
@@ -174,6 +189,11 @@ impl PaletteCells {
         }
     }
 }
+fn state_bit(state: BlockStateId) -> (usize, u64) {
+    let index = usize::from(state.0);
+    (index / 64, 1 << (index % 64))
+}
+
 fn read(words: &[u64], bits: u8, index: usize) -> usize {
     let offset = index * usize::from(bits);
     let word = offset / 64;
