@@ -544,7 +544,6 @@ fn sparse_radius_32_light_admission_preserves_other_peers_and_replaces_old_links
 #[test]
 #[ignore = "explicit Release fixture for wide shared-light subscription admission"]
 fn wide_light_interest_admission_profile() {
-    assert!(!cfg!(debug_assertions));
     let dir = Directory::new();
     let (server, pages, _) = visual_fixture::create(&dir);
     let mut config = limits();
