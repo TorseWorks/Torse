@@ -299,24 +299,40 @@ impl HostLightField {
         ordered.sort_unstable_by_key(|&p| (distance(p, center), p.x, p.z, p.y));
         let mut admitted = BTreeSet::new();
         if available {
+            let mut column_fits = BTreeMap::new();
             for target in ordered {
-                if links + admitted.len() == self.limits.field.interests
-                    || (!targets.contains(&target) && targets.len() == self.limits.field.sections)
-                {
+                if links + admitted.len() == self.limits.field.interests {
+                    break;
+                }
+                if targets.len() == self.limits.field.sections && !targets.contains(&target) {
                     continue;
                 }
-                let envelope = match self.dependencies(&[target].into()) {
-                    Ok(envelope) => envelope,
-                    Err(e) if e.code == FaultCode::ResourceLimit => continue,
-                    Err(e) => return Err(e),
+                // All layers of a column share the same full-height envelope.
+                // The union only grows, so an envelope that did not fit cannot
+                // fit later. An accepted envelope is already in the union.
+                let fits = match column_fits.entry((target.x, target.z)) {
+                    std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let fits = match self.dependencies(&[target].into()) {
+                            Ok(envelope) => {
+                                let added =
+                                    envelope.iter().filter(|pos| !needed.contains(pos)).count();
+                                let fits = needed.len() + added <= self.limits.input_sections;
+                                if fits {
+                                    needed.extend(envelope);
+                                }
+                                fits
+                            }
+                            Err(error) if error.code == FaultCode::ResourceLimit => false,
+                            Err(error) => return Err(error),
+                        };
+                        *entry.insert(fits)
+                    }
                 };
-                let added = envelope.iter().filter(|p| !needed.contains(p)).count();
-                if needed.len() + added > self.limits.input_sections {
-                    continue;
+                if fits {
+                    targets.insert(target);
+                    admitted.insert(target);
                 }
-                needed.extend(envelope);
-                targets.insert(target);
-                admitted.insert(target);
             }
         }
         let count = admitted.len();

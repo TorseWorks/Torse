@@ -542,6 +542,51 @@ fn sparse_radius_32_light_admission_preserves_other_peers_and_replaces_old_links
 }
 
 #[test]
+#[ignore = "explicit Release fixture for wide shared-light subscription admission"]
+fn wide_light_interest_admission_profile() {
+    let dir = Directory::new();
+    let (server, pages, _) = visual_fixture::create(&dir);
+    let mut config = limits();
+    config.input_sections = 4096;
+    config.input_bytes = 96 * 1024 * 1024;
+    config.field.sections = 2048;
+    config.field.interests = 8192;
+    let mut field = HostLightField::new(server.authority().unwrap(), pages, config).unwrap();
+    let positions = |center: i64| {
+        (-16..=16)
+            .flat_map(|x| {
+                (-16..=16)
+                    .flat_map(move |z| (-4..=19).map(move |y| SectionPos::new(center + x, y, z)))
+            })
+            .collect::<Vec<_>>()
+    };
+    let left = positions(0);
+    let right = positions(7);
+    assert_eq!(left.len(), 26_136);
+    field
+        .subscribe_near(2, &right, SectionPos::new(7, 0, 0))
+        .unwrap();
+    for sample in 0..25 {
+        let (scope, center) = if sample % 2 == 0 {
+            (&left, SectionPos::ZERO)
+        } else {
+            (&right, SectionPos::new(7, 0, 0))
+        };
+        let started = Instant::now();
+        let count = field.subscribe_near(1, scope, center).unwrap();
+        let elapsed_ns = started.elapsed().as_nanos();
+        let diagnostics = field.resource_diagnostics();
+        assert!(count > 0 && count < scope.len());
+        assert!(diagnostics.input_sections <= config.input_sections);
+        assert!(diagnostics.admitted_links <= config.field.interests);
+        println!(
+            "admit sample={sample} elapsed_ns={elapsed_ns} count={count} inputs={} links={} denials={}",
+            diagnostics.input_sections, diagnostics.admitted_links, diagnostics.admission_denials
+        );
+    }
+}
+
+#[test]
 fn consumer_and_link_caps_only_deny_optional_light_links() {
     for consumer_cap in [true, false] {
         let dir = Directory::new();
