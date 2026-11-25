@@ -94,6 +94,32 @@ fn drain(client: &mut MemoryTransport) -> Vec<ServerMessage> {
     result
 }
 #[test]
+fn equal_size_visual_resets_have_equal_wire_and_owned_costs() {
+    let reset = |sections: Vec<SectionPos>| TerrainReset {
+        retained: sections
+            .iter()
+            .copied()
+            .map(|pos| (pos, Digest([0; 32])))
+            .collect(),
+        sections,
+    };
+    let near = reset(vec![SectionPos::ZERO, SectionPos::new(1, 2, 3)]);
+    let extreme = reset(vec![
+        SectionPos::new(i64::MIN, i64::MIN, i64::MIN),
+        SectionPos::new(i64::MAX, i64::MAX, i64::MAX),
+    ]);
+    let limits = network();
+    let cost =
+        |value: &TerrainReset| wire::measure_inner(value, limits.budget, limits.codec).unwrap();
+    assert_eq!(cost(&near), cost(&extreme));
+    let smaller = cost(&reset(vec![SectionPos::ZERO]));
+    let full = cost(&near);
+    assert!(smaller.encoded_bytes < full.encoded_bytes);
+    assert!(smaller.owned_bytes < full.owned_bytes);
+    assert!(smaller.items < full.items);
+}
+
+#[test]
 #[ignore = "explicit Release fixture for repeated wide visual admission"]
 fn wide_visual_interest_replacement_profile() {
     let dir = Directory::new();
