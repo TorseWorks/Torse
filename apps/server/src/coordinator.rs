@@ -272,6 +272,15 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         sink: &mut impl InvalidationSink,
         max_records: u32,
     ) -> Result<CommitBatch, Fault> {
+        self.drive_batch_while(sink, max_records, |_| true)
+    }
+
+    pub(crate) fn drive_batch_while(
+        &mut self,
+        sink: &mut impl InvalidationSink,
+        max_records: u32,
+        continue_after: impl Fn(&A) -> bool,
+    ) -> Result<CommitBatch, Fault> {
         if self.state != ServerState::Running {
             return Err(stopped());
         }
@@ -298,7 +307,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
                     break;
                 }
             }
-            if self.authority.at_tick_boundary() {
+            if self.authority.at_tick_boundary() || !continue_after(&self.authority) {
                 break;
             }
         }

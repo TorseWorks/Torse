@@ -1949,6 +1949,17 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
 }
 
 impl ExecutionHost {
+    pub(crate) fn has_frozen_task(&self) -> bool {
+        self.runtime
+            .work
+            .as_ref()
+            .is_some_and(|work| (work.next as usize) < work.tasks.len())
+    }
+
+    pub(crate) fn can_batch_phase_prelude(&self) -> bool {
+        self.stopping.is_none() && self.section_pending.is_none() && !self.has_frozen_task()
+    }
+
     fn prepare_unbudgeted(&mut self) -> Result<Option<ExecutionPrepared>, Fault> {
         if let Some(prepared) = self.section_pending.take() {
             return Ok(Some(prepared));
