@@ -335,6 +335,7 @@ pub(crate) struct VisualSession {
     light_seq: u64,
     reserved_bytes: u64,
     wire_budget: OutputBudget,
+    checked_control_sections: usize,
     codec: torse_codec::CodecLimits,
     order: Vec<SectionPos>,
     scan_cursor: usize,
@@ -351,7 +352,7 @@ impl VisualSession {
     pub(crate) fn center(&self) -> SectionPos {
         self.center
     }
-    pub(crate) fn check_request(&self, desired: &ReplicaScope) -> Result<(), Fault> {
+    pub(crate) fn check_request(&mut self, desired: &ReplicaScope) -> Result<(), Fault> {
         self.approved
             .check_desired(desired, self.limits.max_sections)?;
         if desired == &self.desired {
@@ -360,13 +361,21 @@ impl VisualSession {
         self.generation
             .checked_add(1)
             .ok_or_else(|| Fault::resource_limit("visual generation exhausted"))?;
-        Self::check_control(
-            self.binding,
-            desired,
-            self.limits.control_bytes,
-            self.wire_budget,
-            self.codec,
-        )
+        // Both reset collections contain fixed-width values with fixed
+        // decoder charges per entry. Moving or shrinking an approved window
+        // within the checked count fits the same immutable session budgets.
+        let sections = desired.sections.len();
+        if sections > self.checked_control_sections {
+            Self::check_control(
+                self.binding,
+                desired,
+                self.limits.control_bytes,
+                self.wire_budget,
+                self.codec,
+            )?;
+            self.checked_control_sections = sections;
+        }
+        Ok(())
     }
     fn check_control(
         binding: Binding,
@@ -593,6 +602,7 @@ impl VisualSession {
             network.codec,
         )?;
         let VisualStart { center, generation } = start;
+        let checked_control_sections = desired.sections.len();
         let binding = host.binding();
         let side = host.world().store().side();
         let bounds = host.world().store().bounds();
@@ -715,6 +725,7 @@ impl VisualSession {
             light_seq: 0,
             reserved_bytes: charge,
             wire_budget: network.budget,
+            checked_control_sections,
             codec: network.codec,
             order: Vec::new(),
             scan_cursor: 0,
