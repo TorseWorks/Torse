@@ -495,8 +495,8 @@ fn sparse_radius_32_light_admission_preserves_other_peers_and_replaces_old_links
     let dir = Directory::new();
     let server = fixture::create(&dir);
     let mut config = limits();
-    // A single target's 3x3 horizontal halo spans two vertical sections.
-    config.input_sections = 18;
+    // The 3x3 halo uses 18 sections. One spare layer cannot fit another column.
+    config.input_sections = 19;
     let mut light =
         HostLightField::new(server.authority().unwrap(), fixture::pages(&dir), config).unwrap();
     let origin = SectionPos::ZERO;
