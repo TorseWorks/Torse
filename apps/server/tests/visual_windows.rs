@@ -94,6 +94,52 @@ fn drain(client: &mut MemoryTransport) -> Vec<ServerMessage> {
     result
 }
 #[test]
+#[ignore = "explicit Release fixture for repeated wide visual admission"]
+fn wide_visual_interest_replacement_profile() {
+    let dir = Directory::new();
+    let (mut server, pages) = create(&dir);
+    let approval = VisualTerrainApproval::rectangular(
+        SectionPos::new(-32, -4, -32),
+        SectionPos::new(40, 19, 32),
+    )
+    .unwrap();
+    let left = desired(&approval, 0, 16);
+    let right = desired(&approval, 7, 16);
+    assert_eq!(left.sections.len(), 26_136);
+    assert_eq!(right.sections.len(), left.sections.len());
+    let mut hub = NetworkHub::<MemoryTransport>::new(server.binding(), network()).unwrap();
+    let near = ReplicaScope {
+        sections: [SectionPos::ZERO].into(),
+    };
+    let (id, _client, _, _) = fixture::interest::attach(&mut hub, &mut server, near);
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages,
+        approval,
+        left.clone(),
+        SectionPos::ZERO,
+        limits(),
+    )
+    .unwrap();
+    let initial = hub.visual_terrain_diagnostics(id).unwrap().generation;
+    for sample in 0..25 {
+        let (request, center) = if sample % 2 == 0 {
+            (right.clone(), SectionPos::new(7, 0, 0))
+        } else {
+            (left.clone(), SectionPos::ZERO)
+        };
+        let started = Instant::now();
+        hub.set_visual_interest_deferred(id, request, center)
+            .unwrap();
+        let elapsed_ns = started.elapsed().as_nanos();
+        let generation = hub.visual_terrain_diagnostics(id).unwrap().generation;
+        assert_eq!(generation, initial + sample + 1);
+        println!("visual sample={sample} elapsed_ns={elapsed_ns} generation={generation}");
+    }
+}
+
+#[test]
 fn full_height_control_admission_precedes_session_mutation_and_keeps_small_cache_independent() {
     let dir = Directory::new();
     let (mut server, pages) = create(&dir);
