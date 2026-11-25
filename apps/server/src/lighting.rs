@@ -283,7 +283,8 @@ impl HostLightField {
             .filter(|(id, _)| **id != consumer)
             .flat_map(|(_, s)| s.iter().copied())
             .collect();
-        let mut needed = self.dependencies(&targets)?;
+        let column_limit = self.input_column_limit();
+        let mut needed = self.dependency_columns(targets.iter().copied(), column_limit)?;
         let links: usize = self
             .interests
             .iter()
@@ -313,11 +314,11 @@ impl HostLightField {
                 let fits = match column_fits.entry((target.x, target.z)) {
                     std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        let fits = match self.dependencies(&[target].into()) {
+                        let fits = match self.dependency_columns([target], column_limit) {
                             Ok(envelope) => {
                                 let added =
                                     envelope.iter().filter(|pos| !needed.contains(pos)).count();
-                                let fits = needed.len() + added <= self.limits.input_sections;
+                                let fits = added <= column_limit - needed.len();
                                 if fits {
                                     needed.extend(envelope);
                                 }
@@ -343,7 +344,7 @@ impl HostLightField {
                 .subscribe(consumer, &admitted.iter().copied().collect::<Vec<_>>())?;
             self.interests.insert(consumer, admitted);
             self.centers.insert(consumer, center);
-            self.set_needed(needed);
+            self.set_needed(self.expand_input_columns(needed));
         }
         self.admission_denials = self
             .admission_denials
@@ -411,36 +412,61 @@ impl HostLightField {
         Ok(())
     }
     fn dependencies(&self, targets: &BTreeSet<SectionPos>) -> Result<BTreeSet<SectionPos>, Fault> {
-        let side = i128::from(self.terrain.side());
+        let columns =
+            self.dependency_columns(targets.iter().copied(), self.input_column_limit())?;
+        Ok(self.expand_input_columns(columns))
+    }
+
+    fn input_layers(&self) -> std::ops::RangeInclusive<i64> {
+        let side = i64::from(self.terrain.side());
         let bounds = self.terrain.bounds();
-        let ymin = i128::from(bounds.min_y).div_euclid(side);
-        let ymax = (i128::from(bounds.max_y) - 1).div_euclid(side);
+        bounds.min_y.div_euclid(side)..=(bounds.max_y - 1).div_euclid(side)
+    }
+
+    fn input_column_limit(&self) -> usize {
+        let layers = self.input_layers();
+        let count = i128::from(*layers.end()) - i128::from(*layers.start()) + 1;
+        // Every included column contributes the same complete set of layers.
+        (self.limits.input_sections as i128 / count) as usize
+    }
+
+    fn expand_input_columns(&self, columns: BTreeSet<(i64, i64)>) -> BTreeSet<SectionPos> {
+        let layers = self.input_layers();
+        columns
+            .into_iter()
+            .flat_map(|(x, z)| layers.clone().map(move |y| SectionPos::new(x, y, z)))
+            .collect()
+    }
+
+    fn dependency_columns(
+        &self,
+        targets: impl IntoIterator<Item = SectionPos>,
+        column_limit: usize,
+    ) -> Result<BTreeSet<(i64, i64)>, Fault> {
+        let side = i128::from(self.terrain.side());
         let mut needed = BTreeSet::new();
-        let mut columns = BTreeSet::new();
-        for &target in targets {
+        let mut targets_seen = BTreeSet::new();
+        for target in targets {
             self.validate_target(target)?;
-            if !columns.insert((target.x, target.z)) {
+            if !targets_seen.insert((target.x, target.z)) {
                 continue;
             }
             let first = |v: i64| (i128::from(v) * side - 15).div_euclid(side);
             let last = |v: i64| (i128::from(v) * side + side + 14).div_euclid(side);
             let width = last(target.x) - first(target.x) + 1;
             let depth = last(target.z) - first(target.z) + 1;
-            if width * depth * (ymax - ymin + 1) > self.limits.input_sections as i128 {
+            if width * depth > column_limit as i128 {
                 return Err(Fault::resource_limit("light source envelope"));
             }
             for x in first(target.x)..=last(target.x) {
-                for y in ymin..=ymax {
-                    for z in first(target.z)..=last(target.z) {
-                        let pos = SectionPos::new(
-                            i64::try_from(x).map_err(invalid)?,
-                            i64::try_from(y).map_err(invalid)?,
-                            i64::try_from(z).map_err(invalid)?,
-                        );
-                        needed.insert(pos);
-                        if needed.len() > self.limits.input_sections {
-                            return Err(Fault::resource_limit("light source union"));
-                        }
+                for z in first(target.z)..=last(target.z) {
+                    let column = (
+                        i64::try_from(x).map_err(invalid)?,
+                        i64::try_from(z).map_err(invalid)?,
+                    );
+                    needed.insert(column);
+                    if needed.len() > column_limit {
+                        return Err(Fault::resource_limit("light source union"));
                     }
                 }
             }
