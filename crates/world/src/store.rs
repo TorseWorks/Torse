@@ -206,6 +206,41 @@ impl Entry {
     }
 }
 
+/// Process-local identity of the readable terrain in one store.
+///
+/// Equal versions refer to the same store and certify that no readable
+/// section or exterior policy changed between observations.
+#[derive(Clone, Debug)]
+pub struct ReadableTerrainVersion {
+    identity: std::sync::Arc<()>,
+    version: u64,
+}
+
+impl PartialEq for ReadableTerrainVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.version == other.version && std::sync::Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+
+impl Eq for ReadableTerrainVersion {}
+
+impl ReadableTerrainVersion {
+    fn new() -> Self {
+        Self {
+            identity: std::sync::Arc::new(()),
+            version: 0,
+        }
+    }
+
+    fn advance(&mut self) {
+        if let Some(next) = self.version.checked_add(1) {
+            self.version = next;
+        } else {
+            *self = Self::new();
+        }
+    }
+}
+
 /// In-memory terrain keyed by section coordinate.
 #[derive(Debug)]
 pub struct SectionStore {
@@ -215,6 +250,7 @@ pub struct SectionStore {
     sections: BTreeMap<SectionPos, Entry>,
     retired: BTreeMap<SectionPos, Revision>,
     retired_floor: Option<Revision>,
+    readable_version: ReadableTerrainVersion,
 }
 
 const RETIRED_REVISION_LIMIT: usize = 1024;
@@ -230,6 +266,7 @@ impl SectionStore {
             sections: BTreeMap::new(),
             retired: BTreeMap::new(),
             retired_floor: None,
+            readable_version: ReadableTerrainVersion::new(),
         })
     }
 
@@ -251,7 +288,15 @@ impl SectionStore {
     /// Replace the exterior policy. Hosts should do this through the authority
     /// so the compatibility identity changes with it.
     pub fn set_exterior(&mut self, policy: ExteriorPolicy) {
-        self.exterior = policy;
+        if self.exterior != policy {
+            self.exterior = policy;
+            self.readable_version.advance();
+        }
+    }
+
+    /// Snapshot the current process-local version for derived terrain caches.
+    pub fn readable_version(&self) -> ReadableTerrainVersion {
+        self.readable_version.clone()
     }
 
     /// Current phase of a section, or `None` when it is absent.
@@ -362,6 +407,7 @@ impl SectionStore {
         match entry.phase {
             SectionPhase::Loading => {
                 entry.phase = SectionPhase::Ready;
+                self.readable_version.advance();
                 Ok(())
             }
             phase => Err(StoreError::WrongPhase {
@@ -476,7 +522,9 @@ impl SectionStore {
                 });
             }
         }
-        entry.section.set(local, state)?;
+        if entry.section.set(local, state)? {
+            self.readable_version.advance();
+        }
         Ok(entry.section.revision())
     }
 
@@ -528,6 +576,7 @@ impl SectionStore {
         edits: &[BlockEdit],
     ) -> Result<Vec<(SectionPos, Revision)>, StoreError> {
         let touched = self.validate_edits(edits)?;
+        let mut advanced = false;
 
         for edit in edits {
             let (section_pos, local) = edit
@@ -538,7 +587,11 @@ impl SectionStore {
                 .sections
                 .get_mut(&section_pos)
                 .ok_or(StoreError::NotLoaded { pos: section_pos })?;
-            entry.section.set(local, edit.state)?;
+            // Advance with the first changed cell, even if a later write errors.
+            if entry.section.set(local, edit.state)? && !advanced {
+                self.readable_version.advance();
+                advanced = true;
+            }
         }
 
         let mut revisions = Vec::with_capacity(touched.len());
@@ -638,6 +691,7 @@ impl SectionStore {
             SectionPhase::Ready => {
                 self.retire(pos, entry.section.revision());
                 self.sections.remove(&pos);
+                self.readable_version.advance();
                 Ok(())
             }
             phase => Err(StoreError::WrongPhase {
@@ -655,6 +709,9 @@ impl SectionStore {
     pub fn discard(&mut self, pos: SectionPos) -> Option<Section> {
         self.sections.remove(&pos).map(|entry| {
             self.retire(pos, entry.section.revision());
+            if matches!(entry.phase, SectionPhase::Ready | SectionPhase::Active) {
+                self.readable_version.advance();
+            }
             entry.section
         })
     }
@@ -984,6 +1041,43 @@ mod tests {
             assert!(store.readable_section(pos).is_none());
             assert!(store.section(pos).is_none());
         }
+    }
+
+    #[test]
+    fn readable_version_tracks_terrain_without_counting_tickets_or_noop_edits() {
+        let mut terrain = store();
+        let pos = SectionPos::ZERO;
+        let empty = terrain.readable_version();
+        assert_ne!(empty, store().readable_version());
+        terrain.request(pos).unwrap();
+        terrain.install(pos, Section::empty(16).unwrap()).unwrap();
+        assert_eq!(empty, terrain.readable_version());
+        terrain.finish_load(pos).unwrap();
+        let loaded = terrain.readable_version();
+        assert_ne!(empty, loaded);
+        let ticket = terrain.acquire_ticket(pos, TicketKind::Player).unwrap();
+        terrain.edit(BlockPos::ZERO, BlockStateId::EMPTY).unwrap();
+        assert!(terrain.unload(pos).is_err());
+        terrain.release_ticket(ticket).unwrap();
+        assert_eq!(loaded, terrain.readable_version());
+
+        terrain
+            .apply_edits(&[BlockEdit {
+                pos: BlockPos::ZERO,
+                state: BlockStateId(2),
+            }])
+            .unwrap();
+        let edited = terrain.readable_version();
+        assert_ne!(loaded, edited);
+        terrain.edit(BlockPos::ZERO, BlockStateId(1)).unwrap();
+        let edited_again = terrain.readable_version();
+        assert_ne!(edited, edited_again);
+        terrain.unload(pos).unwrap();
+        assert_ne!(edited_again, terrain.readable_version());
+        ready(&mut terrain, pos, BlockStateId(1));
+        let reloaded = terrain.readable_version();
+        terrain.discard(pos).unwrap();
+        assert_ne!(reloaded, terrain.readable_version());
     }
 
     #[test]
