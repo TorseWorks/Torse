@@ -12,7 +12,10 @@
 //! release its tickets, which keeps async work and eviction visible in the
 //! call graph instead of hiding behind a background thread.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroUsize,
+};
 
 use sha2::{Digest as _, Sha256};
 use torse_types::{BlockPos, Compatibility, Digest, Revision, SectionPos};
@@ -241,6 +244,35 @@ impl ReadableTerrainVersion {
     }
 }
 
+/// Coalesced changes since the owner last drained the readable terrain tracker.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ReadableColumnChanges {
+    /// The observer must rebuild its derived view.
+    All,
+    /// Columns with a changed readable section. Each column is listed once.
+    Columns(BTreeSet<(i64, i64)>),
+}
+
+#[derive(Debug)]
+struct ReadableColumnTracker {
+    limit: NonZeroUsize,
+    pending: ReadableColumnChanges,
+}
+
+impl ReadableColumnTracker {
+    fn record(&mut self, pos: SectionPos) {
+        let ReadableColumnChanges::Columns(columns) = &mut self.pending else {
+            return;
+        };
+        let column = (pos.x, pos.z);
+        if columns.len() == self.limit.get() && !columns.contains(&column) {
+            self.pending = ReadableColumnChanges::All;
+        } else {
+            columns.insert(column);
+        }
+    }
+}
+
 /// In-memory terrain keyed by section coordinate.
 #[derive(Debug)]
 pub struct SectionStore {
@@ -251,6 +283,7 @@ pub struct SectionStore {
     retired: BTreeMap<SectionPos, Revision>,
     retired_floor: Option<Revision>,
     readable_version: ReadableTerrainVersion,
+    readable_columns: Option<ReadableColumnTracker>,
 }
 
 const RETIRED_REVISION_LIMIT: usize = 1024;
@@ -267,6 +300,7 @@ impl SectionStore {
             retired: BTreeMap::new(),
             retired_floor: None,
             readable_version: ReadableTerrainVersion::new(),
+            readable_columns: None,
         })
     }
 
@@ -291,7 +325,30 @@ impl SectionStore {
         if self.exterior != policy {
             self.exterior = policy;
             self.readable_version.advance();
+            if let Some(tracker) = &mut self.readable_columns {
+                tracker.pending = ReadableColumnChanges::All;
+            }
         }
+    }
+
+    /// Start coalescing readable changes for the store owner. The first drain
+    /// requests a rebuild. Overflow discards the partial list and requests
+    /// another rebuild, without allocating beyond the supplied column count.
+    pub fn track_readable_columns(&mut self, limit: NonZeroUsize) {
+        self.readable_columns = Some(ReadableColumnTracker {
+            limit,
+            pending: ReadableColumnChanges::All,
+        });
+    }
+
+    /// Drain the owner's change list. Returns None when tracking is disabled.
+    pub fn take_readable_column_changes(&mut self) -> Option<ReadableColumnChanges> {
+        self.readable_columns.as_mut().map(|tracker| {
+            std::mem::replace(
+                &mut tracker.pending,
+                ReadableColumnChanges::Columns(BTreeSet::new()),
+            )
+        })
     }
 
     /// Snapshot the current process-local version for derived terrain caches.
@@ -408,6 +465,9 @@ impl SectionStore {
             SectionPhase::Loading => {
                 entry.phase = SectionPhase::Ready;
                 self.readable_version.advance();
+                if let Some(tracker) = &mut self.readable_columns {
+                    tracker.record(pos);
+                }
                 Ok(())
             }
             phase => Err(StoreError::WrongPhase {
@@ -524,6 +584,9 @@ impl SectionStore {
         }
         if entry.section.set(local, state)? {
             self.readable_version.advance();
+            if let Some(tracker) = &mut self.readable_columns {
+                tracker.record(section_pos);
+            }
         }
         Ok(entry.section.revision())
     }
@@ -588,9 +651,14 @@ impl SectionStore {
                 .get_mut(&section_pos)
                 .ok_or(StoreError::NotLoaded { pos: section_pos })?;
             // Advance with the first changed cell, even if a later write errors.
-            if entry.section.set(local, edit.state)? && !advanced {
-                self.readable_version.advance();
-                advanced = true;
+            if entry.section.set(local, edit.state)? {
+                if !advanced {
+                    self.readable_version.advance();
+                    advanced = true;
+                }
+                if let Some(tracker) = &mut self.readable_columns {
+                    tracker.record(section_pos);
+                }
             }
         }
 
@@ -692,6 +760,9 @@ impl SectionStore {
                 self.retire(pos, entry.section.revision());
                 self.sections.remove(&pos);
                 self.readable_version.advance();
+                if let Some(tracker) = &mut self.readable_columns {
+                    tracker.record(pos);
+                }
                 Ok(())
             }
             phase => Err(StoreError::WrongPhase {
@@ -711,6 +782,9 @@ impl SectionStore {
             self.retire(pos, entry.section.revision());
             if matches!(entry.phase, SectionPhase::Ready | SectionPhase::Active) {
                 self.readable_version.advance();
+                if let Some(tracker) = &mut self.readable_columns {
+                    tracker.record(pos);
+                }
             }
             entry.section
         })
@@ -1078,6 +1152,76 @@ mod tests {
         let reloaded = terrain.readable_version();
         terrain.discard(pos).unwrap();
         assert_ne!(reloaded, terrain.readable_version());
+    }
+
+    #[test]
+    fn readable_column_tracker_coalesces_layers_and_excludes_unreadable_updates() {
+        use ReadableColumnChanges::{All, Columns};
+        let mut store = store();
+        let a = SectionPos::ZERO;
+        let b = SectionPos::new(0, 1, 0);
+        let c = SectionPos::new(-1, 0, 0);
+        assert_eq!(store.take_readable_column_changes(), None);
+        store.track_readable_columns(NonZeroUsize::new(2).unwrap());
+        assert_eq!(store.take_readable_column_changes(), Some(All));
+        store.request(a).unwrap();
+        store.install(a, Section::empty(16).unwrap()).unwrap();
+        assert_eq!(
+            store.take_readable_column_changes(),
+            Some(Columns(BTreeSet::new()))
+        );
+        store.finish_load(a).unwrap();
+        ready(&mut store, b, BlockStateId::EMPTY);
+        ready(&mut store, c, BlockStateId::EMPTY);
+        assert_eq!(
+            store.take_readable_column_changes(),
+            Some(Columns([(0, 0), (-1, 0)].into()))
+        );
+        store
+            .apply_edits(&[
+                BlockEdit {
+                    pos: BlockPos::ZERO,
+                    state: BlockStateId(1),
+                },
+                BlockEdit {
+                    pos: BlockPos::new(-1, 0, 0),
+                    state: BlockStateId(1),
+                },
+            ])
+            .unwrap();
+        store
+            .edit(BlockPos::new(0, 16, 0), BlockStateId::EMPTY)
+            .unwrap();
+        assert_eq!(
+            store.take_readable_column_changes(),
+            Some(Columns([(0, 0), (-1, 0)].into()))
+        );
+        store.unload(a).unwrap();
+        store.discard(b).unwrap();
+        assert_eq!(
+            store.take_readable_column_changes(),
+            Some(Columns([(0, 0)].into()))
+        );
+    }
+
+    #[test]
+    fn readable_column_tracker_reports_overflow_and_exterior_rebuilds() {
+        use ReadableColumnChanges::{All, Columns};
+        let mut store = store();
+        store.track_readable_columns(NonZeroUsize::new(1).unwrap());
+        assert_eq!(store.take_readable_column_changes(), Some(All));
+        ready(&mut store, SectionPos::ZERO, BlockStateId::EMPTY);
+        ready(&mut store, SectionPos::new(1, 0, 0), BlockStateId::EMPTY);
+        assert_eq!(store.take_readable_column_changes(), Some(All));
+        store.set_exterior(ExteriorPolicy {
+            below: !store.exterior().below,
+            ..store.exterior()
+        });
+        assert_eq!(store.take_readable_column_changes(), Some(All));
+        assert_eq!(
+            store.take_readable_column_changes(),
+            Some(Columns(BTreeSet::new()))
+        );
     }
 
     #[test]

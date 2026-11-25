@@ -76,7 +76,7 @@ pub use section::{
     linear_index,
 };
 pub use store::{
-    BlockEdit, ExteriorPolicy, ReadableTerrainVersion, SectionPhase, SectionStore, StoreError,
-    StoreStats, TICKET_QUOTA_PER_KIND, TerrainQuery, TicketHandle, TicketKind, WorldBounds,
-    bind_exterior,
+    BlockEdit, ExteriorPolicy, ReadableColumnChanges, ReadableTerrainVersion, SectionPhase,
+    SectionStore, StoreError, StoreStats, TICKET_QUOTA_PER_KIND, TerrainQuery, TicketHandle,
+    TicketKind, WorldBounds, bind_exterior,
 };
