@@ -167,6 +167,27 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         self.authority.set_projection_optimization(enabled);
         Ok(())
     }
+    /// Advance phase bookkeeping and freeze the next task table under one
+    /// durability barrier. Stop at a runnable task or the next tick boundary.
+    /// The host can then acknowledge and drain executable work separately.
+    /// Pending section work and shutdown control keep single-record barriers.
+    pub fn drive_phase_prelude(
+        &mut self,
+        sink: &mut impl InvalidationSink,
+        max_records: u32,
+    ) -> Result<crate::CommitBatch, Fault> {
+        let authority = self.authority()?;
+        if authority.has_frozen_task() {
+            return Err(Fault::invalid_data(
+                "frozen work must be driven before the phase prelude",
+            ));
+        }
+        let group = authority.can_batch_phase_prelude();
+        self.drive_batch_while(sink, max_records, |authority| {
+            group && authority.can_batch_phase_prelude()
+        })
+    }
+
     /// Finish one logical tick, including a recovered partial tick, within an
     /// explicit work budget. This never skips a tick or invokes future events.
     pub fn drive_tick(

@@ -355,9 +355,34 @@ fn batch_crash_child() {
     let Ok(path) = std::env::var("TORSE_BATCH_CRASH_PATH") else {
         return;
     };
-    let early = std::env::var("TORSE_BATCH_CRASH_MODE").unwrap() == "publish";
+    let mode = std::env::var("TORSE_BATCH_CRASH_MODE").unwrap();
     let mut config = base::file_policy();
     config.journal.max_pending_records = 16;
+    if mode == "prelude" {
+        let mut server = base::Files::create_file(
+            WorldDirectory::acquire(path, base::WORLD, 65536).unwrap(),
+            binding().compatibility,
+            base::Codec::new(base::codec_limits()).unwrap(),
+            config,
+            |b| {
+                Ok(host(
+                    b,
+                    Workload {
+                        tasks: 8,
+                        contended: false,
+                    },
+                    true,
+                ))
+            },
+        )
+        .unwrap();
+        let flushes = server.flush_metrics().calls;
+        let report = server.drive_phase_prelude(&mut NoReplicas, 16).unwrap();
+        assert_eq!(report.committed, 7);
+        assert_eq!(report.durability.through.0, 7);
+        assert_eq!(server.flush_metrics().calls - flushes, 1);
+        std::process::exit(82);
+    }
     let mut server = FileServer::<CrashHost, base::Codec>::create_file(
         WorldDirectory::acquire(path, base::WORLD, 65536).unwrap(),
         binding().compatibility,
@@ -374,7 +399,7 @@ fn batch_crash_child() {
                     true,
                 ),
                 published: 0,
-                early,
+                early: mode == "publish",
             })
         },
     )
@@ -392,7 +417,7 @@ fn process_exit_discards_unflushed_batch_or_recovers_synced_batch_without_duplic
         tasks: 8,
         contended: false,
     };
-    for mode in ["publish", "durable"] {
+    for mode in ["publish", "durable", "prelude"] {
         let dir = Directory::new();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "batch_crash_child", "--nocapture"])
@@ -411,8 +436,24 @@ fn process_exit_discards_unflushed_batch_or_recovers_synced_batch_without_duplic
         .unwrap();
         assert_eq!(
             recovered.authority().unwrap().cursor().seq.0,
-            if mode == "publish" { 0 } else { 16 }
+            match mode {
+                "publish" => 0,
+                "prelude" => 7,
+                _ => 16,
+            }
         );
+        if mode == "prelude" {
+            let work = recovered
+                .authority()
+                .unwrap()
+                .runtime()
+                .work
+                .as_ref()
+                .unwrap();
+            assert_eq!((work.tasks.len(), work.next), (8, 0));
+            assert!(recovered.drive_phase_prelude(&mut NoReplicas, 16).is_err());
+            assert_eq!(recovered.authority().unwrap().cursor().seq.0, 7);
+        }
         recovered.set_commit_batch_limit(16).unwrap();
         recovered.drive_tick(&mut NoReplicas, 64).unwrap();
         load.verify(recovered.authority().unwrap().world(), 1);
@@ -491,6 +532,27 @@ fn batch_capacity_flushes_accepted_prefix_and_invalidation_precedes_barrier() {
     assert_eq!(server.durability().through.0, 20);
     assert!(server.set_commit_batch_limit(0).is_err());
     assert!(server.drive_batch(&mut sink, 1025).is_err());
+}
+
+#[test]
+fn phase_prelude_retries_a_bounded_journal_prefix() {
+    let dir = Directory::new();
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let mut server = memory(&dir, &trace, 2, 0, false, 16);
+    let mut sink = Sink(Arc::clone(&trace));
+    for seq in [2, 4, 6] {
+        let batch = server.drive_phase_prelude(&mut sink, 16).unwrap();
+        assert_eq!(batch.committed, 2);
+        assert_eq!(batch.durability.through.0, seq);
+        assert!(matches!(batch.blocked, Some(StageError::Busy)));
+    }
+    let batch = server.drive_phase_prelude(&mut sink, 16).unwrap();
+    assert_eq!(batch.committed, 1);
+    assert_eq!(batch.durability.through.0, 7);
+    assert!(batch.blocked.is_none());
+    let work = server.authority().unwrap().runtime().work.as_ref().unwrap();
+    assert_eq!((work.tasks.len(), work.next), (8, 0));
+    assert_eq!(trace.lock().unwrap().syncs, 4);
 }
 
 #[test]
