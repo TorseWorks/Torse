@@ -146,16 +146,29 @@ fn distance(pos: SectionPos, center: SectionPos) -> u128 {
         + u128::from(pos.y.abs_diff(center.y))
         + u128::from(pos.z.abs_diff(center.z))
 }
-type ColumnPriority = (u128, i64, i64, u64, SectionPos);
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ColumnPriority {
+    horizontal: u128,
+    x: i64,
+    z: i64,
+    vertical: u64,
+    y: i64,
+}
+
+impl ColumnPriority {
+    fn position(&self) -> SectionPos {
+        SectionPos::new(self.x, self.y, self.z)
+    }
+}
 
 fn column_priority(pos: SectionPos, center: SectionPos) -> ColumnPriority {
-    (
-        u128::from(pos.x.abs_diff(center.x)) + u128::from(pos.z.abs_diff(center.z)),
-        pos.x,
-        pos.z,
-        pos.y.abs_diff(center.y),
-        pos,
-    )
+    ColumnPriority {
+        horizontal: u128::from(pos.x.abs_diff(center.x)) + u128::from(pos.z.abs_diff(center.z)),
+        x: pos.x,
+        z: pos.z,
+        vertical: pos.y.abs_diff(center.y),
+        y: pos.y,
+    }
 }
 enum Read {
     Saved(Digest),
@@ -408,18 +421,19 @@ impl VisualSession {
         check_frame(&message, budget, codec)
     }
     fn prioritize(&mut self) {
-        self.order = self.desired.sections.iter().copied().collect();
-        self.order
-            .sort_unstable_by_key(|&p| column_priority(p, self.center));
         self.candidates = self
-            .order
+            .desired
+            .sections
             .iter()
             .map(|&p| column_priority(p, self.center))
             .collect();
+        self.order.clear();
+        self.order
+            .extend(self.candidates.iter().map(ColumnPriority::position));
         self.dirty = self
             .dirty
             .iter()
-            .map(|&(.., pos)| column_priority(pos, self.center))
+            .map(|key| column_priority(key.position(), self.center))
             .collect();
         self.scan_cursor = 0;
         self.light_cursor = 0;
@@ -1045,7 +1059,8 @@ impl VisualSession {
             let mut items = Vec::new();
             let mut resident_bytes = 0u64;
             let mut inspected = 0;
-            while let Some(candidate @ (.., pos)) = self.candidates.pop_first() {
+            while let Some(candidate) = self.candidates.pop_first() {
+                let pos = candidate.position();
                 if items.len() >= self.limits.pages_per_poll || inspected >= scan {
                     self.candidates.insert(candidate);
                     break;
@@ -1178,13 +1193,14 @@ impl VisualSession {
         let reset = None;
         let mut pages = Vec::new();
         let mut bytes = 0u64;
-        for key @ (.., pos) in self
+        for key in self
             .dirty
             .iter()
             .copied()
             .take(self.limits.pages_per_poll * 2)
             .collect::<Vec<_>>()
         {
+            let pos = key.position();
             if !self.desired.sections.contains(&pos) {
                 self.dirty.remove(&key);
                 continue;
@@ -1291,8 +1307,36 @@ impl VisualSession {
 }
 
 #[cfg(test)]
-mod proof_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn compact_priorities_preserve_coordinate_ties_and_extreme_distances() {
+        let center = SectionPos::new(i64::MIN, 0, i64::MAX);
+        let mut expected: Vec<_> = [i64::MIN, 0, i64::MAX]
+            .into_iter()
+            .flat_map(|x| {
+                [i64::MIN, 0, i64::MAX]
+                    .into_iter()
+                    .flat_map(move |z| [-1, 0, 1].map(|y| SectionPos::new(x, y, z)))
+            })
+            .collect();
+        let ranks: BTreeSet<_> = expected
+            .iter()
+            .map(|&pos| column_priority(pos, center))
+            .collect();
+        expected.sort_unstable_by_key(|&pos| {
+            (
+                u128::from(pos.x.abs_diff(center.x)) + u128::from(pos.z.abs_diff(center.z)),
+                pos.x,
+                pos.z,
+                pos.y.abs_diff(center.y),
+                pos,
+            )
+        });
+        let actual: Vec<_> = ranks.iter().map(ColumnPriority::position).collect();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn forgotten_batch_entries_require_a_cut_at_or_after_the_publication() {
