@@ -601,10 +601,11 @@ fn consumer_and_link_caps_only_deny_optional_light_links() {
             HostLightField::new(server.authority().unwrap(), fixture::pages(&dir), config).unwrap();
         assert_eq!(
             light
-                .subscribe_near(1, &[SectionPos::ZERO], SectionPos::ZERO)
+                .subscribe_near(1, &[SectionPos::ZERO, SectionPos::ZERO], SectionPos::ZERO)
                 .unwrap(),
             1
         );
+        assert_eq!(light.resource_diagnostics().admission_denials, 0);
         assert_eq!(
             light
                 .subscribe_near(2, &[SectionPos::ZERO], SectionPos::ZERO)
