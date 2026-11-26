@@ -314,16 +314,8 @@ impl HostLightField {
                 let fits = match column_fits.entry((target.x, target.z)) {
                     std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        let fits = match self.dependency_columns([target], column_limit) {
-                            Ok(envelope) => {
-                                let added =
-                                    envelope.iter().filter(|pos| !needed.contains(pos)).count();
-                                let fits = added <= column_limit - needed.len();
-                                if fits {
-                                    needed.extend(envelope);
-                                }
-                                fits
-                            }
+                        let fits = match self.admit_column(target, column_limit, &mut needed) {
+                            Ok(fits) => fits,
                             Err(error) if error.code == FaultCode::ResourceLimit => false,
                             Err(error) => return Err(error),
                         };
@@ -443,7 +435,6 @@ impl HostLightField {
         targets: impl IntoIterator<Item = SectionPos>,
         column_limit: usize,
     ) -> Result<BTreeSet<(i64, i64)>, Fault> {
-        let side = i128::from(self.terrain.side());
         let mut needed = BTreeSet::new();
         let mut targets_seen = BTreeSet::new();
         for target in targets {
@@ -451,15 +442,9 @@ impl HostLightField {
             if !targets_seen.insert((target.x, target.z)) {
                 continue;
             }
-            let first = |v: i64| (i128::from(v) * side - 15).div_euclid(side);
-            let last = |v: i64| (i128::from(v) * side + side + 14).div_euclid(side);
-            let width = last(target.x) - first(target.x) + 1;
-            let depth = last(target.z) - first(target.z) + 1;
-            if width * depth > column_limit as i128 {
-                return Err(Fault::resource_limit("light source envelope"));
-            }
-            for x in first(target.x)..=last(target.x) {
-                for z in first(target.z)..=last(target.z) {
+            let (x_range, z_range) = self.source_envelope(target, column_limit)?;
+            for x in x_range {
+                for z in z_range.clone() {
                     let column = (
                         i64::try_from(x).map_err(invalid)?,
                         i64::try_from(z).map_err(invalid)?,
@@ -472,6 +457,67 @@ impl HostLightField {
             }
         }
         Ok(needed)
+    }
+
+    fn source_envelope(
+        &self,
+        target: SectionPos,
+        column_limit: usize,
+    ) -> Result<
+        (
+            std::ops::RangeInclusive<i128>,
+            std::ops::RangeInclusive<i128>,
+        ),
+        Fault,
+    > {
+        let side = i128::from(self.terrain.side());
+        let range = |coordinate| {
+            let origin = i128::from(coordinate) * side;
+            (origin - 15).div_euclid(side)..=(origin + side + 14).div_euclid(side)
+        };
+        let x = range(target.x);
+        let z = range(target.z);
+        let width = x.end() - x.start() + 1;
+        let depth = z.end() - z.start() + 1;
+        if width * depth > column_limit as i128 {
+            return Err(Fault::resource_limit("light source envelope"));
+        }
+        Ok((x, z))
+    }
+
+    fn admit_column(
+        &self,
+        target: SectionPos,
+        column_limit: usize,
+        needed: &mut BTreeSet<(i64, i64)>,
+    ) -> Result<bool, Fault> {
+        let (x, z) = self.source_envelope(target, column_limit)?;
+        let convert = |range: std::ops::RangeInclusive<i128>| -> Result<_, Fault> {
+            Ok(i64::try_from(*range.start()).map_err(invalid)?
+                ..=i64::try_from(*range.end()).map_err(invalid)?)
+        };
+        let x = convert(x)?;
+        let z = convert(z)?;
+        // An envelope always contains its target column. When full, a
+        // column outside the existing union cannot fit.
+        let available = column_limit - needed.len();
+        if available == 0 && !needed.contains(&(target.x, target.z)) {
+            return Ok(false);
+        }
+        let columns = || x.clone().flat_map(|x| z.clone().map(move |z| (x, z)));
+        let mut added = 0;
+        for column in columns() {
+            if !needed.contains(&column) {
+                added += 1;
+                if added > available {
+                    return Ok(false);
+                }
+            }
+        }
+        if added != 0 {
+            needed.extend(columns());
+        }
+        Ok(true)
     }
     /// Explicitly retry unavailable pages and reverify backing files, including
     /// cached pages. A cached result stays hidden until its content is verified.
