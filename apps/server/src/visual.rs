@@ -1016,42 +1016,47 @@ impl VisualSession {
             let pos = self.order[self.scan_cursor];
             self.scan_cursor = (self.scan_cursor + 1) % self.order.len();
             let current = stamp(host, pos);
-            if let Some(cached) = self.cache.get_mut(&pos)
-                && cached.stamp != current
-            {
-                self.observed.remove(&pos);
-                if host.proves_visual_transition(pos, cached.stamp, current) {
-                    // Reaffirm at the new durable cursor for the client's near-data
-                    // floor. Verify the new source without first removing the page.
-                    cached.stamp = current;
-                    cached.verify_source = true;
-                    self.dirty.insert(column_priority(pos, self.center));
-                    self.unavailable.remove(&pos);
-                } else {
-                    self.remove(pos);
-                    self.unavailable.insert(pos, TerrainUnavailable::Pending);
+            let mut retained = false;
+            let mut verify_source = false;
+            let mut stale = false;
+            if let Some(page) = self.cache.get_mut(&pos) {
+                if page.stamp != current {
+                    self.observed.remove(&pos);
+                    if host.proves_visual_transition(pos, page.stamp, current) {
+                        // Reaffirm at the new durable cursor for the client's
+                        // near-data floor. Keep the page while verifying its source.
+                        page.stamp = current;
+                        page.verify_source = true;
+                        self.dirty.insert(column_priority(pos, self.center));
+                        self.unavailable.remove(&pos);
+                    } else {
+                        stale = true;
+                    }
+                }
+                if !stale {
+                    retained = true;
+                    verify_source = page.verify_source;
+                    page.touched = self.clock;
+                    if let Some(sent) = self
+                        .sent
+                        .get_mut(&pos)
+                        .filter(|sent| sent.digest == page.digest)
+                    {
+                        sent.verified = Some(through.seq);
+                    } else {
+                        self.dirty.insert(column_priority(pos, self.center));
+                    }
                 }
             }
-            if let Some(page) = self.cache.get_mut(&pos) {
-                page.touched = self.clock;
-                if let Some(sent) = self
-                    .sent
-                    .get_mut(&pos)
-                    .filter(|sent| sent.digest == page.digest)
-                {
-                    if page.stamp == current {
-                        sent.verified = Some(through.seq);
-                    }
-                } else {
-                    self.dirty.insert(column_priority(pos, self.center));
-                }
-            } else if current == Stamp::Missing && self.observed.get(&pos) != Some(&current) {
+            if stale {
+                self.remove(pos);
+                self.unavailable.insert(pos, TerrainUnavailable::Pending);
+            }
+            let observed = self.observed.get(&pos) == Some(&current);
+            if !retained && current == Stamp::Missing && !observed {
                 self.observed.insert(pos, current);
                 self.unavailable.insert(pos, TerrainUnavailable::Missing);
-            }
-            if self.observed.get(&pos) != Some(&current)
-                || self.cache.get(&pos).is_some_and(|p| p.verify_source)
-            {
+            } else if !observed || verify_source {
                 self.candidates.insert(column_priority(pos, self.center));
             }
         }
