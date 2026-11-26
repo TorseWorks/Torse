@@ -11,6 +11,7 @@ use torse_net::{ReplicaMirror, terrain::terrain_bytes};
 use torse_sim::replica::{ReplicaScope, ReplicaSnapshot, WorldReplicaSeed};
 use torse_types::*;
 use torse_world::{Snapshot, SnapshotCells, SnapshotSection, StateEntry};
+use torse_world_services::lighting::LightPublication;
 
 mod approval;
 mod frame;
@@ -439,27 +440,21 @@ impl VisualSession {
         self.light_cursor = 0;
     }
     fn light_page(
-        &self,
-        id: u128,
-        field: &crate::lighting::HostLightField,
-        host: &ExecutionHost,
         pos: SectionPos,
-    ) -> Option<TerrainLight> {
-        let cached = self.cache.get(&pos)?;
-        if cached.stamp != stamp(host, pos) {
-            return None;
-        }
-        let light = field.publication(id, pos, host)?;
-        Some(TerrainLight {
+        terrain: Digest,
+        optics: Digest,
+        light: &LightPublication,
+    ) -> TerrainLight {
+        TerrainLight {
             pos,
-            terrain: cached.digest,
+            terrain,
             generation: light.generation,
             rules: light.rules_version,
-            optics: field.optics_identity(),
+            optics,
             complete: light.emitted.is_complete() && light.sky.is_complete(),
             emitted: light.emitted.levels().to_vec(),
             sky: light.sky.levels().to_vec(),
-        })
+        }
     }
     pub(crate) fn attach_lights(
         &mut self,
@@ -484,9 +479,13 @@ impl VisualSession {
             if bytes.saturating_add(cost) > self.limits.batch_bytes {
                 continue;
             }
-            let Some(light) = self.light_page(id, field, host, pos) else {
+            let Some(cached) = self.cache.get(&pos) else {
                 continue;
             };
+            if cached.stamp != stamp(host, pos) {
+                continue;
+            }
+            let light = Self::light_page(pos, cached.digest, field.optics_identity(), publication);
             bytes += cost;
             self.light_sent.insert(pos, light.generation);
             page.light = Some(light);
@@ -534,9 +533,14 @@ impl VisualSession {
             {
                 break;
             }
-            if let Some(light) = self.light_page(id, field, host, pos) {
+            if cached.stamp == stamp(host, pos) {
                 bytes += cost;
-                pages.push(light);
+                pages.push(Self::light_page(
+                    pos,
+                    cached.digest,
+                    field.optics_identity(),
+                    publication,
+                ));
             }
         }
         if pages.is_empty() {
