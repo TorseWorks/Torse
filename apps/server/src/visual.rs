@@ -1016,8 +1016,6 @@ impl VisualSession {
             let pos = self.order[self.scan_cursor];
             self.scan_cursor = (self.scan_cursor + 1) % self.order.len();
             let current = stamp(host, pos);
-            let mut retained = false;
-            let mut verify_source = false;
             let mut stale = false;
             if let Some(page) = self.cache.get_mut(&pos) {
                 if page.stamp != current {
@@ -1034,8 +1032,6 @@ impl VisualSession {
                     }
                 }
                 if !stale {
-                    retained = true;
-                    verify_source = page.verify_source;
                     page.touched = self.clock;
                     if let Some(sent) = self
                         .sent
@@ -1046,6 +1042,12 @@ impl VisualSession {
                     } else {
                         self.dirty.insert(column_priority(pos, self.center));
                     }
+                    if page.verify_source {
+                        self.candidates.insert(column_priority(pos, self.center));
+                    }
+                    // A current cache entry needs no read, even after an
+                    // interest reset clears the observations of missing pages.
+                    continue;
                 }
             }
             if stale {
@@ -1053,10 +1055,10 @@ impl VisualSession {
                 self.unavailable.insert(pos, TerrainUnavailable::Pending);
             }
             let observed = self.observed.get(&pos) == Some(&current);
-            if !retained && current == Stamp::Missing && !observed {
+            if current == Stamp::Missing && !observed {
                 self.observed.insert(pos, current);
                 self.unavailable.insert(pos, TerrainUnavailable::Missing);
-            } else if !observed || verify_source {
+            } else if !observed {
                 self.candidates.insert(column_priority(pos, self.center));
             }
         }
