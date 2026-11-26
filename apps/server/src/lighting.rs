@@ -293,15 +293,21 @@ impl HostLightField {
             .sum();
         let available = self.interests.contains_key(&consumer)
             || self.interests.len() < self.limits.field.consumers;
-        let mut ordered = sections.to_vec();
+        let mut ordered: Vec<_> = sections
+            .iter()
+            .map(|&pos| {
+                let radius = pos.x.abs_diff(center.x).max(pos.z.abs_diff(center.z));
+                (radius, pos.x, pos.z, pos.y)
+            })
+            .collect();
         ordered.sort_unstable();
         ordered.dedup();
         let requested = ordered.len();
-        ordered.sort_unstable_by_key(|&p| (distance(p, center), p.x, p.z, p.y));
         let mut admitted = BTreeSet::new();
         if available {
-            let mut column_fits = BTreeMap::new();
-            for target in ordered {
+            let mut previous_column = None;
+            for (_, x, z, y) in ordered {
+                let target = SectionPos::new(x, y, z);
                 if links + admitted.len() == self.limits.field.interests {
                     break;
                 }
@@ -311,15 +317,18 @@ impl HostLightField {
                 // All layers of a column share the same full-height envelope.
                 // The union only grows, so an envelope that did not fit cannot
                 // fit later. An accepted envelope is already in the union.
-                let fits = match column_fits.entry((target.x, target.z)) {
-                    std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
-                    std::collections::btree_map::Entry::Vacant(entry) => {
+                // The sort places all layers of a column consecutively.
+                let column = (target.x, target.z);
+                let fits = match previous_column {
+                    Some((previous, fits)) if previous == column => fits,
+                    _ => {
                         let fits = match self.admit_column(target, column_limit, &mut needed) {
                             Ok(fits) => fits,
                             Err(error) if error.code == FaultCode::ResourceLimit => false,
                             Err(error) => return Err(error),
                         };
-                        *entry.insert(fits)
+                        previous_column = Some((column, fits));
+                        fits
                     }
                 };
                 if fits {
