@@ -2,7 +2,8 @@
 use crate::{HostAuthority, execution::ExecutionHost, section_pages::SectionPages};
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     sync::mpsc,
     thread,
 };
@@ -141,6 +142,46 @@ struct Cached {
     touched: u64,
     verify_source: bool,
 }
+
+type CacheEvictionRank = (bool, u128, Reverse<u64>, SectionPos);
+
+#[derive(Default)]
+struct CacheEviction {
+    ranked: BinaryHeap<CacheEvictionRank>,
+    tied: Vec<CacheEvictionRank>,
+}
+
+impl CacheEviction {
+    fn take(
+        &mut self,
+        target: (u128, SectionPos),
+        mut is_current: impl FnMut(SectionPos, u64) -> bool,
+    ) -> Option<SectionPos> {
+        let mut victim = None;
+        while let Some(&(outside, distance, touched, pos)) = self.ranked.peek() {
+            if !outside && distance < target.0 {
+                break;
+            }
+            let rank = self.ranked.pop().expect("peeked candidate");
+            if !is_current(pos, touched.0) {
+                continue;
+            }
+            if outside || (distance, pos) > target {
+                victim = Some(pos);
+                break;
+            }
+            // Same distance, but only coordinates strictly after the
+            // incoming page qualify. Keep the others for the next page.
+            self.tied.push(rank);
+        }
+        // Insert individually so a handful of ties does not rebuild the heap.
+        for rank in self.tied.drain(..) {
+            self.ranked.push(rank);
+        }
+        victim
+    }
+}
+
 fn distance(pos: SectionPos, center: SectionPos) -> u128 {
     u128::from(pos.x.abs_diff(center.x))
         + u128::from(pos.y.abs_diff(center.y))
@@ -803,6 +844,40 @@ impl VisualSession {
         self.sent.remove(&pos);
         self.light_sent.remove(&pos);
     }
+
+    fn cache_victim(
+        &self,
+        eviction: &mut Option<CacheEviction>,
+        target: SectionPos,
+    ) -> Option<SectionPos> {
+        // Rank once when an incoming batch first runs out of space. Pages
+        // inserted during this batch are dirty and cannot be evicted yet.
+        let eviction = eviction.get_or_insert_with(|| {
+            let ranked = self
+                .cache
+                .iter()
+                .filter(|(pos, _)| !self.dirty.contains(&column_priority(**pos, self.center)))
+                .map(|(&pos, page)| {
+                    (
+                        !self.desired.sections.contains(&pos),
+                        distance(pos, self.center),
+                        Reverse(page.touched),
+                        pos,
+                    )
+                })
+                .collect::<Vec<_>>();
+            CacheEviction {
+                ranked: BinaryHeap::from(ranked),
+                tied: Vec::new(),
+            }
+        });
+        eviction.take((distance(target, self.center), target), |pos, touched| {
+            self.cache
+                .get(&pos)
+                .is_some_and(|page| page.touched == touched)
+        })
+    }
+
     pub(crate) fn refresh(&mut self) -> Result<(), Fault> {
         self.request(self.desired.clone(), self.center, true)
     }
@@ -881,6 +956,7 @@ impl VisualSession {
                     self.busy = false;
                     if response.refresh == self.refresh {
                         let overlapping = response.generation != self.generation;
+                        let mut eviction = None;
                         for page in response.pages {
                             if !self.desired.sections.contains(&page.pos)
                                 || stamp(host, page.pos) != page.stamp
@@ -918,32 +994,9 @@ impl VisualSession {
                                     while self.bytes.saturating_add(cost) > self.limits.cache_bytes
                                         || self.cache.len() >= self.limits.max_sections
                                     {
-                                        let victim = self
-                                            .cache
-                                            .iter()
-                                            .filter(|(pos, _)| {
-                                                !self
-                                                    .dirty
-                                                    .contains(&column_priority(**pos, self.center))
-                                            })
-                                            .filter(|(pos, _)| {
-                                                !self.desired.sections.contains(pos)
-                                                    || (distance(**pos, self.center), **pos)
-                                                        > (
-                                                            distance(page.pos, self.center),
-                                                            page.pos,
-                                                        )
-                                            })
-                                            .max_by_key(|(pos, p)| {
-                                                (
-                                                    !self.desired.sections.contains(pos),
-                                                    distance(**pos, self.center),
-                                                    std::cmp::Reverse(p.touched),
-                                                    **pos,
-                                                )
-                                            })
-                                            .map(|(pos, _)| *pos);
-                                        let Some(victim) = victim else {
+                                        let Some(victim) =
+                                            self.cache_victim(&mut eviction, page.pos)
+                                        else {
                                             break;
                                         };
                                         // An active delivered page must be explicitly invalidated.
@@ -1314,6 +1367,31 @@ impl VisualSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eviction_keeps_ties_for_later_pages_and_skips_replaced_entries() {
+        let near_tie = SectionPos::new(-2, 0, 0);
+        let far_tie = SectionPos::new(2, 0, 0);
+        let outside = SectionPos::new(1, 0, 0);
+        let replaced = SectionPos::new(3, 0, 0);
+        let mut eviction = CacheEviction {
+            ranked: BinaryHeap::from([
+                (false, 2, Reverse(0), near_tie),
+                (false, 2, Reverse(1), far_tie),
+                (true, 1, Reverse(2), outside),
+                (false, 3, Reverse(0), replaced),
+            ]),
+            ..Default::default()
+        };
+        let current = |pos, _| pos != replaced;
+        assert_eq!(eviction.take((2, SectionPos::ZERO), current), Some(outside));
+        assert_eq!(eviction.take((2, SectionPos::ZERO), current), Some(far_tie));
+        assert_eq!(eviction.take((2, SectionPos::ZERO), current), None);
+        assert_eq!(
+            eviction.take((1, SectionPos::ZERO), current),
+            Some(near_tie)
+        );
+    }
 
     #[test]
     fn compact_priorities_preserve_coordinate_ties_and_extreme_distances() {

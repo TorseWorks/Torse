@@ -640,6 +640,137 @@ fn full_height_display_route_measurement() {
 }
 
 #[test]
+#[ignore = "release display cache pressure measurement"]
+fn disjoint_visual_windows_at_cache_capacity() {
+    let dir = Directory::new();
+    let (mut server, pages) = create(&dir);
+    let window = |center: i64| ReplicaScope {
+        sections: (center..center + 64)
+            .flat_map(|x| (0..4).flat_map(move |z| (0..16).map(move |y| SectionPos::new(x, y, z))))
+            .collect(),
+    };
+    let left = window(2);
+    let right = window(130);
+    let positions: Vec<_> = left.sections.union(&right.sections).copied().collect();
+    for chunk in positions.chunks(512) {
+        let world = server.authority().unwrap().world();
+        let input = chunk
+            .iter()
+            .map(|&pos| fixture::streaming::generated(world, pos))
+            .collect();
+        server
+            .begin_generated_parking(
+                pages.clone(),
+                input,
+                SectionInstallLimits {
+                    max_pages: 512,
+                    max_bytes: 8 * 1024 * 1024,
+                },
+            )
+            .unwrap();
+        let preparing = Instant::now();
+        while !matches!(
+            server.poll_generated_parking(&mut NoReplicas).unwrap(),
+            ParkingProgress::Finished { .. }
+        ) {
+            assert!(preparing.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let resident_pages = server.authority().unwrap().world().store().len();
+    let mut hub = NetworkHub::<MemoryTransport>::new(server.binding(), network()).unwrap();
+    let (id, mut client, _, _) = fixture::interest::attach(
+        &mut hub,
+        &mut server,
+        ReplicaScope {
+            sections: [SectionPos::ZERO].into(),
+        },
+    );
+    let mut config = limits();
+    config.max_sections = left.sections.len();
+    let mut mirror = TerrainMirror::new(
+        server.binding(),
+        16,
+        server.authority().unwrap().world().store().bounds(),
+        TerrainLimits {
+            max_sections: config.max_sections,
+            max_bytes: 24 * 1024 * 1024,
+            metadata_bytes: 8 * 1024 * 1024,
+        },
+        None,
+    )
+    .unwrap();
+    let approval =
+        VisualTerrainApproval::rectangular(SectionPos::new(2, 0, 0), SectionPos::new(193, 15, 3))
+            .unwrap();
+    println!("sample,center,pages,polls,poll_total_ms,poll_max_ms,wall_ms");
+    for (sample, (center, scope)) in [(2, left.clone()), (130, right), (2, left)]
+        .into_iter()
+        .enumerate()
+    {
+        let start = Instant::now();
+        let focus = SectionPos::new(center, 0, 0);
+        if sample == 0 {
+            hub.enable_visual_interest(
+                &server,
+                id,
+                pages.clone(),
+                approval.clone(),
+                scope.clone(),
+                focus,
+                config,
+            )
+            .unwrap();
+        } else {
+            hub.set_visual_interest(id, scope.clone(), focus).unwrap();
+        }
+        let mut polls = 0;
+        let mut total = Duration::ZERO;
+        let mut max = Duration::ZERO;
+        while mirror.desired() != &scope.sections || mirror.cached_pages() < config.max_sections {
+            let poll = Instant::now();
+            hub.poll(&mut server).unwrap();
+            let elapsed = poll.elapsed();
+            polls += 1;
+            total += elapsed;
+            max = max.max(elapsed);
+            for message in drain(&mut client) {
+                if let ServerMessage::Terrain(update) = message {
+                    assert!(update.unavailable.is_empty(), "{:?}", update.unavailable);
+                    mirror.apply(update).unwrap();
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(45),
+                "incomplete sample {sample}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            hub.visual_terrain_diagnostics(id).unwrap().cache_pages,
+            config.max_sections
+        );
+        assert_eq!(
+            server.authority().unwrap().world().store().len(),
+            resident_pages
+        );
+        assert!(mirror.pages().all(|page| {
+            scope.sections.contains(&page.sections[0].pos)
+                && page.sections[0].cells
+                    == SnapshotCells::Uniform(torse_world::BlockStateId::EMPTY)
+                && page.entities.is_empty()
+        }));
+        println!(
+            "{sample},{center},{},{polls},{:.3},{:.3},{:.3}",
+            mirror.cached_pages(),
+            total.as_secs_f64() * 1000.,
+            max.as_secs_f64() * 1000.,
+            start.elapsed().as_secs_f64() * 1000.
+        );
+    }
+}
+
+#[test]
 #[ignore = "release control/display scheduling comparison"]
 fn separate_display_control_route_measurement() {
     use torse_server::lighting::{HostLightLimits, HostLightWorkBudget};
