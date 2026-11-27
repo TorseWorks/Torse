@@ -273,12 +273,113 @@ fn ordered_resets_retain_buffers_and_reject_invalid_updates_atomically() {
         .unwrap()
         .retained
         .push((pos, Digest([1; 32])));
+    for kind in 0..4 {
+        let mut bad = retained.clone();
+        let reset = bad.reset.as_mut().unwrap();
+        match kind {
+            0 => reset.retained[0].1 = Digest([2; 32]),
+            1 => reset.retained.push(reset.retained[0]),
+            2 => reset.sections[0].x += 1,
+            _ => bad.unavailable.push((pos, TerrainUnavailable::Missing)),
+        }
+        assert!(mirror.apply(bad).is_err());
+        assert_eq!(mirror.page(pos), Some(&before));
+    }
     mirror.apply(retained.clone()).unwrap();
     assert!(mirror.apply(retained).is_err());
     match &mirror.page(pos).unwrap().sections[0].cells {
         torse_world::SnapshotCells::Dense(v) => assert_eq!(v.as_ptr(), address),
         _ => unreachable!(),
     }
+}
+
+#[test]
+#[ignore = "fixed workload for release timing"]
+fn overlapping_full_height_interest_reset_measurement() {
+    use std::time::Instant;
+    use torse_world::{BlockStateId, SnapshotCells};
+
+    let (_, mut initial) = setup(1_000_000);
+    let bounds = WorldBounds::new(-64, 320).unwrap();
+    let column_window = |left| {
+        (left..left + 33)
+            .flat_map(|x| {
+                (-4..20).flat_map(move |y| (-16..17).map(move |z| SectionPos::new(x, y, z)))
+            })
+            .collect::<Vec<_>>()
+    };
+    let original = column_window(-16);
+    let shifted = column_window(-15);
+    let retained = &original[24 * 33..];
+    let digest = Digest([1; 32]);
+    let mut page = initial.pages.pop().unwrap();
+    page.terrain.bounds = bounds;
+    page.terrain.states.clear();
+    page.terrain.sections[0].cells = SnapshotCells::Uniform(BlockStateId::EMPTY);
+    initial.pages = original
+        .iter()
+        .map(|&pos| {
+            let mut page = page.clone();
+            page.terrain.sections[0].pos = pos;
+            page
+        })
+        .collect();
+    initial
+        .reset
+        .as_mut()
+        .unwrap()
+        .sections
+        .clone_from(&original);
+    let mut mirror = TerrainMirror::new(
+        initial.binding,
+        16,
+        bounds,
+        TerrainLimits {
+            max_sections: original.len(),
+            max_bytes: 256 * 1024 * 1024,
+            metadata_bytes: 64 * 1024 * 1024,
+        },
+        None,
+    )
+    .unwrap();
+    let mut reset = TerrainUpdate {
+        binding: initial.binding,
+        through: initial.through,
+        generation: 2,
+        seq: 1,
+        reset: Some(TerrainReset {
+            sections: shifted.clone(),
+            retained: retained.iter().map(|&pos| (pos, digest)).collect(),
+        }),
+        pages: Vec::new(),
+        unavailable: Vec::new(),
+    };
+    mirror.apply(initial).unwrap();
+    let mut samples = Vec::new();
+    for generation in 2..34 {
+        reset.generation = generation;
+        let scope = if generation % 2 == 0 {
+            &shifted
+        } else {
+            &original
+        };
+        reset.reset.as_mut().unwrap().sections.clone_from(scope);
+        let message = reset.clone();
+        let started = Instant::now();
+        let changes = mirror.apply(message).unwrap();
+        samples.push(started.elapsed().as_micros());
+        assert!(changes.changed.is_empty());
+        assert_eq!(changes.removed.len(), if generation == 2 { 792 } else { 0 });
+        assert_eq!(mirror.cached_pages(), retained.len());
+        assert_eq!(mirror.desired().len(), scope.len());
+    }
+    let first = samples.remove(0);
+    samples.sort_unstable();
+    println!(
+        "retention first_us={first} median_us={} max_us={}",
+        samples[samples.len() / 2],
+        samples.last().unwrap()
+    );
 }
 #[test]
 fn near_edits_hide_old_pages_until_a_fresh_page_or_retained_proof() {

@@ -272,18 +272,32 @@ impl TerrainMirror {
             {
                 return Err(invalid());
             }
-            let desired: BTreeSet<_> = reset.sections.iter().copied().collect();
-            let retained: BTreeMap<_, _> = reset.retained.iter().copied().collect();
-            if retained.iter().any(|(pos, digest)| {
-                !desired.contains(pos) || self.pages.get(pos).is_none_or(|p| p.digest != *digest)
+            let mut desired = reset.sections.iter().peekable();
+            let mut pages = self.pages.iter().peekable();
+            if reset.retained.iter().any(|(pos, digest)| {
+                while desired.peek().is_some_and(|next| *next < pos) {
+                    desired.next();
+                }
+                while pages.peek().is_some_and(|(next, _)| *next < pos) {
+                    pages.next();
+                }
+                desired.next_if_eq(&pos).is_none()
+                    || pages
+                        .next_if(|(next, _)| *next == pos)
+                        .is_none_or(|(_, page)| page.digest != *digest)
             }) {
                 return Err(invalid());
             }
-            (Some(desired), retained)
+            (
+                Some(reset.sections.iter().copied().collect()),
+                reset.retained.as_slice(),
+            )
         } else {
-            (None, BTreeMap::new())
+            (None, &[][..])
         };
         let desired = next_desired.as_ref().unwrap_or(&self.desired);
+        let is_retained =
+            |pos: &SectionPos| retained.binary_search_by_key(pos, |&(key, _)| key).is_ok();
         if update.pages.len() > self.limits.max_sections
             || update.unavailable.len() > self.limits.max_sections
             || update.pages.iter().any(|p| p.terrain.sections.len() != 1)
@@ -295,7 +309,7 @@ impl TerrainMirror {
         let unavailable: BTreeSet<_> = update.unavailable.iter().map(|(p, _)| *p).collect();
         if unavailable
             .iter()
-            .any(|p| !desired.contains(p) || retained.contains_key(p))
+            .any(|p| !desired.contains(p) || is_retained(p))
         {
             return Err(invalid());
         }
@@ -318,7 +332,7 @@ impl TerrainMirror {
             }
             if !desired.contains(&pos)
                 || unavailable.contains(&pos)
-                || retained.contains_key(&pos)
+                || is_retained(&pos)
                 || page.at.world != self.binding.world
                 || page.at.seq > update.through.seq
                 || page.terrain.side != self.side
@@ -361,16 +375,14 @@ impl TerrainMirror {
             }
             incoming.insert(pos, checked);
         }
-        let keep = |pos: &SectionPos| {
-            desired.contains(pos)
-                && !unavailable.contains(pos)
-                && !incoming.contains_key(pos)
-                && (update.reset.is_none() || retained.contains_key(pos))
-        };
-        let removed: Vec<_> = if update.reset.is_some() {
+        let removed: Vec<_> = if next_desired.is_some() {
+            let mut retained = retained.iter().peekable();
             self.pages
                 .keys()
-                .filter(|p| !keep(p) && !incoming.contains_key(p))
+                .filter(|&&pos| {
+                    retained.next_if(|&&(next, _)| next == pos).is_none()
+                        && !incoming.contains_key(&pos)
+                })
                 .copied()
                 .collect()
         } else {
@@ -407,8 +419,14 @@ impl TerrainMirror {
         for pos in &changes.removed {
             self.pages.remove(pos);
         }
-        for pos in retained.keys() {
-            let page = self.pages.get_mut(pos).expect("checked retained page");
+        let mut pages = self.pages.iter_mut().peekable();
+        for (pos, _) in retained {
+            while pages.peek().is_some_and(|(next, _)| *next < pos) {
+                pages.next();
+            }
+            let (_, page) = pages
+                .next_if(|(next, _)| *next == pos)
+                .expect("checked retained page");
             if self
                 .floors
                 .get(pos)
