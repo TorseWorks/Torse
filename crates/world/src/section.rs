@@ -618,6 +618,7 @@ mod tests {
             (5, 2),
             (16, 2),
             (16, 17),
+            (16, 256),
             (16, 257),
             (16, 300),
         ] {
@@ -640,6 +641,55 @@ mod tests {
         );
         assert!(Section::from_cells(16, vec![BlockStateId::EMPTY; 4095]).is_err());
         assert!(Section::from_cells(0, vec![]).is_err());
+    }
+
+    #[test]
+    #[ignore = "fixed workload for release timing"]
+    fn imported_section_palette_measurement() {
+        use std::{hint::black_box, time::Instant};
+
+        for (side, symbols) in [
+            (4u32, 3usize),
+            (16, 2),
+            (16, 3),
+            (16, 8),
+            (16, 32),
+            (16, 128),
+            (16, 256),
+        ] {
+            let len = (side as usize).pow(3);
+            let fixtures: Vec<Vec<_>> = (0..120)
+                .map(|page| {
+                    (0..len)
+                        .map(|index| {
+                            let symbol = (index * 17 + (index / 1024) * 71 + page * 13) % symbols;
+                            BlockStateId((symbol as u16).wrapping_mul(251).wrapping_add(191))
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut timings = Vec::new();
+            for _ in 0..17 {
+                let inputs = fixtures.clone();
+                let started = Instant::now();
+                let sections: Vec<_> = inputs
+                    .into_iter()
+                    .map(|input| Section::from_cells(side, black_box(input)).unwrap())
+                    .collect();
+                timings.push(started.elapsed().as_micros());
+                assert!(
+                    sections
+                        .iter()
+                        .zip(&fixtures)
+                        .all(|(section, input)| section.values().eq(input.iter().copied()))
+                );
+            }
+            timings.sort_unstable();
+            println!(
+                "palette side={side} symbols={symbols} pages=120 median_us={} max_us={}",
+                timings[8], timings[16]
+            );
+        }
     }
 
     #[test]
