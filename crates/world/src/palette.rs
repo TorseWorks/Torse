@@ -68,14 +68,46 @@ impl PaletteCells {
         values: impl Iterator<Item = BlockStateId> + Clone,
         len: usize,
     ) -> Option<Self> {
+        if len < 1024 {
+            return Self::build_with_index(values, len, &mut []);
+        }
+        Self::build_indexed(values, len)
+    }
+
+    // Keep the reverse table's stack frame off the small-section path.
+    #[inline(never)]
+    fn build_indexed(
+        values: impl Iterator<Item = BlockStateId> + Clone,
+        len: usize,
+    ) -> Option<Self> {
+        let mut indices = [0u8; u16::MAX as usize + 1];
+        Self::build_with_index(values, len, &mut indices)
+    }
+
+    fn build_with_index(
+        values: impl Iterator<Item = BlockStateId> + Clone,
+        len: usize,
+        indices: &mut [u8],
+    ) -> Option<Self> {
         let mut states = Vec::new();
         let mut counts = Vec::new();
         for value in values.clone() {
-            if let Some(index) = states.iter().position(|s| *s == value) {
+            let slot = indices.get_mut(usize::from(value.0));
+            let known = if let Some(slot) = slot.as_ref() {
+                // Unassigned IDs map to slot zero, so verify the reverse lookup.
+                let index = usize::from(**slot);
+                (states.get(index) == Some(&value)).then_some(index)
+            } else {
+                states.iter().position(|state| *state == value)
+            };
+            if let Some(index) = known {
                 counts[index] += 1;
             } else {
                 if states.len() == MAX_PALETTE_STATES {
                     return None;
+                }
+                if let Some(slot) = slot {
+                    *slot = states.len() as u8;
                 }
                 states.push(value);
                 counts.push(1u32);
@@ -96,11 +128,16 @@ impl PaletteCells {
             len,
         };
         for (index, value) in values.enumerate() {
-            let symbol = packed
-                .states
-                .iter()
-                .position(|s| *s == value)
-                .expect("counted state");
+            let symbol = indices.get(usize::from(value.0)).map_or_else(
+                || {
+                    packed
+                        .states
+                        .iter()
+                        .position(|state| *state == value)
+                        .expect("counted state")
+                },
+                |slot| usize::from(*slot),
+            );
             packed.put(index, symbol);
         }
         packed.states.shrink_to_fit();
