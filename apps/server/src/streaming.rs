@@ -4,6 +4,7 @@ use crate::{
     CommitStep, HostCheckpointStore, InvalidationSink, Server, section_pages::SectionPages,
 };
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use torse_storage::CommitJournal;
 use torse_world::Snapshot;
 
@@ -21,6 +22,60 @@ pub struct SectionInstallDiagnostics {
 }
 
 const MAX_RESIDENT: usize = 4096;
+
+#[derive(Default)]
+pub(super) struct ParkedIndex {
+    entries: BTreeMap<SectionPos, ParkedSection>,
+    entities: usize,
+}
+
+impl From<BTreeMap<SectionPos, ParkedSection>> for ParkedIndex {
+    fn from(entries: BTreeMap<SectionPos, ParkedSection>) -> Self {
+        let entities = entries.values().map(|page| page.entities.len()).sum();
+        Self { entries, entities }
+    }
+}
+
+impl std::ops::Deref for ParkedIndex {
+    type Target = BTreeMap<SectionPos, ParkedSection>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl ParkedIndex {
+    pub(super) fn insert(&mut self, pos: SectionPos, page: ParkedSection) {
+        self.entities += page.entities.len();
+        if let Some(old) = self.entries.insert(pos, page) {
+            self.entities -= old.entities.len();
+        }
+    }
+
+    pub(super) fn remove(&mut self, pos: &SectionPos) {
+        if let Some(old) = self.entries.remove(pos) {
+            self.entities -= old.entities.len();
+        }
+    }
+
+    pub(super) fn cost(
+        &self,
+        pages: usize,
+        entities: usize,
+        budget: OutputBudget,
+        codec: torse_codec::CodecLimits,
+    ) -> Result<wire::WireCost, Fault> {
+        self.len()
+            .checked_add(pages)
+            .zip(self.entities.checked_add(entities))
+            .and_then(|(pages, entities)| wire::parked_index_cost(pages, entities))
+            .filter(|cost| {
+                budget.allows(cost.items, cost.owned_bytes)
+                    && cost.encoded_bytes <= budget.max_bytes.min(u64::from(codec.max_frame_bytes))
+            })
+            .ok_or_else(|| Fault::resource_limit("parked section index budget"))
+    }
+}
 
 // The record appends exactly the already measured Vec<SectionChange>. Its
 // container prefix is present in both measurements; subtract it once. No
@@ -473,9 +528,12 @@ impl ExecutionHost {
             return Err(Fault::resource_limit("resident section capacity"));
         }
         if unload {
-            let mut candidate = self.parked.clone();
-            candidate.insert(change.page.sections[0].pos, change.reference.clone());
-            wire::measure_inner(&candidate, self.limits.runtime, self.limits.codec)?;
+            self.parked.cost(
+                1,
+                change.reference.entities.len(),
+                self.limits.runtime,
+                self.limits.codec,
+            )?;
         }
         Ok(())
     }
@@ -644,29 +702,22 @@ fn bind_parking_batch(changes: &[SectionChange]) -> Result<Vec<Cow<'_, Snapshot>
         .collect()
 }
 fn check_parked_additions(
-    parked: &BTreeMap<SectionPos, ParkedSection>,
+    parked: &ParkedIndex,
     changes: &[SectionChange],
     limits: ExecutionLimits,
 ) -> Result<(), Fault> {
-    let additions: BTreeMap<_, _> = changes
+    let positions: BTreeSet<_> = changes
         .iter()
-        .map(|change| (change.page.sections[0].pos, change.reference.clone()))
+        .map(|change| change.page.sections[0].pos)
         .collect();
-    let budget = limits.runtime;
-    let base = wire::measure_inner(parked, budget, limits.codec)?;
-    let added = wire::measure_inner(&additions, budget, limits.codec)?;
-    if additions.len() != changes.len()
-        || base
-            .encoded_bytes
-            .saturating_add(added.encoded_bytes.saturating_sub(4))
-            > budget
-                .max_bytes
-                .min(u64::from(limits.codec.max_frame_bytes))
-        || base.owned_bytes.saturating_add(added.owned_bytes) > budget.max_bytes
-        || base.items.saturating_add(added.items) > budget.max_items
-    {
-        return Err(Fault::resource_limit("parked section index budget"));
+    if positions.len() != changes.len() {
+        return Err(Fault::invalid_data("duplicate parked section positions"));
     }
+    let entities = changes
+        .iter()
+        .map(|change| change.reference.entities.len())
+        .sum();
+    parked.cost(changes.len(), entities, limits.runtime, limits.codec)?;
     Ok(())
 }
 fn check_reference(
@@ -1062,9 +1113,12 @@ impl ExecutionRecovery<'_> {
             }
         }
         if !change.load {
-            let mut candidate = self.parked.clone();
-            candidate.insert(change.page.sections[0].pos, change.reference.clone());
-            wire::measure_inner(&candidate, self.limits.runtime, self.limits.codec)?;
+            self.parked.cost(
+                1,
+                change.reference.entities.len(),
+                self.limits.runtime,
+                self.limits.codec,
+            )?;
         }
         let pages = self
             .section_pages
@@ -1201,13 +1255,14 @@ impl ExecutionRecovery<'_> {
         }
         // Persistent indexes are bounded by encoded bytes and items, rather
         // than imposing a fixed number of explored sections on every host.
-        wire::measure_inner(&self.parked, self.limits.runtime, self.limits.codec)?;
+        self.parked
+            .cost(0, 0, self.limits.runtime, self.limits.codec)?;
         let pages = self
             .section_pages
             .as_ref()
             .ok_or_else(|| Fault::invalid_data("parked pages require a section store"))?;
         let mut ids = std::collections::BTreeSet::new();
-        for (pos, expected) in &self.parked {
+        for (pos, expected) in self.parked.iter() {
             let raw = pages.get(expected.digest)?;
             let page = bind_parked_page(&raw, expected)?;
             if page.sections[0].pos != *pos
@@ -1227,23 +1282,76 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "release timing of one parked index admission at exploration scale"]
+    fn parked_admission_measurement() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let budget = crate::bootstrap::budget();
+        let codec = crate::bootstrap::codec_limits();
+        let pos = SectionPos::ZERO;
+        let reference = ParkedSection {
+            digest: Digest([0x3b; 32]),
+            entities: vec![EntityId(1)],
+        };
+        for count in [4096, 26_136] {
+            let map: BTreeMap<_, _> = (1..=count)
+                .map(|x| {
+                    let mut value = reference.clone();
+                    if x % 4 != 0 {
+                        value.entities.clear();
+                    }
+                    (SectionPos::new(x, 0, 0), value)
+                })
+                .collect();
+            let parked = ParkedIndex::from(map.clone());
+            let mut old = Vec::new();
+            let mut new = Vec::new();
+            for _ in 0..25 {
+                let start = Instant::now();
+                let mut candidate = black_box(&map).clone();
+                candidate.insert(pos, reference.clone());
+                let expected = wire::measure_inner(&candidate, budget, codec).unwrap();
+                old.push(start.elapsed().as_nanos());
+
+                const ITERATIONS: u128 = 10_000;
+                let start = Instant::now();
+                for _ in 0..ITERATIONS {
+                    let actual = black_box(&parked)
+                        .cost(1, black_box(reference.entities.len()), budget, codec)
+                        .unwrap();
+                    assert_eq!(black_box(actual), expected);
+                }
+                new.push(start.elapsed().as_nanos() / ITERATIONS);
+            }
+            old.sort_unstable();
+            new.sort_unstable();
+            println!(
+                "pages={count} baseline_ns={} candidate_ns={}",
+                old[12], new[12]
+            );
+        }
+    }
+
+    #[test]
     fn parked_index_accepts_more_than_4096_sections_within_its_budget() {
         let (world, _) = crate::bootstrap::world().unwrap();
         let page = world
             .capture_section(SectionPos::ZERO, crate::bootstrap::budget())
             .unwrap();
         let digest = Digest([0; 32]);
-        let parked: BTreeMap<_, _> = (1..=4097)
+        let mut parked: ParkedIndex = (1..=4097)
             .map(|x| {
                 (
                     SectionPos::new(x, 0, 0),
                     ParkedSection {
                         digest,
-                        entities: Vec::new(),
+                        entities: (0..x % 4).map(|id| EntityId(id as u128 + 1)).collect(),
                     },
                 )
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>()
+            .into();
         let change = SectionChange {
             reference: reference(&page, digest),
             page,
@@ -1251,16 +1359,39 @@ mod tests {
             fresh: false,
         };
         check_reference(&change, &parked).unwrap();
-        wire::measure_inner(
-            &parked,
-            crate::bootstrap::budget(),
-            crate::bootstrap::codec_limits(),
-        )
-        .unwrap();
+        let budget = crate::bootstrap::budget();
+        let codec = crate::bootstrap::codec_limits();
+        let estimate = parked
+            .cost(1, change.reference.entities.len(), budget, codec)
+            .unwrap();
+        parked.insert(SectionPos::ZERO, change.reference);
+        assert_eq!(
+            estimate,
+            wire::measure_inner(&*parked, budget, codec).unwrap()
+        );
+        let exact = OutputBudget {
+            max_items: estimate.items,
+            max_bytes: estimate.owned_bytes.max(estimate.encoded_bytes),
+        };
+        assert_eq!(parked.cost(0, 0, exact, codec).unwrap(), estimate);
+        assert!(parked.cost(1, 0, exact, codec).is_err());
+        let pos = SectionPos::new(3, 0, 0);
+        parked.remove(&pos);
+        parked.insert(
+            SectionPos::ZERO,
+            ParkedSection {
+                digest,
+                entities: vec![EntityId(1)],
+            },
+        );
+        assert_eq!(
+            parked.cost(0, 0, budget, codec).unwrap(),
+            wire::measure_inner(&*parked, budget, codec).unwrap()
+        );
         let tiny = OutputBudget {
             max_items: 64,
             max_bytes: 1024,
         };
-        assert!(wire::measure_inner(&parked, tiny, crate::bootstrap::codec_limits()).is_err());
+        assert!(parked.cost(0, 0, tiny, codec).is_err());
     }
 }
