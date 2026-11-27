@@ -391,7 +391,7 @@ pub(crate) struct VisualSession {
     wire_budget: OutputBudget,
     checked_control_sections: usize,
     codec: torse_codec::CodecLimits,
-    order: Vec<SectionPos>,
+    order: Vec<ColumnPriority>,
     scan_cursor: usize,
     last_scan: usize,
     light_cursor: usize,
@@ -462,15 +462,23 @@ impl VisualSession {
         check_frame(&message, budget, codec)
     }
     fn prioritize(&mut self) {
-        self.candidates = self
-            .desired
-            .sections
-            .iter()
-            .map(|&p| column_priority(p, self.center))
-            .collect();
         self.order.clear();
-        self.order
-            .extend(self.candidates.iter().map(ColumnPriority::position));
+        self.order.extend(
+            self.desired
+                .sections
+                .iter()
+                .map(|&pos| column_priority(pos, self.center)),
+        );
+        self.order.sort_unstable();
+        // The sweep introduces unobserved sections a slice at a time. Only
+        // rerank positions that already have pending source work.
+        self.candidates = self
+            .candidates
+            .iter()
+            .map(ColumnPriority::position)
+            .filter(|pos| self.desired.sections.contains(pos))
+            .map(|pos| column_priority(pos, self.center))
+            .collect();
         self.dirty = self
             .dirty
             .iter()
@@ -552,7 +560,7 @@ impl VisualSession {
             if pages.len() == self.limits.pages_per_poll {
                 break;
             }
-            let pos = self.order[self.light_cursor];
+            let pos = self.order[self.light_cursor].position();
             self.light_cursor = (self.light_cursor + 1) % self.order.len();
             self.last_light_scan += 1;
             let Some(cached) = self.cache.get(&pos) else {
@@ -1077,7 +1085,7 @@ impl VisualSession {
         let scan = self.order.len().min(checks - invalidations);
         self.last_scan = invalidations + scan;
         for _ in 0..scan {
-            let pos = self.order[self.scan_cursor];
+            let pos = self.order[self.scan_cursor].position();
             self.scan_cursor = (self.scan_cursor + 1) % self.order.len();
             let current = stamp(host, pos);
             let mut retained = false;
@@ -1120,7 +1128,7 @@ impl VisualSession {
             if !retained && current == Stamp::Missing && !observed {
                 self.observed.insert(pos, current);
                 self.unavailable.insert(pos, TerrainUnavailable::Missing);
-            } else if !observed || verify_source {
+            } else if (!retained && !observed) || verify_source {
                 self.candidates.insert(column_priority(pos, self.center));
             }
         }
