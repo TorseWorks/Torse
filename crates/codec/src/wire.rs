@@ -815,6 +815,21 @@ fields!(ExecutionSnapshot {
 });
 fields!(ParkingReservation { first, end });
 fields!(ParkedSection { digest, entities });
+
+/// Exact body cost of the parked section map. Keys, digests, length prefixes
+/// and entity IDs are fixed-width. Container allocations are charged by the
+/// same element sizes as the generic map and vector decoders.
+pub fn parked_index_cost(pages: usize, entities: usize) -> Option<WireCost> {
+    let items = u32::try_from(pages.checked_add(entities)?).ok()?;
+    let pages = u64::try_from(pages).ok()?;
+    let entities = u64::try_from(entities).ok()?;
+    Some(WireCost {
+        encoded_bytes: 4 + pages * (24 + 32 + 4) + entities * 16,
+        owned_bytes: pages * size_of::<(SectionPos, ParkedSection)>() as u64
+            + entities * size_of::<EntityId>() as u64,
+        items,
+    })
+}
 fields!(SectionChange {
     page,
     load,

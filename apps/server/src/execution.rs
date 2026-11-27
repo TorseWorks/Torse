@@ -37,6 +37,7 @@ mod player_control;
 #[path = "streaming.rs"]
 pub(crate) mod streaming;
 pub use player_control::{PlayerState, movement_action, movement_call};
+use streaming::ParkedIndex;
 pub use streaming::SectionInstallDiagnostics;
 
 pub struct ExecutionModel;
@@ -176,7 +177,7 @@ struct Queued {
 }
 pub struct ExecutionHost {
     players: BTreeMap<u128, player_control::PlayerSession>,
-    parked: BTreeMap<SectionPos, ParkedSection>,
+    parked: ParkedIndex,
     parking_reservation: Option<ParkingReservation>,
     visual_transitions:
         std::collections::VecDeque<(SectionPos, crate::visual::Stamp, crate::visual::Stamp)>,
@@ -501,7 +502,7 @@ impl ExecutionHost {
             memory: None,
             players: BTreeMap::new(),
             source: ReplicaSource::new(world, binding, limits.replicas)?,
-            parked: BTreeMap::new(),
+            parked: ParkedIndex::default(),
             parking_reservation: None,
             visual_transitions: std::collections::VecDeque::new(),
             visual_history: crate::visual::TerrainHistory::default(),
@@ -1616,7 +1617,7 @@ impl HostAuthority for ExecutionHost {
                 "execution checkpoint requires tick start",
             ));
         }
-        let parked_cost = wire::measure_inner(&self.parked, budget, self.limits.codec)?;
+        let parked_cost = self.parked.cost(0, 0, budget, self.limits.codec)?;
         let world_budget = OutputBudget {
             max_items: budget
                 .max_items
@@ -1665,7 +1666,7 @@ impl HostAuthority for ExecutionHost {
 }
 
 pub struct ExecutionRecovery<'a> {
-    parked: BTreeMap<SectionPos, ParkedSection>,
+    parked: ParkedIndex,
     parking_reservation: Option<ParkingReservation>,
     section_pages: Option<crate::section_pages::SectionPages>,
     binding: Binding,
@@ -1687,7 +1688,7 @@ impl<'a> ExecutionRecovery<'a> {
         limits: ExecutionLimits,
     ) -> Self {
         Self {
-            parked: BTreeMap::new(),
+            parked: ParkedIndex::default(),
             parking_reservation: None,
             section_pages: None,
             binding,
@@ -1772,7 +1773,7 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
             .map_err(|e| Fault::invalid_data(e.to_string()))?;
         self.point = Some(snapshot.meta.resume_at);
         self.runtime = Some(snapshot.state.runtime);
-        self.parked = snapshot.state.parked;
+        self.parked = snapshot.state.parked.into();
         self.parking_reservation = snapshot.state.parking_reservation;
         Ok(())
     }
