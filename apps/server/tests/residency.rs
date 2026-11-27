@@ -306,6 +306,110 @@ fn entity_tickets_follow_committed_movement_and_cross_section_scopes_hold_both_s
 }
 
 #[test]
+fn retirement_retries_entity_changes_without_losing_other_pages() {
+    let dir = Directory::new();
+    let pages = pages(&dir);
+    let source = SectionPos::ZERO;
+    let destination = SectionPos::new(1, 0, 0);
+    let sibling = SectionPos::new(2, 0, 0);
+    let rules = || -> Vec<Box<dyn DurableRule>> {
+        vec![Box::new(Rule {
+            dependencies: vec![EventDependency::Entity(EntityId(1))],
+            move_entity: true,
+            event_tick: 10,
+        })]
+    };
+    let mut server = create(&dir, rules());
+    let world = server.authority().unwrap().world();
+    let revision = world.store().revision(source).unwrap();
+    let mut page = world.capture_section(source, base::budget()).unwrap();
+    let resident_ids: Vec<_> = page.entities.iter().map(|entity| entity.id).collect();
+    assert!(resident_ids.contains(&EntityId(1)));
+    page.sections[0].pos = sibling;
+    page.entities.clear();
+    server
+        .install_section(&pages, page, &mut NoReplicas)
+        .unwrap();
+    server
+        .enable_residency(
+            ResidencyConfig {
+                max_io_bytes: pages.budget().max_bytes * 4 * 3,
+                ..config()
+            },
+            pages.clone(),
+            None,
+            &[destination],
+        )
+        .unwrap();
+    server.set_residency_batch_pages(2).unwrap();
+    assert!(matches!(
+        server.poll_residency(&mut NoReplicas).unwrap(),
+        ResidencyProgress::Pending
+    ));
+    assert!(
+        server
+            .residency_io_diagnostics()
+            .unwrap()
+            .retirement_age
+            .is_some()
+    );
+    // Drive the simulation without polling residency. Publication now sees a
+    // different entity view of the source even though its blocks are unchanged.
+    while server.authority().unwrap().resume_point().tick == Tick(0) {
+        assert!(server.drive_batch(&mut NoReplicas, 16).unwrap().committed > 0);
+    }
+    let authority = server.authority().unwrap();
+    let entity = authority.world().entities();
+    assert_eq!(
+        entity
+            .get(entity.handle_of(EntityId(1)).unwrap())
+            .unwrap()
+            .position
+            .section(16),
+        Some(destination)
+    );
+    assert_eq!(authority.world().store().revision(source), Some(revision));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for expected in [sibling, source] {
+        let before = server.flush_metrics().calls;
+        loop {
+            match server.poll_residency(&mut NoReplicas).unwrap() {
+                ResidencyProgress::Pending => std::thread::yield_now(),
+                ResidencyProgress::Batch(report) => {
+                    assert!(report.failure.is_none(), "{report:?}");
+                    assert_eq!(report.committed, [expected]);
+                    assert_eq!(server.flush_metrics().calls - before, 1);
+                    break;
+                }
+                other => panic!("unexpected retirement result: {other:?}"),
+            }
+            assert!(Instant::now() < deadline);
+        }
+    }
+    drop(server);
+    let server = open(&dir, pages, rules());
+    let authority = server.authority().unwrap();
+    assert_eq!(
+        authority.parked_sections()[&source].entities,
+        resident_ids
+            .into_iter()
+            .filter(|id| *id != EntityId(1))
+            .collect::<Vec<_>>()
+    );
+    assert!(authority.parked_sections().contains_key(&sibling));
+    let entity = authority.world().entities();
+    assert_eq!(
+        entity
+            .get(entity.handle_of(EntityId(1)).unwrap())
+            .unwrap()
+            .position
+            .section(16),
+        Some(destination)
+    );
+}
+
+#[test]
 fn automatic_load_unload_budget_backpressure_and_page_io_retry_preserve_authority() {
     let dir = Directory::new();
     let pages = pages(&dir);

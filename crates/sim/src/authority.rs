@@ -191,6 +191,16 @@ impl WorldAuthority {
         crate::streaming::prepare(self, page, load, false, budget)
     }
 
+    /// Revalidate an asynchronously captured resident page. An intact snapshot
+    /// that differs from current persistent terrain or entities must be recaptured.
+    pub fn prepare_retirement(
+        &self,
+        page: &Snapshot,
+        budget: torse_types::OutputBudget,
+    ) -> Result<Option<crate::streaming::PreparedSection>, torse_types::Fault> {
+        crate::streaming::prepare_retirement(self, page, budget)
+    }
+
     /// Prepare trusted generated cells and consecutive new identities in one publication.
     pub fn prepare_generated_section(
         &self,
