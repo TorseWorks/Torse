@@ -135,7 +135,8 @@ fn prepare_batch_at<'a>(
                 "parking pages require one generation cut",
             ));
         }
-        let prepared = prepare_at(world, page, true, true, budget, Some(allocator), park)?;
+        let prepared = prepare_at(world, page, true, true, budget, Some(allocator), park)?
+            .expect("generated sections do not retire resident pages");
         if !positions.insert(prepared.position()) {
             return Err(Fault::invalid_data("duplicate generated batch position"));
         }
@@ -161,7 +162,16 @@ pub(crate) fn prepare(
     generated: bool,
     budget: OutputBudget,
 ) -> Result<PreparedSection, Fault> {
-    prepare_at(world, page, load, generated, budget, None, false)
+    prepare_at(world, page, load, generated, budget, None, false)?
+        .ok_or_else(|| Fault::invalid_data("unload page differs from resident data"))
+}
+
+pub(crate) fn prepare_retirement(
+    world: &WorldAuthority,
+    page: &Snapshot,
+    budget: OutputBudget,
+) -> Result<Option<PreparedSection>, Fault> {
+    prepare_at(world, page, false, false, budget, None, false)
 }
 fn prepare_at(
     world: &WorldAuthority,
@@ -171,7 +181,7 @@ fn prepare_at(
     budget: OutputBudget,
     allocator: Option<u128>,
     park: bool,
-) -> Result<PreparedSection, Fault> {
+) -> Result<Option<PreparedSection>, Fault> {
     if page.sections.len() != 1
         || page.side != world.store().side()
         || page.bounds != world.store().bounds()
@@ -252,13 +262,11 @@ fn prepare_at(
                 .as_ref(),
             page,
         ) {
-            return Err(Fault::invalid_data(
-                "unload page differs from resident data",
-            ));
+            return Ok(None);
         }
         Some(current)
     };
-    Ok(PreparedSection {
+    Ok(Some(PreparedSection {
         barrier: world.prepare_barrier().map_err(fault)?,
         page_meta: page.meta,
         position: pos,
@@ -270,7 +278,7 @@ fn prepare_at(
         budget,
         revision: world.store().revision(pos),
         retired: world.store().retired_revision(pos),
-    })
+    }))
 }
 
 // Legacy writers could leave an all-equal section in Dense form. Reclaiming its

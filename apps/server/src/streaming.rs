@@ -365,6 +365,16 @@ impl ExecutionHost {
         &self,
         change: SectionChange,
     ) -> Result<ExecutionPrepared, Fault> {
+        Ok(self
+            .prepare_residency_candidate(change, false)?
+            .expect("strict section preparation cannot skip stale pages"))
+    }
+
+    fn prepare_residency_candidate(
+        &self,
+        change: SectionChange,
+        discard_stale: bool,
+    ) -> Result<Option<ExecutionPrepared>, Fault> {
         if change.fresh && !change.load {
             return Err(Fault::invalid_data(
                 "direct parking requires a generated batch",
@@ -380,18 +390,31 @@ impl ExecutionHost {
                 )
             })
             .transpose()?;
-        self.check_residency(&change)?;
-        let page = if change.load && !change.fresh {
-            bind_parked_page(&change.page, &change.reference)?
+        let world = if discard_stale && !change.load {
+            let Some(prepared) = self
+                .world()
+                .prepare_retirement(&change.page, self.limits.runtime)?
+            else {
+                return Ok(None);
+            };
+            // Event pins also consult the page's entity list. Validate that
+            // list against the current world before checking those pins.
+            self.check_residency(&change)?;
+            prepared
         } else {
-            Cow::Borrowed(&change.page)
-        };
-        let world = if change.fresh {
-            self.world()
-                .prepare_generated_section(&change.page, self.limits.runtime)?
-        } else {
-            self.world()
-                .prepare_section(&page, change.load, self.limits.runtime)?
+            self.check_residency(&change)?;
+            if change.fresh {
+                self.world()
+                    .prepare_generated_section(&change.page, self.limits.runtime)?
+            } else {
+                let page = if change.load {
+                    bind_parked_page(&change.page, &change.reference)?
+                } else {
+                    Cow::Borrowed(&change.page)
+                };
+                self.world()
+                    .prepare_section(&page, change.load, self.limits.runtime)?
+            }
         };
         let meta = world.meta();
         let changes = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
@@ -419,7 +442,7 @@ impl ExecutionHost {
         };
         wire::measure_inner(&prepared.record, self.limits.runtime, self.limits.codec)?;
         self.account_residency(&mut prepared)?;
-        Ok(prepared)
+        Ok(Some(prepared))
     }
     fn check_residency(&self, change: &SectionChange) -> Result<(), Fault> {
         let unload = !change.load && !change.fresh;
@@ -737,8 +760,12 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
                 load: completed.load,
                 fresh: completed.fresh,
             };
-            match self.authority.prepare_residency(change) {
-                Ok(prepared) => self.authority.section_pending = Some(prepared),
+            match self.authority.prepare_residency_candidate(change, true) {
+                Ok(Some(prepared)) => self.authority.section_pending = Some(prepared),
+                // Entity/component edits can leave the terrain revision
+                // unchanged. Keep the current resident page and finish the
+                // unaffected siblings; a later poll will recapture it.
+                Ok(None) => continue,
                 Err(error) => {
                     report.failure = Some((pos, error));
                     break;
