@@ -110,6 +110,66 @@ fn explicit_metadata_budget_retains_distant_pages_with_a_single_page_batch() {
 }
 
 #[test]
+fn bounded_display_prioritizes_new_terrain_behind_the_scan_cursor() {
+    let dir = Directory::new();
+    let (mut server, pages, _) = create(&dir);
+    let (mut hub, id, mut client, _, _) = connect(&mut server, scope(0, 1));
+    let target = SectionPos::new(32, 1, 0);
+    let desired = ReplicaScope {
+        sections: (0..=32)
+            .flat_map(|x| (1..=8).map(move |y| SectionPos::new(x, y, 0)))
+            .collect(),
+    };
+    let count = desired.sections.len();
+    let mut limits = limits();
+    limits.max_sections = count;
+    limits.control_bytes = 512 * 1024;
+    hub.enable_visual_interest(
+        &server,
+        id,
+        pages.clone(),
+        approval(),
+        desired,
+        SectionPos::ZERO,
+        limits,
+    )
+    .unwrap();
+    let budget = |metadata_checks_per_session| DisplayWorkBudget {
+        sessions: 1,
+        metadata_checks_per_session,
+        ..Default::default()
+    };
+    // Finish the first metadata sweep while every page is missing and put its
+    // cursor at the far end, beyond the target. No delivered proofs exist yet.
+    hub.poll_display(&server, budget(count)).unwrap();
+    drain(&mut client);
+    hub.poll_display(&server, budget(count - 1)).unwrap();
+    drain(&mut client);
+    let page = streaming::generated(server.authority().unwrap().world(), target);
+    server.install_section(&pages, page, &mut hub).unwrap();
+    drain(&mut client);
+
+    // Leave enough time for the read worker while limiting authority polls
+    // to fewer checks than a new sweep would need to revisit the target.
+    for _ in 0..64 {
+        let progress = hub.poll_display(&server, budget(2)).unwrap();
+        assert!(progress.metadata_checks <= 2);
+        for message in drain(&mut client).0 {
+            if let ServerMessage::Terrain(update) = message
+                && update.pages.iter().any(|page| {
+                    page.terrain.sections[0].pos == target
+                        && page.at == server.authority().unwrap().cursor()
+                })
+            {
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("newly published terrain was not sent within 128 metadata checks");
+}
+
+#[test]
 fn bounded_reset_retains_unchanged_overlap_outside_the_metadata_slice() {
     let dir = Directory::new();
     let (mut server, pages, expected) = create(&dir);

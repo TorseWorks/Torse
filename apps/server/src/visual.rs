@@ -774,7 +774,7 @@ impl VisualSession {
             unavailable: BTreeMap::new(),
             observed: BTreeMap::new(),
             sent: BTreeMap::new(),
-            proof_cut: CommitSeq(0),
+            proof_cut: host.cursor().seq,
             proof_floor: CommitSeq(0),
             light_sent: BTreeMap::new(),
             light_seq: 0,
@@ -903,9 +903,14 @@ impl VisualSession {
         self.poll_with_budget(host, can_send, usize::MAX)
     }
 
-    fn advance_proofs(&mut self, host: &ExecutionHost, cut: CommitSeq, budget: usize) -> usize {
+    fn observe_publications(
+        &mut self,
+        host: &ExecutionHost,
+        cut: CommitSeq,
+        budget: usize,
+    ) -> usize {
         let previous = std::mem::replace(&mut self.proof_cut, cut);
-        if self.sent.is_empty() {
+        if previous == cut {
             return 0;
         }
         let Some(changes) = host
@@ -924,6 +929,12 @@ impl VisualSession {
                 && page.verified.is_some_and(|verified| verified < seq)
             {
                 page.verified = None;
+            }
+            if self.desired.sections.contains(&pos) {
+                // A durable publication can arrive just after the rotating
+                // scan passed this position. Give it normal distance priority
+                // immediately while keeping the source checks at admission.
+                self.candidates.insert(column_priority(pos, self.center));
             }
         }
         checked
@@ -1061,7 +1072,7 @@ impl VisualSession {
         let invalidations = if metadata_checks == usize::MAX {
             0
         } else {
-            self.advance_proofs(host, through.seq, checks)
+            self.observe_publications(host, through.seq, checks)
         };
         let scan = self.order.len().min(checks - invalidations);
         self.last_scan = invalidations + scan;
